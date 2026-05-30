@@ -58,6 +58,9 @@ wheel/
 # Claude files
 .claude
 
+# Local scratch / issue investigation
+ghissue/
+
 # Data files
 data
 
