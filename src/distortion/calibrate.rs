@@ -135,9 +135,23 @@ pub fn calibrate_camera(
         .count();
 
     if n_valid <= 1 {
-        single_image_calibrate(solve_results, centroids, database, image_width, image_height, config)
+        single_image_calibrate(
+            solve_results,
+            centroids,
+            database,
+            image_width,
+            image_height,
+            config,
+        )
     } else {
-        multi_image_calibrate(solve_results, centroids, database, image_width, image_height, config)
+        multi_image_calibrate(
+            solve_results,
+            centroids,
+            database,
+            image_width,
+            image_height,
+            config,
+        )
     }
 }
 
@@ -206,13 +220,9 @@ fn single_image_calibrate(
             order,
             &fit_config,
         ),
-        DistortionModelType::Radial => fit_radial_distortion(
-            solve_results,
-            centroids,
-            database,
-            image_width,
-            &fit_config,
-        ),
+        DistortionModelType::Radial => {
+            fit_radial_distortion(solve_results, centroids, database, image_width, &fit_config)
+        }
     };
 
     // Get FOV from first successful solve result
@@ -225,7 +235,7 @@ fn single_image_calibrate(
     let parity_flip = solve_results
         .iter()
         .find(|sr| sr.status == SolveStatus::MatchFound)
-        .map_or(false, |sr| sr.parity_flip);
+        .is_some_and(|sr| sr.parity_flip);
 
     // Polynomial: extract crpix from polynomial order-0 terms.
     // Radial: fit_result.crpix already carries the fitted optical-center
@@ -362,7 +372,7 @@ fn multi_image_calibrate(
         // For each image, undistort centroids with current model, then refine attitude.
         struct RefinedImage {
             sr_idx: usize,
-            matches: Vec<(usize, usize)>,   // (centroid_idx_in_full_array, catalog_star_idx)
+            matches: Vec<(usize, usize)>, // (centroid_idx_in_full_array, catalog_star_idx)
             crval_ra: f64,
             crval_dec: f64,
             cd_matrix: [[f64; 2]; 2],
@@ -434,7 +444,9 @@ fn multi_image_calibrate(
             if wcs_result.matches.len() < 4 {
                 debug!(
                     "  multi-cal outer {}: image {} wcs_refine returned only {} matches, skipping",
-                    outer, img.sr_idx, wcs_result.matches.len()
+                    outer,
+                    img.sr_idx,
+                    wcs_result.matches.len()
                 );
                 continue;
             }
@@ -562,7 +574,12 @@ fn multi_image_calibrate(
 
         debug!(
             "  multi-cal outer {}: {:?} fit: {}/{} inliers, RMSE {:.3} -> {:.3} px",
-            outer, config.model, n_inliers, all_points.len(), rmse_before, rmse_after,
+            outer,
+            config.model,
+            n_inliers,
+            all_points.len(),
+            rmse_before,
+            rmse_after,
         );
 
         total_iterations += iters;
@@ -585,7 +602,9 @@ fn multi_image_calibrate(
         if rmse_frac_change < 0.01 || rmse_change < config.convergence_threshold_px {
             debug!(
                 "  multi-cal: converged at outer iteration {} (RMSE change={:.4} px, {:.2}%)",
-                outer, rmse_change, rmse_frac_change * 100.0,
+                outer,
+                rmse_change,
+                rmse_frac_change * 100.0,
             );
             break;
         }

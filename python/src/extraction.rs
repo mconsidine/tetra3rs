@@ -140,8 +140,8 @@ impl PyExtractionResult {
             threshold: b.threshold,
             num_blobs_raw: b.num_blobs_raw as u64,
         };
-        let bytes = postcard::to_allocvec(&ser)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let bytes =
+            postcard::to_allocvec(&ser).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let from_bytes = slf.get_type().getattr("_from_pickle_bytes")?;
         Ok((from_bytes.unbind(), (bytes,)))
     }
@@ -153,9 +153,7 @@ impl PyExtractionResult {
         let centroids = ser
             .centroids
             .into_iter()
-            .map(|cs| PyCentroid {
-                inner: cs.into(),
-            })
+            .map(|cs| PyCentroid { inner: cs.into() })
             .collect();
         Ok(Self {
             centroids,

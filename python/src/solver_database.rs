@@ -2,9 +2,9 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 use tetra3::camera_model::CameraModel;
-use tetra3::{calibrate_camera, CalibrateConfig, DistortionModelType};
 use tetra3::solver::{GenerateDatabaseConfig, SolveConfig, SolveStatus, SolverDatabase};
 use tetra3::Centroid;
+use tetra3::{calibrate_camera, CalibrateConfig, DistortionModelType};
 
 use crate::calibrate::PyCalibrateResult;
 use crate::camera_model::PyCameraModel;
@@ -534,7 +534,9 @@ fn parse_attitude_hint(obj: &Bound<'_, pyo3::PyAny>) -> PyResult<tetra3::Quatern
 
     // Try 1D [w, x, y, z] quaternion.
     if let Ok(arr) = obj.extract::<PyReadonlyArray1<f64>>() {
-        let slice = arr.as_slice().map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let slice = arr
+            .as_slice()
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
         if slice.len() != 4 {
             return Err(PyValueError::new_err(format!(
                 "attitude_hint 1D array must have 4 elements [w, x, y, z], got {}",
@@ -542,7 +544,10 @@ fn parse_attitude_hint(obj: &Bound<'_, pyo3::PyAny>) -> PyResult<tetra3::Quatern
             )));
         }
         return Ok(tetra3::Quaternion::new(
-            slice[0] as f32, slice[1] as f32, slice[2] as f32, slice[3] as f32,
+            slice[0] as f32,
+            slice[1] as f32,
+            slice[2] as f32,
+            slice[3] as f32,
         ));
     }
     // Try a plain Python list / tuple of length 4.
@@ -554,7 +559,10 @@ fn parse_attitude_hint(obj: &Bound<'_, pyo3::PyAny>) -> PyResult<tetra3::Quatern
             )));
         }
         return Ok(tetra3::Quaternion::new(
-            vec[0] as f32, vec[1] as f32, vec[2] as f32, vec[3] as f32,
+            vec[0] as f32,
+            vec[1] as f32,
+            vec[2] as f32,
+            vec[3] as f32,
         ));
     }
     // Try a 3×3 rotation matrix.
@@ -568,9 +576,21 @@ fn parse_attitude_hint(obj: &Bound<'_, pyo3::PyAny>) -> PyResult<tetra3::Quatern
         }
         let view = arr.as_array();
         let m = numeris::Matrix3::<f32>::new([
-            [view[(0, 0)] as f32, view[(0, 1)] as f32, view[(0, 2)] as f32],
-            [view[(1, 0)] as f32, view[(1, 1)] as f32, view[(1, 2)] as f32],
-            [view[(2, 0)] as f32, view[(2, 1)] as f32, view[(2, 2)] as f32],
+            [
+                view[(0, 0)] as f32,
+                view[(0, 1)] as f32,
+                view[(0, 2)] as f32,
+            ],
+            [
+                view[(1, 0)] as f32,
+                view[(1, 1)] as f32,
+                view[(1, 2)] as f32,
+            ],
+            [
+                view[(2, 0)] as f32,
+                view[(2, 1)] as f32,
+                view[(2, 2)] as f32,
+            ],
         ]);
         return Ok(tetra3::Quaternion::from_rotation_matrix(&m));
     }

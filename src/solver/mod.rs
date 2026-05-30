@@ -160,8 +160,7 @@ mod pattern_catalog_tests {
         *cat.get_mut(1023) = PatternEntry::new([1, 2, 3, 4], 0.9, 0xffff);
 
         let bytes = postcard::to_allocvec(&cat).expect("serialize");
-        let restored: PatternCatalog =
-            postcard::from_bytes(&bytes).expect("deserialize");
+        let restored: PatternCatalog = postcard::from_bytes(&bytes).expect("deserialize");
 
         assert_eq!(restored.len(), 1024);
         assert_eq!(restored.get(0).star_indices, [10, 20, 30, 40]);

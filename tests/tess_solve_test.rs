@@ -46,11 +46,11 @@ fn parse_header_card(card: &[u8; 80]) -> Option<(String, FitsValue)> {
         return None;
     }
     let value_str = card_str[10..].trim();
-    let value = if value_str.starts_with('\'') {
-        if let Some(end) = value_str[1..].find('\'') {
-            FitsValue::Str(value_str[1..1 + end].trim().to_string())
+    let value = if let Some(rest) = value_str.strip_prefix('\'') {
+        if let Some(end) = rest.find('\'') {
+            FitsValue::Str(rest[..end].trim().to_string())
         } else {
-            FitsValue::Str(value_str[1..].trim().to_string())
+            FitsValue::Str(rest.trim().to_string())
         }
     } else {
         let num_part = if let Some(slash) = value_str.find('/') {
@@ -110,7 +110,7 @@ fn read_fits_hdus(path: &str) -> Vec<FitsHdu> {
         };
 
         let mut data_len: u64 = if naxis > 0 {
-            let bytes_per_pixel = (bitpix.unsigned_abs() as u64) / 8;
+            let bytes_per_pixel = bitpix.unsigned_abs() / 8;
             let mut npixels: u64 = 1;
             for i in 1..=naxis {
                 let key = format!("NAXIS{}", i);
@@ -128,7 +128,7 @@ fn read_fits_hdus(path: &str) -> Vec<FitsHdu> {
         }
 
         let data_offset = offset;
-        let padded = ((data_len + 2879) / 2880) * 2880;
+        let padded = data_len.div_ceil(2880) * 2880;
         offset += padded;
         file.seek(SeekFrom::Start(offset)).ok();
 

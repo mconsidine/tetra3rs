@@ -86,7 +86,11 @@ impl SolverDatabase {
             .collect();
 
         let default_pm_year = 1991.25; // Hipparcos reference epoch
-        Ok(Self::generate_from_star_list(stars, config, default_pm_year))
+        Ok(Self::generate_from_star_list(
+            stars,
+            config,
+            default_pm_year,
+        ))
     }
 
     /// Generate a solver database from a Gaia binary catalog file.
@@ -113,7 +117,11 @@ impl SolverDatabase {
             .collect();
 
         let default_pm_year = 2016.0; // Gaia DR3 reference epoch
-        Ok(Self::generate_from_star_list(stars, config, default_pm_year))
+        Ok(Self::generate_from_star_list(
+            stars,
+            config,
+            default_pm_year,
+        ))
     }
 
     /// Core database generation from a pre-converted list of generic stars.
@@ -132,13 +140,20 @@ impl SolverDatabase {
             .unwrap_or(max_fov);
 
         let pattern_bins = (0.25 / config.pattern_max_error).round() as u32;
-        info!("Pattern bins: {}, max_error: {}", pattern_bins, config.pattern_max_error);
+        info!(
+            "Pattern bins: {}, max_error: {}",
+            pattern_bins, config.pattern_max_error
+        );
 
         let epoch_pm_year = config.epoch_proper_motion_year;
         info!("Proper motion epoch: {:?}", epoch_pm_year);
 
         // Sort by brightness (ascending magnitude = brightest first)
-        stars.sort_by(|a, b| a.mag.partial_cmp(&b.mag).unwrap_or(std::cmp::Ordering::Equal));
+        stars.sort_by(|a, b| {
+            a.mag
+                .partial_cmp(&b.mag)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Determine magnitude cutoff
         let star_max_magnitude = config.star_max_magnitude.unwrap_or_else(|| {
@@ -158,10 +173,13 @@ impl SolverDatabase {
         let num_stars = stars.len();
 
         // Precompute unit vectors
-        let star_vectors: Vec<[f32; 3]> = stars.iter().map(|s| {
-            let v = s.uvec();
-            [v[0], v[1], v[2]]
-        }).collect();
+        let star_vectors: Vec<[f32; 3]> = stars
+            .iter()
+            .map(|s| {
+                let v = s.uvec();
+                [v[0], v[1], v[2]]
+            })
+            .collect();
 
         // Save catalog IDs before building the spatial index
         let star_catalog_ids: Vec<i64> = stars.iter().map(|s| s.id).collect();
@@ -192,7 +210,10 @@ impl SolverDatabase {
         info!(
             "Generating patterns at {} FOV scales: {:?} deg",
             pattern_fovs.len(),
-            pattern_fovs.iter().map(|f| f.to_degrees()).collect::<Vec<_>>()
+            pattern_fovs
+                .iter()
+                .map(|f| f.to_degrees())
+                .collect::<Vec<_>>()
         );
 
         // ── Generate patterns across all FOV scales ──
@@ -233,16 +254,15 @@ impl SolverDatabase {
                 }
             }
 
-            let pattern_star_indices: Vec<usize> = (0..num_stars)
-                .filter(|&i| keep_for_patterns[i])
-                .collect();
+            let pattern_star_indices: Vec<usize> =
+                (0..num_stars).filter(|&i| keep_for_patterns[i]).collect();
             info!("Pattern stars at this FOV: {}", pattern_star_indices.len());
 
             // ── Distribute lattice fields and generate patterns ──
             let fov_angle = pattern_fov / 2.0;
             let _fov_dist = distance_from_angle(fov_angle);
-            let n_fields = num_fields_for_sky(pattern_fov)
-                * config.lattice_field_oversampling as usize;
+            let n_fields =
+                num_fields_for_sky(pattern_fov) * config.lattice_field_oversampling as usize;
 
             let lattice_points = fibonacci_sphere_lattice(n_fields);
             let mut total_added = 0usize;
@@ -279,17 +299,21 @@ impl SolverDatabase {
                     let is_new = pattern_set.insert(pat);
                     if is_new {
                         total_added += 1;
-                        if pattern_set.len() % 100_000 == 0 {
+                        if pattern_set.len().is_multiple_of(100_000) {
                             info!("Generated {} patterns so far...", pattern_set.len());
                         }
                     }
                     patterns_this_field += 1;
-                    if patterns_this_field >= config.patterns_per_lattice_field as u32 {
+                    if patterns_this_field >= config.patterns_per_lattice_field {
                         break;
                     }
                 }
             }
-            info!("Added {} new patterns at this FOV ({} total)", total_added, pattern_set.len());
+            info!(
+                "Added {} new patterns at this FOV ({} total)",
+                total_added,
+                pattern_set.len()
+            );
         }
 
         let pattern_list: Vec<[u32; PATTERN_SIZE]> = pattern_set.into_iter().collect();
@@ -328,11 +352,7 @@ impl SolverDatabase {
             sort_u32_pattern_by_centroid_distance(&mut sorted_pat, &star_vectors);
 
             // Insert into hash table
-            let entry = PatternEntry::new(
-                sorted_pat,
-                largest_angle,
-                (pkey_hash & 0xFFFF) as u16,
-            );
+            let entry = PatternEntry::new(sorted_pat, largest_angle, (pkey_hash & 0xFFFF) as u16);
             insert_pattern(entry, hidx, &mut pattern_catalog);
         }
 

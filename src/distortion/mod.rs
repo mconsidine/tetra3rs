@@ -38,9 +38,10 @@ pub use radial::RadialDistortion;
 /// An enum-based distortion model that supports radial and polynomial
 /// distortion correction. All coordinates are in pixels relative to
 /// the optical center (typically the image center).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub enum Distortion {
     /// No distortion correction.
+    #[default]
     None,
     /// Radial distortion: r_distorted = r × (1 + k1·r² + k2·r⁴ + k3·r⁶).
     Radial(RadialDistortion),
@@ -76,11 +77,5 @@ impl Distortion {
     /// Returns `true` if this is `Distortion::None`.
     pub fn is_none(&self) -> bool {
         matches!(self, Distortion::None)
-    }
-}
-
-impl Default for Distortion {
-    fn default() -> Self {
-        Distortion::None
     }
 }

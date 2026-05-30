@@ -7,11 +7,7 @@ fn main() {
     let dirty = run_git(&["status", "--porcelain"])
         .map(|s| !s.is_empty())
         .unwrap_or(false);
-    let revision = if dirty {
-        format!("{hash}-dirty")
-    } else {
-        hash
-    };
+    let revision = if dirty { format!("{hash}-dirty") } else { hash };
 
     println!("cargo:rustc-env=TETRA3RS_GIT_HASH={revision}");
 

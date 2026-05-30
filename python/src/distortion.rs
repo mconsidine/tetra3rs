@@ -1,8 +1,8 @@
 use numpy::PyArray1;
 use pyo3::prelude::*;
 
-use tetra3::num_coeffs as poly_num_coeffs;
 use tetra3::distortion::{Distortion, PolynomialDistortion, RadialDistortion};
+use tetra3::num_coeffs as poly_num_coeffs;
 
 /// Helper: extract a Distortion enum from a Python RadialDistortion or PolynomialDistortion.
 pub(crate) fn extract_distortion(obj: &Bound<'_, pyo3::PyAny>) -> PyResult<Distortion> {
@@ -156,7 +156,12 @@ impl PyRadialDistortion {
 ///     https://www.adass.org/adass/proceedings/adass04/reprints/P3-1-3.pdf
 ///   * FITS WCS SIP convention registry entry:
 ///     https://fits.gsfc.nasa.gov/registry/sip.html
-#[pyclass(name = "PolynomialDistortion", module = "tetra3rs", frozen, from_py_object)]
+#[pyclass(
+    name = "PolynomialDistortion",
+    module = "tetra3rs",
+    frozen,
+    from_py_object
+)]
 #[derive(Clone)]
 pub(crate) struct PyPolynomialDistortion {
     pub(crate) inner: PolynomialDistortion,

@@ -348,7 +348,7 @@ impl SolverDatabase {
             let table_len = self.pattern_catalog.len() as u64;
 
             // Try each candidate pattern key
-            for &(_, ref pkey) in &pattern_key_list {
+            for (_, pkey) in &pattern_key_list {
                 let pkey_hash = compute_pattern_key_hash(pkey, p_bins);
                 let hidx = hash_to_index(pkey_hash, table_len);
 
@@ -424,8 +424,10 @@ impl SolverDatabase {
                     profiling::count(buckets::RATIO_PASS, 1);
 
                     // SVD rotation: finds R such that camera_vec ≈ R * icrs_vec
-                    let mut rotation_matrix =
-                        timed!(buckets::SVD, find_rotation_matrix(&matched_img, &matched_cat));
+                    let mut rotation_matrix = timed!(
+                        buckets::SVD,
+                        find_rotation_matrix(&matched_img, &matched_cat)
+                    );
 
                     // Determine parity from the rotation determinant.
                     // centroid_vectors is never mutated; when parity is needed we use
@@ -822,7 +824,7 @@ pub(super) fn find_rotation_matrix<const N: usize>(
             catalog_vectors[i][1] as f64,
             catalog_vectors[i][2] as f64,
         ]);
-        h = h + img.outer(&cat);
+        h += img.outer(&cat);
     }
 
     let svd = h.svd().expect("SVD failed");
@@ -936,7 +938,11 @@ mod tests {
         assert!((norm - 1.0).abs() < 1e-6, "output not unit length: {norm}");
 
         // Y component should be positive (shifted toward velocity direction)
-        assert!(apparent[1] > 0.0, "expected positive Y shift, got {}", apparent[1]);
+        assert!(
+            apparent[1] > 0.0,
+            "expected positive Y shift, got {}",
+            apparent[1]
+        );
 
         // Shift magnitude should be ~v/c ≈ 1e-4 rad ≈ 20"
         let shift_rad = (apparent[1] as f64).atan2(apparent[0] as f64);

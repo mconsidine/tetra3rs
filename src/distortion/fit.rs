@@ -143,12 +143,8 @@ pub fn fit_radial_distortion(
     // Compute before/after RMSE on the SAME inlier set for a fair comparison.
     // The "after" RMSE is computed against the centered Brown-Conrady model,
     // so we subtract the fitted (cx, cy) before applying distort.
-    let rmse_before = compute_corrected_rmse_centered(
-        &points,
-        &fit.mask,
-        &Distortion::None,
-        [0.0, 0.0],
-    );
+    let rmse_before =
+        compute_corrected_rmse_centered(&points, &fit.mask, &Distortion::None, [0.0, 0.0]);
     let rmse_after = compute_corrected_rmse_centered(
         &points,
         &fit.mask,
@@ -427,6 +423,7 @@ fn run_brown_conrady_lm(
 
 /// Per-point Euclidean residual under the current Brown-Conrady model
 /// (centered radial + tangential).
+#[allow(clippy::too_many_arguments)]
 fn centered_radial_residuals(
     points: &[MatchedPoint],
     cx: f64,
@@ -732,7 +729,7 @@ pub fn fit_polynomial_distortion(
         "solve_results and centroids must have the same length"
     );
     assert!(
-        order >= 2 && order <= 6,
+        (2..=6).contains(&order),
         "polynomial order must be in [2, 6]"
     );
 
@@ -777,8 +774,12 @@ pub fn fit_polynomial_distortion(
     let fit = fit_polynomial_sigma_clip(&points, order, scale, config);
 
     let model = PolynomialDistortion::new(
-        order, scale,
-        fit.a_coeffs, fit.b_coeffs, fit.ap_coeffs, fit.bp_coeffs,
+        order,
+        scale,
+        fit.a_coeffs,
+        fit.b_coeffs,
+        fit.ap_coeffs,
+        fit.bp_coeffs,
     );
     let dist = Distortion::Polynomial(model.clone());
     // Compute before/after RMSE on the SAME inlier set for a fair comparison
@@ -922,7 +923,11 @@ fn compute_rmse_px(points: &[MatchedPoint]) -> f64 {
 }
 
 /// Compute RMS pixel residual after applying distortion correction to inliers.
-pub(super) fn compute_corrected_rmse(points: &[MatchedPoint], mask: &[bool], distortion: &Distortion) -> f64 {
+pub(super) fn compute_corrected_rmse(
+    points: &[MatchedPoint],
+    mask: &[bool],
+    distortion: &Distortion,
+) -> f64 {
     let mut sum_sq = 0.0;
     let mut count = 0;
 
@@ -1062,4 +1067,3 @@ mod tests {
         assert!(k3.abs() < 1e-18, "k3: fitted={:.3e}, expected ~0", k3);
     }
 }
-

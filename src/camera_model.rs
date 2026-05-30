@@ -164,12 +164,7 @@ mod tests {
     fn test_roundtrip_no_distortion() {
         let cam = CameraModel::from_fov(10.0_f64.to_radians(), 1024, 768);
 
-        let test_points = [
-            (0.0, 0.0),
-            (100.0, 200.0),
-            (-300.0, 150.0),
-            (512.0, -400.0),
-        ];
+        let test_points = [(0.0, 0.0), (100.0, 200.0), (-300.0, 150.0), (512.0, -400.0)];
 
         for &(px, py) in &test_points {
             let (xi, eta) = cam.pixel_to_tanplane(px, py);

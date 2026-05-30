@@ -171,7 +171,10 @@ impl PolynomialDistortion {
             // point. We've never observed this in practice — for any sensible
             // lens distortion the Jacobian is dominated by the identity. If
             // it ever fires, the latest iterate is still the best estimate.
-            debug_assert!(det.abs() > 1e-15, "singular Jacobian in undistort Newton step");
+            debug_assert!(
+                det.abs() > 1e-15,
+                "singular Jacobian in undistort Newton step"
+            );
             if det.abs() < 1e-15 {
                 break;
             }

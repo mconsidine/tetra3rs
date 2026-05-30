@@ -111,8 +111,9 @@ mod tests {
     fn test_bfs_combinations_early_stop() {
         // Should be able to take just a few without enumerating all
         let items: Vec<usize> = (0..50).collect();
-        let first_10: Vec<[usize; 4]> =
-            BreadthFirstCombinations::<4>::new(&items).take(10).collect();
+        let first_10: Vec<[usize; 4]> = BreadthFirstCombinations::<4>::new(&items)
+            .take(10)
+            .collect();
         assert_eq!(first_10.len(), 10);
         assert_eq!(first_10[0], [0, 1, 2, 3]);
     }

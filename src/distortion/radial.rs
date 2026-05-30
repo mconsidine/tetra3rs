@@ -80,13 +80,7 @@ impl RadialDistortion {
     /// Create a full Brown-Conrady model with both radial and tangential
     /// coefficients.
     pub fn with_tangential(k1: f64, k2: f64, k3: f64, p1: f64, p2: f64) -> Self {
-        Self {
-            k1,
-            k2,
-            k3,
-            p1,
-            p2,
-        }
+        Self { k1, k2, k3, p1, p2 }
     }
 
     /// Forward distortion: ideal → distorted.

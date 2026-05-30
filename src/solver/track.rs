@@ -54,8 +54,7 @@ impl SolverDatabase {
         let pixel_scale: f32 = if camera_model_initialized {
             (1.0 / cam.focal_length_px) as f32
         } else if config.fov_estimate_rad > 0.0 && config.image_width > 0 {
-            let f = (config.image_width as f32 / 2.0)
-                / (config.fov_estimate_rad / 2.0).tan();
+            let f = (config.image_width as f32 / 2.0) / (config.fov_estimate_rad / 2.0).tan();
             1.0 / f
         } else {
             return SolveResult::failure(SolveStatus::NoMatch, elapsed_ms(t0));
@@ -70,16 +69,11 @@ impl SolverDatabase {
         // ── Hint geometry ──
         let r_hint = hint.to_rotation_matrix();
         // Boresight in ICRS = R^T * [0,0,1] = third row of R
-        let boresight_icrs = Vector3::from_array([
-            r_hint[(2, 0)],
-            r_hint[(2, 1)],
-            r_hint[(2, 2)],
-        ]);
+        let boresight_icrs = Vector3::from_array([r_hint[(2, 0)], r_hint[(2, 1)], r_hint[(2, 2)]]);
 
         // Cone radius: half-FOV (use diagonal for safety) + hint uncertainty + small margin
         let fov_diagonal = fov_rad * 1.42;
-        let cone_radius =
-            fov_diagonal / 2.0 + config.hint_uncertainty_rad + 2.0 * pixel_scale;
+        let cone_radius = fov_diagonal / 2.0 + config.hint_uncertainty_rad + 2.0 * pixel_scale;
         let nearby_inds = self.star_catalog.query_indices_from_uvec_cached(
             boresight_icrs,
             cone_radius,
@@ -161,8 +155,7 @@ impl SolverDatabase {
         // ── Initial centroid → catalog star matching ──
         // Match radius covers (a) hint angular uncertainty and (b) the LIS-equivalent
         // fractional match radius. Whichever is larger.
-        let hint_match_radius =
-            (config.hint_uncertainty_rad).max(config.match_radius * fov_rad);
+        let hint_match_radius = (config.hint_uncertainty_rad).max(config.match_radius * fov_rad);
 
         let initial_matches = find_centroid_matches(
             &centroid_vectors[..match_centroid_count.min(centroid_vectors.len())],
@@ -181,8 +174,12 @@ impl SolverDatabase {
         }
 
         // ── Wahba SVD on the initial correspondence set ──
-        let (rotation_matrix, det_sign_ok) =
-            wahba_svd_dynamic(&centroid_vectors, &candidate_vecs, &nearby_inds, &initial_matches);
+        let (rotation_matrix, det_sign_ok) = wahba_svd_dynamic(
+            &centroid_vectors,
+            &candidate_vecs,
+            &nearby_inds,
+            &initial_matches,
+        );
         if !det_sign_ok {
             // Parity mismatch — bail (caller may still fall back to LIS).
             return SolveResult::failure(SolveStatus::NoMatch, elapsed_ms(t0));
@@ -190,9 +187,7 @@ impl SolverDatabase {
 
         // ── Verification (mirrors solve.rs verify step) ──
         let match_radius_rad = config.match_radius * fov_rad;
-        let image_center_icrs = rotation_matrix
-            .transpose()
-            * Vector3::from_array([0.0, 0.0, 1.0]);
+        let image_center_icrs = rotation_matrix.transpose() * Vector3::from_array([0.0, 0.0, 1.0]);
         let verify_inds = self.star_catalog.query_indices_from_uvec_cached(
             image_center_icrs,
             fov_diagonal / 2.0,
@@ -304,9 +299,8 @@ fn wahba_svd_dynamic(
 ) -> (Matrix3<f32>, bool) {
     // Build catalog-index → local-position map for candidate_vecs lookup.
     // Linear scan is fine — nearby_inds is typically <1000.
-    let cat_to_local = |cat_idx: usize| -> Option<usize> {
-        nearby_inds.iter().position(|&x| x == cat_idx)
-    };
+    let cat_to_local =
+        |cat_idx: usize| -> Option<usize> { nearby_inds.iter().position(|&x| x == cat_idx) };
 
     // Collect paired vectors as Vec for find_rotation_matrix (which is generic
     // on N — we'd need a const N. Instead, build the cross-covariance directly).
@@ -319,9 +313,11 @@ fn wahba_svd_dynamic(
         };
         let img = &centroid_vectors[cent_idx];
         let cat = &candidate_vecs[local_i];
-        let img_v = numeris::Vector3::<f64>::from_array([img[0] as f64, img[1] as f64, img[2] as f64]);
-        let cat_v = numeris::Vector3::<f64>::from_array([cat[0] as f64, cat[1] as f64, cat[2] as f64]);
-        h = h + img_v.outer(&cat_v);
+        let img_v =
+            numeris::Vector3::<f64>::from_array([img[0] as f64, img[1] as f64, img[2] as f64]);
+        let cat_v =
+            numeris::Vector3::<f64>::from_array([cat[0] as f64, cat[1] as f64, cat[2] as f64]);
+        h += img_v.outer(&cat_v);
         n_pairs += 1;
     }
 

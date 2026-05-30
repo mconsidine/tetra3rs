@@ -43,7 +43,9 @@ fn rotation_from_ra_dec_roll(ra: f32, dec: f32, roll: f32) -> Matrix3<f32> {
     let cam_x_noroll = if raw_x.norm() > 1e-6 {
         raw_x.normalize()
     } else {
-        Vector3::from_array([1.0, 0.0, 0.0]).cross(&cam_z).normalize()
+        Vector3::from_array([1.0, 0.0, 0.0])
+            .cross(&cam_z)
+            .normalize()
     };
     let cam_y_noroll = cam_z.cross(&cam_x_noroll);
     let cam_x = cam_x_noroll * roll.cos() + cam_y_noroll * roll.sin();
@@ -147,7 +149,10 @@ fn main() {
     //   T3_SPURIOUS=K  append K uniform-random false centroids to each field
     //   T3_RANDOM=1    each field is ENTIRELY random centroids (forces no-match:
     //                  full combination enumeration × full FOV sweep)
-    let spurious: usize = std::env::var("T3_SPURIOUS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let spurious: usize = std::env::var("T3_SPURIOUS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let random_only = std::env::var("T3_RANDOM").is_ok();
     let half_w_px = half_fov / pixel_scale; // image half-extent in pixels
     eprintln!("Scenario: random_only={random_only}, spurious_per_field={spurious}");
@@ -171,7 +176,8 @@ fn main() {
         let dec = (rng.unit() * 2.0 - 1.0).asin();
         let roll = rng.unit() * 2.0 * std::f32::consts::PI;
         let rot = rotation_from_ra_dec_roll(ra, dec, roll);
-        let boresight = Vector3::from_array([dec.cos() * ra.cos(), dec.cos() * ra.sin(), dec.sin()]);
+        let boresight =
+            Vector3::from_array([dec.cos() * ra.cos(), dec.cos() * ra.sin(), dec.sin()]);
         let mut c = if random_only {
             Vec::new()
         } else {
@@ -209,7 +215,12 @@ fn main() {
     let wall = t_all.elapsed();
 
     println!("\n═══════════════════════════════════════════════════════════════");
-    println!("Profiled {} solves ({} found), wall {:.3}s", sets.len(), n_found, wall.as_secs_f64());
+    println!(
+        "Profiled {} solves ({} found), wall {:.3}s",
+        sets.len(),
+        n_found,
+        wall.as_secs_f64()
+    );
     println!(
         "Mean solve: {:.1} µs   (sum {:.3}s)",
         total_solve_ns as f64 / sets.len() as f64 / 1000.0,
@@ -243,7 +254,10 @@ fn main() {
         ];
 
         let get = |name: &str| -> (u128, u64) {
-            snap.iter().find(|(k, _, _)| *k == name).map(|(_, ns, n)| (*ns, *n)).unwrap_or((0, 0))
+            snap.iter()
+                .find(|(k, _, _)| *k == name)
+                .map(|(_, ns, n)| (*ns, *n))
+                .unwrap_or((0, 0))
         };
         let timed_total: u128 = TIMED.iter().map(|b| get(b).0).sum();
 
@@ -255,11 +269,19 @@ fn main() {
         for b in TIMED {
             let (ns, n) = get(b);
             let ms = ns as f64 / 1e6;
-            let pct = if timed_total > 0 { 100.0 * ns as f64 / timed_total as f64 } else { 0.0 };
+            let pct = if timed_total > 0 {
+                100.0 * ns as f64 / timed_total as f64
+            } else {
+                0.0
+            };
             let per = if n > 0 { ns as f64 / n as f64 } else { 0.0 };
             println!("    {b:<14} {ms:>10.2} {pct:>6.1}% {n:>12} {per:>9.0}");
         }
-        println!("    {:<14} {:>10.2}", "TIMED TOTAL", timed_total as f64 / 1e6);
+        println!(
+            "    {:<14} {:>10.2}",
+            "TIMED TOTAL",
+            timed_total as f64 / 1e6
+        );
         println!(
             "    (timed spans = {:.1}% of summed solve time; remainder is loop/hash/glue)",
             100.0 * timed_total as f64 / total_solve_ns as f64
@@ -268,13 +290,21 @@ fn main() {
         println!("\n  Operation counts (totals across all solves):");
         for b in COUNTS {
             let (_, n) = get(b);
-            println!("    {:<22} {:>14}  ({:.1} / solve)", b, n, n as f64 / sets.len() as f64);
+            println!(
+                "    {:<22} {:>14}  ({:.1} / solve)",
+                b,
+                n,
+                n as f64 / sets.len() as f64
+            );
         }
 
         // wcs_refine internals — nested INSIDE the wcs_refine bucket above, so
         // shown as a share of wcs_refine (not the global timed total).
-        const WCS_TIMED: &[&str] =
-            &[bk::WCS_REASSOC_QUERY, bk::WCS_REASSOC_PROJECT, bk::WCS_REASSOC_MATCH];
+        const WCS_TIMED: &[&str] = &[
+            bk::WCS_REASSOC_QUERY,
+            bk::WCS_REASSOC_PROJECT,
+            bk::WCS_REASSOC_MATCH,
+        ];
         const WCS_COUNTS: &[&str] = &[
             bk::WCS_OUTER,
             bk::WCS_INNER,
@@ -284,12 +314,22 @@ fn main() {
         ];
         let wcs_total = get(bk::WCS_REFINE).0;
         if wcs_total > 0 {
-            println!("\n  wcs_refine internals (share of the {:.1} ms wcs_refine total):", wcs_total as f64 / 1e6);
+            println!(
+                "\n  wcs_refine internals (share of the {:.1} ms wcs_refine total):",
+                wcs_total as f64 / 1e6
+            );
             for b in WCS_TIMED {
                 let (ns, n) = get(b);
                 let pct = 100.0 * ns as f64 / wcs_total as f64;
                 let per = if n > 0 { ns as f64 / n as f64 } else { 0.0 };
-                println!("    {:<20} {:>10.2} ms {:>6.1}%  ({:>10} calls, {:.0} ns/call)", b, ns as f64 / 1e6, pct, n, per);
+                println!(
+                    "    {:<20} {:>10.2} ms {:>6.1}%  ({:>10} calls, {:.0} ns/call)",
+                    b,
+                    ns as f64 / 1e6,
+                    pct,
+                    n,
+                    per
+                );
             }
             let reassoc: u128 = WCS_TIMED.iter().map(|b| get(b).0).sum();
             println!(
@@ -300,7 +340,12 @@ fn main() {
             );
             for b in WCS_COUNTS {
                 let (_, n) = get(b);
-                println!("    {:<20} {:>14}  ({:.1} / solve)", b, n, n as f64 / sets.len() as f64);
+                println!(
+                    "    {:<20} {:>14}  ({:.1} / solve)",
+                    b,
+                    n,
+                    n as f64 / sets.len() as f64
+                );
             }
             let radec = get(bk::WCS_RADEC).1;
             println!(
@@ -313,7 +358,11 @@ fn main() {
         let img = get(bk::IMAGE_EDGES).0 as f64;
         println!(
             "\n  → image-side edge angles = {:.1}% of timed work, {:.1}% of total solve time",
-            if timed_total > 0 { 100.0 * img / timed_total as f64 } else { 0.0 },
+            if timed_total > 0 {
+                100.0 * img / timed_total as f64
+            } else {
+                0.0
+            },
             100.0 * img / total_solve_ns as f64,
         );
     }

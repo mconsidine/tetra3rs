@@ -146,6 +146,8 @@ pub fn decompose_cd(cd: &[[f64; 2]; 2]) -> (f64, f64, f64, bool) {
 ///
 /// The normal equations `(AᵀA)x = Aᵀb` for our 3-parameter LS problem are always 3×3,
 /// so this avoids pulling in a general linear algebra solver.
+// Index-based pivoting/elimination is clearer here than iterator adapters.
+#[allow(clippy::needless_range_loop)]
 fn solve_3x3(a: &[[f64; 3]; 3], b: &[f64; 3]) -> Option<[f64; 3]> {
     // Work on copies
     let mut m = *a;
@@ -281,7 +283,11 @@ fn star_radec(sv: &[f32; 3]) -> StarRaDec {
     profiling::count(buckets::WCS_RADEC, 1);
     let ra = (sv[1] as f64).atan2(sv[0] as f64);
     let dec = (sv[2] as f64).asin();
-    StarRaDec { ra, sin_dec: dec.sin(), cos_dec: dec.cos() }
+    StarRaDec {
+        ra,
+        sin_dec: dec.sin(),
+        cos_dec: dec.cos(),
+    }
 }
 
 /// TAN projection from precomputed star coords and precomputed CRVAL sin/cos.
@@ -313,6 +319,7 @@ fn tan_project_pre(
 /// Jacobian rows are `ξ: [∂ξ/∂θ, 1, 0]` and `η: [∂η/∂θ, 0, 1]`, with
 /// `∂ξ/∂θ = ps·(-sinθ·px − cosθ·py)` and `∂η/∂θ = ps·(cosθ·px − sinθ·py)`.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn accumulate_normal_equations(
     ata: &mut [[f64; 3]; 3],
     atb: &mut [f64; 3],
@@ -563,7 +570,10 @@ pub fn wcs_refine(
 
             debug!(
                 "  inner {}: δθ={:.3e}°, offset=({:.3e}, {:.3e}) rad",
-                inner_iter, d_theta.to_degrees(), dxi_0, deta_0,
+                inner_iter,
+                d_theta.to_degrees(),
+                dxi_0,
+                deta_0,
             );
 
             // Check convergence
@@ -928,9 +938,21 @@ pub fn wcs_to_rotation(
     // Build rotation matrix: rows are camera axes expressed in ICRS
     // R maps ICRS → camera: camera_vec = R * icrs_vec
     let rot = Matrix3::new([
-        [cam_x_icrs[0] as f32, cam_x_icrs[1] as f32, cam_x_icrs[2] as f32],
-        [cam_y_icrs[0] as f32, cam_y_icrs[1] as f32, cam_y_icrs[2] as f32],
-        [boresight[0] as f32, boresight[1] as f32, boresight[2] as f32],
+        [
+            cam_x_icrs[0] as f32,
+            cam_x_icrs[1] as f32,
+            cam_x_icrs[2] as f32,
+        ],
+        [
+            cam_y_icrs[0] as f32,
+            cam_y_icrs[1] as f32,
+            cam_y_icrs[2] as f32,
+        ],
+        [
+            boresight[0] as f32,
+            boresight[1] as f32,
+            boresight[2] as f32,
+        ],
     ]);
 
     // FOV from pixel scale in X direction.
@@ -956,12 +978,7 @@ mod tests {
         let crval_ra = 1.2_f64;
         let crval_dec = 0.3_f64;
 
-        let test_points = [
-            (1.21, 0.31),
-            (1.25, 0.25),
-            (1.15, 0.35),
-            (1.0, 0.0),
-        ];
+        let test_points = [(1.21, 0.31), (1.25, 0.25), (1.15, 0.35), (1.0, 0.0)];
 
         for &(ra, dec) in &test_points {
             let (xi, eta) = tan_project(ra, dec, crval_ra, crval_dec).unwrap();
@@ -969,7 +986,10 @@ mod tests {
             assert!(
                 (ra - ra2).abs() < 1e-12 && (dec - dec2).abs() < 1e-12,
                 "Roundtrip failed for ({}, {}): got ({}, {})",
-                ra, dec, ra2, dec2,
+                ra,
+                dec,
+                ra2,
+                dec2,
             );
         }
     }
@@ -1102,7 +1122,11 @@ mod tests {
         let (rot, fov, parity) = wcs_to_rotation(&cd, crval_ra, crval_dec, image_width);
 
         assert!(!parity);
-        assert!((fov.to_degrees() - 10.0).abs() < 0.01, "FOV: {}", fov.to_degrees());
+        assert!(
+            (fov.to_degrees() - 10.0).abs() < 0.01,
+            "FOV: {}",
+            fov.to_degrees()
+        );
 
         let bore_cam = rot * Vector3::from_array([0.0_f32, 1.0, 0.0]);
         assert!(bore_cam[2] > 0.99, "boresight z = {}", bore_cam[2]);

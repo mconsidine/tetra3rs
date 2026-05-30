@@ -74,8 +74,8 @@ impl PyCalibrateResult {
             n_outliers: b.n_outliers,
             iterations: b.iterations,
         };
-        let bytes = postcard::to_allocvec(&ser)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let bytes =
+            postcard::to_allocvec(&ser).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let from_bytes = slf.get_type().getattr("_from_pickle_bytes")?;
         Ok((from_bytes.unbind(), (bytes,)))
     }

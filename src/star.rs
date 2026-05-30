@@ -39,8 +39,7 @@ pub fn star_from_hipparcos(
     // Hipparcos reference epoch is J1991.25
     const HIPPARCOS_EPOCH_YEAR: f64 = 1991.25;
     // Convert milliarcseconds/year to radians/year
-    const MAS_PER_YR_TO_RAD_PER_YR: f64 =
-        2.0 * std::f64::consts::PI / (3600.0 * 1000.0 * 360.0);
+    const MAS_PER_YR_TO_RAD_PER_YR: f64 = 2.0 * std::f64::consts::PI / (3600.0 * 1000.0 * 360.0);
 
     let (ra, dec) = if let Some(target_year) = epoch_year {
         let dt_years = target_year - HIPPARCOS_EPOCH_YEAR;
@@ -79,15 +78,11 @@ pub fn star_from_hipparcos(
 ///
 /// The source_id is stored directly as `i64` — negative values indicate Hipparcos
 /// gap-fill stars from the merged catalog.
-pub fn star_from_gaia(
-    star: &crate::catalogs::gaia::GaiaStar,
-    epoch_year: Option<f64>,
-) -> Star {
+pub fn star_from_gaia(star: &crate::catalogs::gaia::GaiaStar, epoch_year: Option<f64>) -> Star {
     // Gaia DR3 reference epoch is J2016.0
     const GAIA_EPOCH_YEAR: f64 = 2016.0;
     // Gaia proper motions are in mas/yr, same conversion factor
-    const MAS_PER_YR_TO_RAD_PER_YR: f64 =
-        2.0 * std::f64::consts::PI / (3600.0 * 1000.0 * 360.0);
+    const MAS_PER_YR_TO_RAD_PER_YR: f64 = 2.0 * std::f64::consts::PI / (3600.0 * 1000.0 * 360.0);
 
     let ra_rad = (star.ra_deg as f64).to_radians();
     let dec_rad = (star.dec_deg as f64).to_radians();

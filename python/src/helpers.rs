@@ -142,8 +142,12 @@ pub(crate) fn exactly_one_angle_rad(
     match (deg, rad) {
         (Some(d), None) => Ok((d as f32).to_radians()),
         (None, Some(r)) => Ok(r as f32),
-        (Some(_), Some(_)) => Err(pyo3::exceptions::PyValueError::new_err(both_msg.to_string())),
-        (None, None) => Err(pyo3::exceptions::PyValueError::new_err(neither_msg.to_string())),
+        (Some(_), Some(_)) => Err(pyo3::exceptions::PyValueError::new_err(
+            both_msg.to_string(),
+        )),
+        (None, None) => Err(pyo3::exceptions::PyValueError::new_err(
+            neither_msg.to_string(),
+        )),
     }
 }
 
@@ -157,7 +161,9 @@ pub(crate) fn at_most_one_angle_rad(
     match (deg, rad) {
         (Some(d), None) => Ok(Some((d as f32).to_radians())),
         (None, Some(r)) => Ok(Some(r as f32)),
-        (Some(_), Some(_)) => Err(pyo3::exceptions::PyValueError::new_err(both_msg.to_string())),
+        (Some(_), Some(_)) => Err(pyo3::exceptions::PyValueError::new_err(
+            both_msg.to_string(),
+        )),
         (None, None) => Ok(None),
     }
 }

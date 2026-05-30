@@ -189,9 +189,9 @@
 //!
 
 pub mod aberration;
+pub mod camera_model;
 /// Raw star catalogs (Gaia DR3, optionally Hipparcos)
 pub(crate) mod catalogs;
-pub mod camera_model;
 mod centroid;
 #[cfg(feature = "image")]
 pub mod centroid_extraction;
@@ -201,9 +201,9 @@ pub mod solver;
 pub mod star;
 pub mod starcatalog;
 
+pub use aberration::earth_barycentric_velocity;
 pub use camera_model::CameraModel;
 pub use centroid::*;
-pub use error::{Error, Result};
 #[cfg(feature = "image")]
 pub use centroid_extraction::{
     extract_centroids_from_image, extract_centroids_from_raw, CentroidExtractionConfig,
@@ -213,11 +213,11 @@ pub use distortion::{
     calibrate_camera, num_coeffs, CalibrateConfig, CalibrateResult, Distortion,
     DistortionModelType, PolynomialDistortion, RadialDistortion,
 };
+pub use error::{Error, Result};
 pub use solver::{
     DatabaseProperties, GenerateDatabaseConfig, SolveConfig, SolveResult, SolveStatus,
     SolverDatabase,
 };
-pub use aberration::earth_barycentric_velocity;
 pub use star::*;
 pub use starcatalog::*;
 

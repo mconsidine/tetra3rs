@@ -292,8 +292,7 @@ fn extract_from_gray(
     } else {
         Connectivity::Four
     };
-    let (labels, components) =
-        connected_components_with_label_buffer(&mask, connectivity, 0u8);
+    let (labels, components) = connected_components_with_label_buffer(&mask, connectivity, 0u8);
 
     // ── Step 4: compute centroids ──
     // Use the local-background-subtracted image for centroid weighting so that
@@ -369,8 +368,8 @@ fn estimate_local_background(pixels: &[f32], width: u32, height: u32, block_size
     let bs = block_size as usize;
 
     // Number of blocks in each dimension
-    let nx = (w + bs - 1) / bs;
-    let ny = (h + bs - 1) / bs;
+    let nx = w.div_ceil(bs);
+    let ny = h.div_ceil(bs);
 
     // Compute median for each block
     let mut block_medians = vec![0.0f32; nx * ny];
@@ -508,7 +507,7 @@ fn estimate_background(
     let cmp = |a: &f32, b: &f32| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
     let median = {
         let (lower, nth, _) = values.select_nth_unstable_by(n / 2, cmp);
-        if n % 2 == 0 {
+        if n.is_multiple_of(2) {
             let prev = lower.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             (prev + *nth) / 2.0
         } else {
@@ -518,11 +517,7 @@ fn estimate_background(
 
     // Estimate noise from pixels at or below the median (uncontaminated by stars).
     // These represent the "dark side" of the noise distribution.
-    let mut low_half: Vec<f32> = values
-        .iter()
-        .copied()
-        .filter(|&v| v <= median)
-        .collect();
+    let mut low_half: Vec<f32> = values.iter().copied().filter(|&v| v <= median).collect();
 
     // Sigma-clip the lower half to reject any remaining outliers
     let mut sigma = 0.0_f32;
@@ -708,7 +703,7 @@ fn compute_blob_centroids(
                 let mid = m / 2;
                 let (lower, nth, _) =
                     annulus_vals.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
-                if m % 2 == 0 {
+                if m.is_multiple_of(2) {
                     let prev = lower.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                     (prev + *nth) as f64 / 2.0
                 } else {
@@ -966,7 +961,12 @@ mod tests {
         };
 
         let result = extract_centroids_from_raw(&pixels, width, height, &config).unwrap();
-        assert_eq!(result.centroids.len(), 1, "Expected 1 star, got {}", result.centroids.len());
+        assert_eq!(
+            result.centroids.len(),
+            1,
+            "Expected 1 star, got {}",
+            result.centroids.len()
+        );
 
         // Centroid is in centered coords (origin at image center)
         let c = &result.centroids[0];

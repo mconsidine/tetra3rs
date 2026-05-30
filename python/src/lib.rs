@@ -96,6 +96,8 @@ fn datetime_to_jd(
         + day as f64
         + b as f64
         - 1524.5;
-    let frac = (hour as f64 + minute as f64 / 60.0 + (second as f64 + microsecond as f64 * 1e-6) / 3600.0) / 24.0;
+    let frac =
+        (hour as f64 + minute as f64 / 60.0 + (second as f64 + microsecond as f64 * 1e-6) / 3600.0)
+            / 24.0;
     jd_day + frac
 }

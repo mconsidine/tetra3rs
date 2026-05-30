@@ -381,7 +381,8 @@ fn test_statistical_1000_random_orientations() {
         let roll: f32 = rng.random::<f32>() * 2.0 * std::f32::consts::PI;
 
         let rot = rotation_from_ra_dec_roll(ra, dec, roll);
-        let boresight_icrs = Vector3::from_array([dec.cos() * ra.cos(), dec.cos() * ra.sin(), dec.sin()]);
+        let boresight_icrs =
+            Vector3::from_array([dec.cos() * ra.cos(), dec.cos() * ra.sin(), dec.sin()]);
 
         let centroids = generate_centroids(&db, &rot, &boresight_icrs, half_fov, pixel_scale);
 
@@ -397,8 +398,7 @@ fn test_statistical_1000_random_orientations() {
                 all_solve_times_ms.push(result.solve_time_ms);
 
                 // Compute boresight error
-                let true_quat =
-                    Quaternion::from_rotation_matrix(&rot);
+                let true_quat = Quaternion::from_rotation_matrix(&rot);
                 let solved_quat = result.qicrs2cam.unwrap();
                 let solved_boresight = solved_quat.inverse() * Vector3::from_array([0.0, 0.0, 1.0]);
                 let true_boresight = true_quat.inverse() * Vector3::from_array([0.0, 0.0, 1.0]);
@@ -692,7 +692,8 @@ fn test_statistical_1000_noisy_centroids() {
         let roll: f32 = rng.random::<f32>() * 2.0 * std::f32::consts::PI;
 
         let rot = rotation_from_ra_dec_roll(ra, dec, roll);
-        let boresight_icrs = Vector3::from_array([dec.cos() * ra.cos(), dec.cos() * ra.sin(), dec.sin()]);
+        let boresight_icrs =
+            Vector3::from_array([dec.cos() * ra.cos(), dec.cos() * ra.sin(), dec.sin()]);
 
         let centroids = generate_centroids_with_noise(
             &db,
@@ -715,8 +716,7 @@ fn test_statistical_1000_noisy_centroids() {
             SolveStatus::MatchFound => {
                 all_solve_times_ms.push(result.solve_time_ms);
 
-                let true_quat =
-                    Quaternion::from_rotation_matrix(&rot);
+                let true_quat = Quaternion::from_rotation_matrix(&rot);
                 let solved_quat = result.qicrs2cam.unwrap();
                 let solved_boresight = solved_quat.inverse() * Vector3::from_array([0.0, 0.0, 1.0]);
                 let true_boresight = true_quat.inverse() * Vector3::from_array([0.0, 0.0, 1.0]);
@@ -1068,15 +1068,32 @@ fn test_tracking_with_attitude_hint() {
     };
 
     println!("\n══════════════════════════════════════════════════════════════");
-    println!("  Tracking-mode test ({} trials, {:.1}' hint perturbation)", n_trials, perturb_arcmin);
-    println!("    LIS solves successful:        {:3}/{}", n_lis_ok, n_trials);
-    println!("    Tracking solves successful:   {:3}/{}", n_track_ok, n_lis_ok);
-    println!("    Tracking agrees with LIS:     {:3}/{}", n_track_recovers_perturbed, n_track_ok);
+    println!(
+        "  Tracking-mode test ({} trials, {:.1}' hint perturbation)",
+        n_trials, perturb_arcmin
+    );
+    println!(
+        "    LIS solves successful:        {:3}/{}",
+        n_lis_ok, n_trials
+    );
+    println!(
+        "    Tracking solves successful:   {:3}/{}",
+        n_track_ok, n_lis_ok
+    );
+    println!(
+        "    Tracking agrees with LIS:     {:3}/{}",
+        n_track_recovers_perturbed, n_track_ok
+    );
     println!("    Mean LIS time:      {:7.2} ms", mean(&lis_time_ms));
     println!("    Mean tracking time: {:7.2} ms", mean(&track_time_ms));
     println!("══════════════════════════════════════════════════════════════\n");
 
-    assert!(n_lis_ok >= 15, "LIS only solved {}/{} — DB may be too sparse", n_lis_ok, n_trials);
+    assert!(
+        n_lis_ok >= 15,
+        "LIS only solved {}/{} — DB may be too sparse",
+        n_lis_ok,
+        n_trials
+    );
     assert!(
         n_track_ok as f64 / n_lis_ok as f64 > 0.90,
         "Tracking only succeeded for {}/{} of LIS-solved frames",
@@ -1141,8 +1158,8 @@ fn test_multiscale_database() {
         .expect("save_to_file");
 
     println!("Loading…");
-    let loaded = SolverDatabase::load_from_file(tmp_path.to_str().unwrap())
-        .expect("load_from_file");
+    let loaded =
+        SolverDatabase::load_from_file(tmp_path.to_str().unwrap()).expect("load_from_file");
     assert_eq!(loaded.pattern_catalog.len(), total_slots);
     assert_eq!(loaded.props.num_patterns, db.props.num_patterns);
 
