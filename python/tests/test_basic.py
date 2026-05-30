@@ -227,6 +227,44 @@ class TestRadialDistortion:
         assert abs(cu.x - c.x) < 0.1
         assert abs(cu.y - c.y) < 0.1
 
+    def test_tangential_construction(self):
+        d = tetra3rs.RadialDistortion(k1=-7e-9, k2=2e-15, p1=5e-7, p2=-3e-7)
+        assert d.k1 == pytest.approx(-7e-9)
+        assert d.k2 == pytest.approx(2e-15)
+        assert d.k3 == 0.0
+        assert d.p1 == pytest.approx(5e-7)
+        assert d.p2 == pytest.approx(-3e-7)
+
+    def test_tangential_defaults_zero(self):
+        d = tetra3rs.RadialDistortion(k1=-1e-8)
+        assert d.p1 == 0.0
+        assert d.p2 == 0.0
+
+    def test_tangential_changes_distortion(self):
+        radial_only = tetra3rs.RadialDistortion(k1=-1e-8)
+        with_tang = tetra3rs.RadialDistortion(k1=-1e-8, p1=5e-7, p2=-3e-7)
+        x, y = 300.0, 400.0
+        xr, yr = radial_only.distort(x, y)
+        xt, yt = with_tang.distort(x, y)
+        assert (xr, yr) != (xt, yt)
+
+    def test_tangential_distort_undistort_roundtrip(self):
+        d = tetra3rs.RadialDistortion(k1=-7e-9, k2=2e-15, p1=5e-7, p2=-3e-7)
+        for x, y in [(100.0, 200.0), (-500.0, 300.0), (1024.0, -512.0)]:
+            xd, yd = d.distort(x, y)
+            xu, yu = d.undistort(xd, yd)
+            assert abs(xu - x) < 1e-4
+            assert abs(yu - y) < 1e-4
+
+    def test_tangential_pickle_roundtrip(self):
+        d = tetra3rs.RadialDistortion(k1=-7e-9, k2=2e-15, k3=-1e-24, p1=5e-7, p2=-3e-7)
+        d2 = pickle.loads(pickle.dumps(d))
+        assert d2.k1 == pytest.approx(d.k1)
+        assert d2.k2 == pytest.approx(d.k2)
+        assert d2.k3 == pytest.approx(d.k3)
+        assert d2.p1 == pytest.approx(d.p1)
+        assert d2.p2 == pytest.approx(d.p2)
+
 
 # ---------------------------------------------------------------------------
 # PolynomialDistortion
