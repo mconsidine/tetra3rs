@@ -599,8 +599,6 @@ pub fn wcs_refine(
         };
 
         // ── Phase C: MAD-based outlier rejection ────────────────────────
-        let mut n_rejected = 0usize;
-
         if let Some((median, sigma_est)) = mad_stats {
             let clip_threshold = median + CLIP_NSIGMA * sigma_est;
 
@@ -611,9 +609,8 @@ pub fn wcs_refine(
                     keep_matches.push(current_matches[match_idx]);
                 }
             }
-            n_rejected = old_len - keep_matches.len();
 
-            if n_rejected > 0 && keep_matches.len() >= 4 {
+            if keep_matches.len() < old_len && keep_matches.len() >= 4 {
                 debug!(
                     "  outer {}: MAD clip: {} → {} matches (σ={:.2e} rad, threshold={:.2e} rad)",
                     outer_iter,
@@ -623,13 +620,16 @@ pub fn wcs_refine(
                     clip_threshold,
                 );
                 current_matches = keep_matches;
-            } else {
-                n_rejected = 0;
             }
         }
 
         // ── Phase D: Re-associate (search for new inliers) ─────────────
-        if outer_iter > 0 || n_rejected > 0 {
+        // Run every iteration (including the first): Phase A has already
+        // converged the LS this pass, so the re-association is meaningful, and
+        // detecting a stable match set here lets us break without burning an
+        // extra confirming iteration. `n_rejected` keeps the existing
+        // clip-driven behavior.
+        {
             let cos_t = theta.cos();
             let sin_t = theta.sin();
 
@@ -728,11 +728,12 @@ pub fn wcs_refine(
             }
         }
 
-        // Converged
-        if outer_iter > 0 {
-            debug!("  outer {}: converged", outer_iter);
-            break;
-        }
+        // Converged: reaching here means re-association produced no change this
+        // iteration (a change would have `continue`d above), so the match set is
+        // stable. Break regardless of iteration index — Phase A already
+        // converged the LS fit on this set.
+        debug!("  outer {}: converged", outer_iter);
+        break;
     }
 
     // ── Final MAD clip passes (clip-only, no re-association) ────────────
