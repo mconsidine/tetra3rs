@@ -215,15 +215,18 @@ fn find_pixel_matches(
     let radius_sq = radius_px * radius_px;
     let n_cent = centroid_pixels.len().min(max_centroids);
 
-    // Collect all candidate pairs within radius
-    let mut candidates: Vec<(f64, usize, usize)> = Vec::new(); // (dist_sq, cent_idx, cat_idx)
+    // Collect all candidate pairs within radius. We track the *position* in
+    // `predicted` (not the catalog id) so uniqueness can use a bitset instead of
+    // a HashSet — `predicted` holds distinct catalog stars, so position ↔ id is
+    // a bijection and the dedup result is identical.
+    let mut candidates: Vec<(f64, usize, usize)> = Vec::new(); // (dist_sq, cent_idx, pred_idx)
     for (cent_idx, &(cx, cy)) in centroid_pixels[..n_cent].iter().enumerate() {
-        for &(cat_idx, px, py) in predicted {
+        for (pred_idx, &(_cat_idx, px, py)) in predicted.iter().enumerate() {
             let dx = cx - px;
             let dy = cy - py;
             let d2 = dx * dx + dy * dy;
             if d2 <= radius_sq {
-                candidates.push((d2, cent_idx, cat_idx));
+                candidates.push((d2, cent_idx, pred_idx));
             }
         }
     }
@@ -233,14 +236,14 @@ fn find_pixel_matches(
 
     // Greedy unique 1-to-1 assignment
     let mut used_cent = vec![false; n_cent];
-    let mut used_cat = std::collections::HashSet::new();
+    let mut used_pred = vec![false; predicted.len()];
     let mut matches = Vec::new();
 
-    for &(_, cent_idx, cat_idx) in &candidates {
-        if !used_cent[cent_idx] && !used_cat.contains(&cat_idx) {
+    for &(_, cent_idx, pred_idx) in &candidates {
+        if !used_cent[cent_idx] && !used_pred[pred_idx] {
             used_cent[cent_idx] = true;
-            used_cat.insert(cat_idx);
-            matches.push((cent_idx, cat_idx));
+            used_pred[pred_idx] = true;
+            matches.push((cent_idx, predicted[pred_idx].0));
         }
     }
 
@@ -682,7 +685,15 @@ pub fn wcs_refine(
             let (_, nearby_indices, nearby_radec) = reassoc_cache.as_ref().unwrap();
 
             // Project each cached catalog star to pixel coords via TAN + inverse
-            // rotation, reusing the cached `StarRaDec`.
+            // rotation, reusing the cached `StarRaDec`. Drop stars whose
+            // predicted pixel lands farther than (max centroid radius + match
+            // radius) from the optical center: by the triangle inequality such a
+            // star cannot fall within `radius_px` of any centroid, so it could
+            // never match — pruning it here shrinks the matching loop without
+            // changing the result. (The cone query is padded ~1.5× the frame, so
+            // a large fraction of cached stars project off-frame.)
+            let prune_r = max_cent_dist_px + radius_px;
+            let prune_r2 = prune_r * prune_r;
             let sin_dec0 = crval_dec.sin();
             let cos_dec0 = crval_dec.cos();
             let predicted: Vec<(usize, f64, f64)> = timed!(buckets::WCS_REASSOC_PROJECT, {
@@ -692,7 +703,9 @@ pub fn wcs_refine(
                         tan_project_pre(&nearby_radec[k], crval_ra, sin_dec0, cos_dec0)
                     {
                         let (pred_x, pred_y) = predict_pixel(xi, eta, cos_t, sin_t, inv_ps);
-                        predicted.push((cat_idx, pred_x, pred_y));
+                        if pred_x * pred_x + pred_y * pred_y <= prune_r2 {
+                            predicted.push((cat_idx, pred_x, pred_y));
+                        }
                     }
                 }
                 predicted
