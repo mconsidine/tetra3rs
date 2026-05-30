@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.7.2
+
+Performance and tooling. No breaking public API changes.
 
 ### New features
 
@@ -16,6 +18,30 @@
   byte-compatible `.bin` / `.csv` output, so the new downloader is a
   drop-in when fainter limits are needed. flathub is not on PyPI —
   install from the [upstream repo](https://github.com/flatironinstitute/flathub/tree/prod/py).
+
+### Performance
+
+- **~1.7× faster typical lost-in-space solves** (10° clean field) versus 0.7.1,
+  with identical accuracy. The gain is concentrated in `wcs_refine`, which
+  dominates a successful solve:
+  - Precompute each catalog star's `(ra, sin dec, cos dec)` once and hoist the
+    CRVAL `sin`/`cos` out of the per-star projection loop.
+  - Cache the Phase-D re-association catalog cone query and its projected star
+    set, reusing it across refinement iterations instead of re-querying every
+    pass (catalog query drops from ~4× to ~1× per solve).
+  - Detect a stable match set and stop one iteration earlier.
+  - Prune off-frame predicted stars and use a bitset (not a hash set) in the
+    pixel matcher.
+
+### Internal
+
+- Solver core simplified (dead-code removal, deduplication) with no change to
+  public behavior.
+- New optional `profile` cargo feature adds zero-cost (when disabled)
+  thread-local leaf timers to the solve path, plus an `examples/profile_solve`
+  harness. See `CLAUDE.md`.
+- Added Python test coverage for the tangential `RadialDistortion` parameters
+  (`p1`, `p2`).
 
 ### Other
 
