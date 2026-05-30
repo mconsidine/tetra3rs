@@ -33,6 +33,20 @@ cargo run --release --features profile --example profile_solve -- 5000    # n tr
 
 `[profile.test]` uses `opt-level = 3`.
 
+### Pre-push gate (fmt + clippy)
+
+A committed hook (`.githooks/pre-push`) blocks pushes **to `main`** unless
+`cargo fmt --all --check` and `cargo clippy --all-targets --all-features -D
+warnings` both pass (other branches are not gated). Enable it once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+Keep `main` fmt- and clippy-clean (`--all-features`, so `image`/`hipparcos`/
+`profile`-gated code is linted too). `git push --no-verify` bypasses it for a
+one-off.
+
 The `profile` feature wires thread-local leaf timers into the lost-in-space
 solve path (`solver::profiling`, bucket names in `profiling::buckets`). It is a
 no-op without the feature. Scope: `solve_at_fov` + `wcs_refine` only (not
@@ -76,6 +90,29 @@ Public re-exports in `src/lib.rs` — `CameraModel`, `SolveConfig`, `SolveResult
 - All public types pickle via postcard: `SolverDatabase`, `CameraModel`, `SolveResult`, `CalibrateResult`, `ExtractionResult`, `Centroid`, `RadialDistortion`, `PolynomialDistortion`
 - Gaia catalog bundled via the `gaia-catalog` PyPI package — no manual download needed
 - Wheels: cibuildwheel, cp310–cp314, skips i686/musllinux
+
+## Releasing (version bump — read before tagging)
+
+A release version lives in **three** files that must be bumped in lockstep, or
+publishing breaks in confusing ways:
+
+| File | Field | Drives |
+|---|---|---|
+| `Cargo.toml` | `[package] version` | the `tetra3` **crates.io** crate |
+| **`pyproject.toml`** (repo root) | `[project] version` | the `tetra3rs` **PyPI** wheel name (setuptools-rust reads this, **not** Cargo.toml) |
+| `python/Cargo.toml` | `[package] version` | the PyO3 extension crate (`publish = false`); keep in sync |
+
+⚠️ The easy trap (hit in 0.7.2): bumping `Cargo.toml` but **not** root
+`pyproject.toml`. The crates.io publish succeeds while wheels build under the
+*old* version and the PyPI upload fails with "file already exists." Always grep
+`grep -rn '<old-version>' Cargo.toml pyproject.toml python/Cargo.toml` and
+update `CHANGELOG.md` before tagging.
+
+Publishing:
+- **crates.io (Rust):** manual — `cargo publish -p tetra3` (no CI automation).
+- **PyPI (Python):** automated by `.github/workflows/publish.yml` on a `v*` tag
+  push (`git tag vX.Y.Z && git push origin vX.Y.Z`). The tagged commit must
+  already carry all three version bumps.
 
 ## Tests
 

@@ -1,0 +1,32 @@
+#!/bin/sh
+# Pre-push gate: enforce rustfmt + clippy (warnings-as-errors) before pushing
+# to `main`. Pushes to other branches are not gated (fast feature-branch flow).
+#
+# Enable once per clone:
+#     git config core.hooksPath .githooks
+#
+# Bypass for a one-off push (use sparingly):
+#     git push --no-verify
+
+push_to_main=0
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+    case "$remote_ref" in
+        refs/heads/main) push_to_main=1 ;;
+    esac
+done
+[ "$push_to_main" -eq 1 ] || exit 0
+
+echo "pre-push (main): cargo fmt --all --check"
+if ! cargo fmt --all -- --check; then
+    echo "✗ rustfmt: formatting issues — run 'cargo fmt --all' and re-commit." >&2
+    exit 1
+fi
+
+echo "pre-push (main): cargo clippy --all-targets --all-features -D warnings"
+if ! cargo clippy --all-targets --all-features -- -D warnings; then
+    echo "✗ clippy: warnings present — fix them (or 'cargo clippy --fix') and re-commit." >&2
+    exit 1
+fi
+
+echo "pre-push (main): ✓ fmt + clippy clean"
+exit 0
