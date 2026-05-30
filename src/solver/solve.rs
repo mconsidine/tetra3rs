@@ -26,6 +26,9 @@ use super::pattern::{
 use super::wcs_refine;
 use super::{SolveConfig, SolveResult, SolveStatus, SolverDatabase};
 
+#[cfg(feature = "profile")]
+use crate::solver::profiling::{self, buckets};
+
 /// Speed of light in km/s.
 pub(super) const C_KM_S: f64 = 299_792.458;
 
@@ -181,6 +184,9 @@ impl SolverDatabase {
         star_vectors: &[[f32; 3]],
         t0: Instant,
     ) -> SolveResult {
+        #[cfg(feature = "profile")]
+        profiling::count(buckets::FOV_PASS, 1);
+
         // True pinhole pixel scale (rad/px): ps = 1/f where f = (W/2) / tan(fov/2).
         let pixel_scale = if config.image_width > 0 && fov_estimate > 0.0 {
             let f = (config.image_width as f32 / 2.0) / (fov_estimate / 2.0).tan();
@@ -305,10 +311,18 @@ impl SolverDatabase {
                 centroid_vectors[image_pattern_local[3]],
             ];
 
+            #[cfg(feature = "profile")]
+            profiling::count(buckets::COMBOS, 1);
+
             // Compute edge angles and ratios
-            let edge_angles = compute_sorted_edge_angles(&image_vecs);
+            // (image-side edges: this is exactly what an N×N precomputed
+            // pairwise-angle matrix would replace with table lookups.)
+            let (edge_angles, image_ratios) = timed!(buckets::IMAGE_EDGES, {
+                let ea = compute_sorted_edge_angles(&image_vecs);
+                let ir = compute_edge_ratios(&ea);
+                (ea, ir)
+            });
             let image_largest_edge = edge_angles[NUM_EDGES - 1];
-            let image_ratios = compute_edge_ratios(&edge_angles);
 
             // Broadened range for pattern key lookup
             let ratio_min: [f32; NUM_EDGE_RATIOS] =
@@ -326,8 +340,10 @@ impl SolverDatabase {
 
             // Build list of candidate pattern keys, sorted by distance from image_key
             pattern_key_list.clear();
-            enumerate_key_range(&key_min, &key_max, &image_key, &mut pattern_key_list);
-            pattern_key_list.sort_unstable_by_key(|&(dist, _)| dist);
+            timed!(buckets::KEY_ENUM, {
+                enumerate_key_range(&key_min, &key_max, &image_key, &mut pattern_key_list);
+                pattern_key_list.sort_unstable_by_key(|&(dist, _)| dist);
+            });
 
             let table_len = self.pattern_catalog.len() as u64;
 
@@ -350,6 +366,9 @@ impl SolverDatabase {
                         continue;
                     }
 
+                    #[cfg(feature = "profile")]
+                    profiling::count(buckets::CANDIDATES, 1);
+
                     // FOV consistency check: the catalog pattern's largest edge
                     // should be close to the image pattern's largest edge.
                     let cat_largest = entry.largest_edge;
@@ -369,9 +388,15 @@ impl SolverDatabase {
                         star_vectors[cat_pat[2] as usize],
                         star_vectors[cat_pat[3] as usize],
                     ];
-                    let cat_edges = compute_sorted_edge_angles(&cat_vecs);
+                    // Catalog-side edges: the analogue of `image_edges`, but
+                    // computed per surviving candidate and NOT precomputable
+                    // per-image (depends on which catalog pattern matched).
+                    let (cat_edges, cat_ratios) = timed!(buckets::CAT_EDGES, {
+                        let ce = compute_sorted_edge_angles(&cat_vecs);
+                        let cr = compute_edge_ratios(&ce);
+                        (ce, cr)
+                    });
                     let cat_largest_edge = cat_edges[NUM_EDGES - 1];
-                    let cat_ratios = compute_edge_ratios(&cat_edges);
 
                     // Check all edge ratios are within tolerance
                     let ratios_ok = (0..NUM_EDGE_RATIOS)
@@ -395,8 +420,12 @@ impl SolverDatabase {
                         std::array::from_fn(|i| image_vecs[img_order[i]]);
                     let matched_cat: [[f32; 3]; 4] = std::array::from_fn(|i| cat_vecs[i]);
 
+                    #[cfg(feature = "profile")]
+                    profiling::count(buckets::RATIO_PASS, 1);
+
                     // SVD rotation: finds R such that camera_vec ≈ R * icrs_vec
-                    let mut rotation_matrix = find_rotation_matrix(&matched_img, &matched_cat);
+                    let mut rotation_matrix =
+                        timed!(buckets::SVD, find_rotation_matrix(&matched_img, &matched_cat));
 
                     // Determine parity from the rotation determinant.
                     // centroid_vectors is never mutated; when parity is needed we use
@@ -411,7 +440,10 @@ impl SolverDatabase {
                             let orig = image_vecs[img_order[i]];
                             [-orig[0], orig[1], orig[2]]
                         });
-                        rotation_matrix = find_rotation_matrix(&matched_img_flip, &matched_cat);
+                        rotation_matrix = timed!(
+                            buckets::SVD,
+                            find_rotation_matrix(&matched_img_flip, &matched_cat)
+                        );
                         if rotation_matrix.det() < 0.0 {
                             continue; // still a reflection — skip
                         }
@@ -439,11 +471,16 @@ impl SolverDatabase {
                     // Use the stored (un-aberrated) unit vectors as the query
                     // cache: they are bit-identical to `Star::uvec()` and aligned
                     // with the catalog, so the candidate set is unchanged.
-                    let nearby_inds = self.star_catalog.query_indices_from_uvec_cached(
-                        image_center_icrs,
-                        fov_diagonal / 2.0,
-                        &self.star_vectors,
+                    let nearby_inds = timed!(
+                        buckets::VERIFY_QUERY,
+                        self.star_catalog.query_indices_from_uvec_cached(
+                            image_center_icrs,
+                            fov_diagonal / 2.0,
+                            &self.star_vectors,
+                        )
                     );
+                    #[cfg(feature = "profile")]
+                    profiling::count(buckets::VERIFY_QUERY_STARS, nearby_inds.len() as u64);
 
                     // Project catalog stars to camera frame
                     let mut nearby_cam_positions: Vec<(usize, f32, f32)> = Vec::new();
@@ -463,10 +500,13 @@ impl SolverDatabase {
                     let num_nearby = nearby_cam_positions.len();
 
                     // Match image centroids to projected catalog stars
-                    let current_matches = find_centroid_matches(
-                        &working_vectors[..match_centroid_count],
-                        &nearby_cam_positions,
-                        match_radius_rad,
+                    let current_matches = timed!(
+                        buckets::VERIFY_MATCH,
+                        find_centroid_matches(
+                            &working_vectors[..match_centroid_count],
+                            &nearby_cam_positions,
+                            match_radius_rad,
+                        )
                     );
                     let current_num_matches = current_matches.len();
 
@@ -510,17 +550,22 @@ impl SolverDatabase {
                         1.0 / f
                     };
 
-                    let wcs_result = wcs_refine::wcs_refine(
-                        &rotation_matrix,
-                        &current_matches,
-                        &centroids_px,
-                        star_vectors,
-                        &self.star_catalog,
-                        ps_refine,
-                        parity_flip,
-                        match_radius_rad,
-                        match_centroid_count,
-                        10,
+                    #[cfg(feature = "profile")]
+                    profiling::count(buckets::WCS_REFINE, 1);
+                    let wcs_result = timed!(
+                        buckets::WCS_REFINE,
+                        wcs_refine::wcs_refine(
+                            &rotation_matrix,
+                            &current_matches,
+                            &centroids_px,
+                            star_vectors,
+                            &self.star_catalog,
+                            ps_refine,
+                            parity_flip,
+                            match_radius_rad,
+                            match_centroid_count,
+                            10,
+                        )
                     );
 
                     if wcs_result.matches.len() < 4 {

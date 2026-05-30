@@ -23,9 +23,22 @@ cargo test --test tess_solve_test --features image -- --nocapture
 
 # Python (maturin via setuptools-rust)
 pip install -e .
+
+# Solver profiling (feature-gated leaf timers; zero-cost when off)
+cargo run --release --features profile --example profile_solve            # 2000 solves
+cargo run --release --features profile --example profile_solve -- 5000    # n trials
+# Scenario knobs (env): T3_SPURIOUS=K appends K false centroids per field;
+# T3_RANDOM=1 makes each field fully random (forces no-match enumeration).
 ```
 
 `[profile.test]` uses `opt-level = 3`.
+
+The `profile` feature wires thread-local leaf timers into the lost-in-space
+solve path (`solver::profiling`, bucket names in `profiling::buckets`). It is a
+no-op without the feature. Scope: `solve_at_fov` + `wcs_refine` only (not
+tracking or DB generation). Profiling shows `wcs_refine` dominates easy solves
+(~90%), with its Phase-D re-association (catalog query + project + match) the
+largest internal cost.
 
 ## Module layout (`src/`)
 

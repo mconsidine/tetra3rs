@@ -34,6 +34,9 @@ image = { version = "0.25", optional = true, default-features = false }
 [features]
 default = []
 hipparcos = []
+# Leaf-level solver timing instrumentation (thread-local accumulators).
+# Compiles to nothing when disabled. See src/solver/profiling.rs.
+profile = []
 # Centroid extraction also pulls in numeris's imageproc (used for CCL).
 image = ["dep:image", "numeris/imageproc"]
 

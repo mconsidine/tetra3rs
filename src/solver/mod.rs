@@ -11,9 +11,24 @@
 //!
 //! Reference: cedar-solve / tetra3 by Gustav Pettersson (ESA) and Steven Rosenthal.
 
+/// Time `$e`, attributing the elapsed nanoseconds (and one operation) to
+/// `$bucket`. With the `profile` feature off this expands to just `$e`.
+macro_rules! timed {
+    ($bucket:expr, $e:expr) => {{
+        #[cfg(feature = "profile")]
+        let __t0 = std::time::Instant::now();
+        let __res = $e;
+        #[cfg(feature = "profile")]
+        $crate::solver::profiling::record($bucket, __t0.elapsed().as_nanos(), 1);
+        __res
+    }};
+}
+
 pub(crate) mod combinations;
 pub(crate) mod database;
 pub(crate) mod pattern;
+#[cfg(feature = "profile")]
+pub mod profiling;
 pub(crate) mod solve;
 pub(crate) mod track;
 pub(crate) mod wcs_refine;

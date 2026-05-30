@@ -26,6 +26,9 @@ use tracing::debug;
 
 use crate::starcatalog::StarCatalog;
 
+#[cfg(feature = "profile")]
+use crate::solver::profiling::{self, buckets};
+
 // ── TAN projection ─────────────────────────────────────────────────────────
 
 /// Forward gnomonic (TAN) projection.
@@ -257,12 +260,48 @@ fn predict_tanplane(px: f64, py: f64, cos_t: f64, sin_t: f64, ps: f64) -> (f64, 
     (xi, eta)
 }
 
-/// Decode a catalog star's ICRS unit vector into `(ra, dec)` in radians.
+/// Precomputed per-star projection inputs: right ascension plus the sine and
+/// cosine of declination. Decoded once from the ICRS unit vector and reused
+/// across every refinement pass (the `atan2`/`asin`/`sin`/`cos` would otherwise
+/// be recomputed for the same star on every iteration).
+#[derive(Clone, Copy)]
+struct StarRaDec {
+    ra: f64,
+    sin_dec: f64,
+    cos_dec: f64,
+}
+
+/// Decode a catalog star's ICRS unit vector into [`StarRaDec`].
 #[inline]
-fn sv_to_radec(sv: &[f32; 3]) -> (f64, f64) {
+fn star_radec(sv: &[f32; 3]) -> StarRaDec {
+    #[cfg(feature = "profile")]
+    profiling::count(buckets::WCS_RADEC, 1);
     let ra = (sv[1] as f64).atan2(sv[0] as f64);
     let dec = (sv[2] as f64).asin();
-    (ra, dec)
+    StarRaDec { ra, sin_dec: dec.sin(), cos_dec: dec.cos() }
+}
+
+/// TAN projection from precomputed star coords and precomputed CRVAL sin/cos.
+///
+/// Equivalent to [`tan_project`] but takes a [`StarRaDec`] (star dec sin/cos
+/// already known) and the CRVAL declination sin/cos hoisted out of the per-star
+/// loop, leaving only `cos(da)`/`sin(da)` to compute per call.
+#[inline]
+fn tan_project_pre(
+    s: &StarRaDec,
+    crval_ra: f64,
+    sin_dec0: f64,
+    cos_dec0: f64,
+) -> Option<(f64, f64)> {
+    let da = s.ra - crval_ra;
+    let cos_da = da.cos();
+    let denom = s.sin_dec * sin_dec0 + s.cos_dec * cos_dec0 * cos_da;
+    if denom <= 1e-12 {
+        return None;
+    }
+    let xi = s.cos_dec * da.sin() / denom;
+    let eta = (s.sin_dec * cos_dec0 - s.cos_dec * sin_dec0 * cos_da) / denom;
+    Some((xi, eta))
 }
 
 /// Accumulate one matched star's contribution to the 3-parameter
@@ -429,27 +468,60 @@ pub fn wcs_refine(
     // ── Working state ───────────────────────────────────────────────────
     let mut current_matches: Vec<(usize, usize)> = initial_matches.to_vec();
 
+    // Phase-D search geometry is constant across iterations (depends only on the
+    // centroid positions and pixel scale), so compute it once.
+    let max_cent_dist_px = centroids_px
+        .iter()
+        .map(|(x, y)| (x * x + y * y).sqrt())
+        .fold(0.0f64, f64::max);
+    let search_radius = (ps * max_cent_dist_px * 1.5).max(match_radius_rad as f64 * 2.0);
+
+    // Phase-D re-association cache: the boresight barely moves between outer
+    // iterations, so we query the catalog cone once (padded by REQUERY_MARGIN)
+    // and reuse the star set + its precomputed `StarRaDec` until the boresight
+    // drifts past the margin. The cached set is a superset of any single
+    // iteration's query, and the extra (annulus) stars project well outside the
+    // image so they never enter `find_pixel_matches` — results are unchanged.
+    let requery_margin = match_radius_rad as f64 * 2.0;
+    let requery_cos = requery_margin.cos();
+    let mut reassoc_cache: Option<(Vector3<f64>, Vec<usize>, Vec<StarRaDec>)> = None;
+
     // ── Outer refinement loop ───────────────────────────────────────────
     for outer_iter in 0..max_iterations {
+        #[cfg(feature = "profile")]
+        profiling::count(buckets::WCS_OUTER, 1);
+        // Precompute per-star (ra, sin_dec, cos_dec) for the current match set
+        // once; reused by Phase A's inner loop and Phase B. The values depend
+        // only on the star, not on θ/CRVAL.
+        let match_radec: Vec<StarRaDec> = current_matches
+            .iter()
+            .map(|&(_, cat_idx)| star_radec(&star_vectors[cat_idx]))
+            .collect();
+
         // ── Phase A: LS fit (δθ, dξ₀, dη₀) ──────────────────────────
         for inner_iter in 0..10 {
             if current_matches.len() < 3 {
                 break;
             }
+            #[cfg(feature = "profile")]
+            profiling::count(buckets::WCS_INNER, 1);
 
             let cos_t = theta.cos();
             let sin_t = theta.sin();
+            // CRVAL changes each inner iteration; hoist its sin/cos out of the
+            // per-star loop (was recomputed inside tan_project for every star).
+            let sin_dec0 = crval_dec.sin();
+            let cos_dec0 = crval_dec.cos();
 
             // Build normal equations AᵀA x = Aᵀb for 3 unknowns: [δθ, dξ₀, dη₀]
             let mut ata = [[0.0f64; 3]; 3];
             let mut atb = [0.0f64; 3];
             let mut n_valid = 0u32;
 
-            for &(cent_idx, cat_idx) in &current_matches {
-                let sv = &star_vectors[cat_idx];
-                let (star_ra, star_dec) = sv_to_radec(sv);
-
-                let Some((xi_cat, eta_cat)) = tan_project(star_ra, star_dec, crval_ra, crval_dec) else {
+            for (i, &(cent_idx, _)) in current_matches.iter().enumerate() {
+                let Some((xi_cat, eta_cat)) =
+                    tan_project_pre(&match_radec[i], crval_ra, sin_dec0, cos_dec0)
+                else {
                     continue;
                 };
 
@@ -500,13 +572,14 @@ pub fn wcs_refine(
         // ── Phase B: Compute residuals ──────────────────────────────────
         let cos_t = theta.cos();
         let sin_t = theta.sin();
+        let sin_dec0 = crval_dec.sin();
+        let cos_dec0 = crval_dec.cos();
 
         let mut residuals: Vec<(usize, f64)> = Vec::with_capacity(current_matches.len());
-        for (match_idx, &(cent_idx, cat_idx)) in current_matches.iter().enumerate() {
-            let sv = &star_vectors[cat_idx];
-            let (star_ra, star_dec) = sv_to_radec(sv);
-
-            if let Some((xi_cat, eta_cat)) = tan_project(star_ra, star_dec, crval_ra, crval_dec) {
+        for (match_idx, &(cent_idx, _)) in current_matches.iter().enumerate() {
+            if let Some((xi_cat, eta_cat)) =
+                tan_project_pre(&match_radec[match_idx], crval_ra, sin_dec0, cos_dec0)
+            {
                 let (px, py) = centroids_px[cent_idx];
                 let (xi_pred, eta_pred) = predict_tanplane(px, py, cos_t, sin_t, ps);
                 let dxi = xi_pred - xi_cat;
@@ -570,39 +643,69 @@ pub fn wcs_refine(
                 radius_px
             };
 
-            // Query catalog stars near boresight
+            // Current boresight in ICRS.
             let boresight = Vector3::from_array([
                 crval_dec.cos() * crval_ra.cos(),
                 crval_dec.cos() * crval_ra.sin(),
                 crval_dec.sin(),
             ]);
-            let max_cent_dist_px = centroids_px
-                .iter()
-                .map(|(x, y)| (x * x + y * y).sqrt())
-                .fold(0.0f64, f64::max);
-            let search_radius =
-                (ps * max_cent_dist_px * 1.5).max(match_radius_rad as f64 * 2.0);
-            let nearby_indices = star_catalog.query_indices_from_uvec(
-                Vector3::from_array([boresight[0] as f32, boresight[1] as f32, boresight[2] as f32]),
-                search_radius as f32,
-            );
 
-            // Project each catalog star to pixel coords via TAN + inverse rotation
-            let mut predicted: Vec<(usize, f64, f64)> = Vec::new();
-            for &cat_idx in &nearby_indices {
-                let sv = &star_vectors[cat_idx];
-                let (sra, sdec) = sv_to_radec(sv);
-                if let Some((xi, eta)) = tan_project(sra, sdec, crval_ra, crval_dec) {
-                    let (pred_x, pred_y) = predict_pixel(xi, eta, cos_t, sin_t, inv_ps);
-                    predicted.push((cat_idx, pred_x, pred_y));
+            // (Re)query the catalog cone only when the cache is empty or the
+            // boresight has drifted past the padding margin. Cache the star set
+            // and its precomputed `StarRaDec` (atan2/asin done once, not per
+            // outer iteration).
+            let need_query = match &reassoc_cache {
+                Some((qb, _, _)) => qb.dot(&boresight) < requery_cos,
+                None => true,
+            };
+            if need_query {
+                let idx = timed!(
+                    buckets::WCS_REASSOC_QUERY,
+                    star_catalog.query_indices_from_uvec(
+                        Vector3::from_array([
+                            boresight[0] as f32,
+                            boresight[1] as f32,
+                            boresight[2] as f32,
+                        ]),
+                        (search_radius + requery_margin) as f32,
+                    )
+                );
+                #[cfg(feature = "profile")]
+                {
+                    profiling::count(buckets::WCS_REASSOC_CALL, 1);
+                    profiling::count(buckets::WCS_REASSOC_STARS, idx.len() as u64);
                 }
+                let radec: Vec<StarRaDec> =
+                    idx.iter().map(|&i| star_radec(&star_vectors[i])).collect();
+                reassoc_cache = Some((boresight, idx, radec));
             }
+            let (_, nearby_indices, nearby_radec) = reassoc_cache.as_ref().unwrap();
 
-            let new_matches = find_pixel_matches(
-                centroids_px,
-                max_match_centroids,
-                &predicted,
-                adaptive_radius_px,
+            // Project each cached catalog star to pixel coords via TAN + inverse
+            // rotation, reusing the cached `StarRaDec`.
+            let sin_dec0 = crval_dec.sin();
+            let cos_dec0 = crval_dec.cos();
+            let predicted: Vec<(usize, f64, f64)> = timed!(buckets::WCS_REASSOC_PROJECT, {
+                let mut predicted: Vec<(usize, f64, f64)> = Vec::new();
+                for (k, &cat_idx) in nearby_indices.iter().enumerate() {
+                    if let Some((xi, eta)) =
+                        tan_project_pre(&nearby_radec[k], crval_ra, sin_dec0, cos_dec0)
+                    {
+                        let (pred_x, pred_y) = predict_pixel(xi, eta, cos_t, sin_t, inv_ps);
+                        predicted.push((cat_idx, pred_x, pred_y));
+                    }
+                }
+                predicted
+            });
+
+            let new_matches = timed!(
+                buckets::WCS_REASSOC_MATCH,
+                find_pixel_matches(
+                    centroids_px,
+                    max_match_centroids,
+                    &predicted,
+                    adaptive_radius_px,
+                )
             );
 
             if new_matches.len() >= 4 {
@@ -640,12 +743,18 @@ pub fn wcs_refine(
 
         let cos_t = theta.cos();
         let sin_t = theta.sin();
+        let sin_dec0 = crval_dec.sin();
+        let cos_dec0 = crval_dec.cos();
+        let match_radec: Vec<StarRaDec> = current_matches
+            .iter()
+            .map(|&(_, cat_idx)| star_radec(&star_vectors[cat_idx]))
+            .collect();
 
         let mut residuals: Vec<(usize, f64)> = Vec::new();
-        for (match_idx, &(cent_idx, cat_idx)) in current_matches.iter().enumerate() {
-            let sv = &star_vectors[cat_idx];
-            let (sra, sdec) = sv_to_radec(sv);
-            if let Some((xi_cat, eta_cat)) = tan_project(sra, sdec, crval_ra, crval_dec) {
+        for (match_idx, &(cent_idx, _)) in current_matches.iter().enumerate() {
+            if let Some((xi_cat, eta_cat)) =
+                tan_project_pre(&match_radec[match_idx], crval_ra, sin_dec0, cos_dec0)
+            {
                 let (px, py) = centroids_px[cent_idx];
                 let (xi_pred, eta_pred) = predict_tanplane(px, py, cos_t, sin_t, ps);
                 let dxi = xi_pred - xi_cat;
@@ -685,13 +794,14 @@ pub fn wcs_refine(
         {
             let cos_t = theta.cos();
             let sin_t = theta.sin();
+            let sin_dec0 = crval_dec.sin();
+            let cos_dec0 = crval_dec.cos();
 
             let mut ata = [[0.0f64; 3]; 3];
             let mut atb = [0.0f64; 3];
             for &(cent_idx, cat_idx) in &current_matches {
-                let sv = &star_vectors[cat_idx];
-                let (sra, sdec) = sv_to_radec(sv);
-                if let Some((xi_cat, eta_cat)) = tan_project(sra, sdec, crval_ra, crval_dec) {
+                let s = star_radec(&star_vectors[cat_idx]);
+                if let Some((xi_cat, eta_cat)) = tan_project_pre(&s, crval_ra, sin_dec0, cos_dec0) {
                     let (px, py) = centroids_px[cent_idx];
                     let (xi_pred, eta_pred) = predict_tanplane(px, py, cos_t, sin_t, ps);
                     let r_xi = xi_cat - xi_pred;
@@ -713,12 +823,13 @@ pub fn wcs_refine(
     // ── Compute final residual statistics ────────────────────────────────
     let cos_t = theta.cos();
     let sin_t = theta.sin();
+    let sin_dec0 = crval_dec.sin();
+    let cos_dec0 = crval_dec.cos();
 
     let mut final_residuals: Vec<f64> = Vec::with_capacity(current_matches.len());
     for &(cent_idx, cat_idx) in &current_matches {
-        let sv = &star_vectors[cat_idx];
-        let (sra, sdec) = sv_to_radec(sv);
-        if let Some((xi_cat, eta_cat)) = tan_project(sra, sdec, crval_ra, crval_dec) {
+        let s = star_radec(&star_vectors[cat_idx]);
+        if let Some((xi_cat, eta_cat)) = tan_project_pre(&s, crval_ra, sin_dec0, cos_dec0) {
             let (px, py) = centroids_px[cent_idx];
             let (xi_pred, eta_pred) = predict_tanplane(px, py, cos_t, sin_t, ps);
             let dxi = xi_pred - xi_cat;
