@@ -715,6 +715,27 @@ class SolverDatabase:
         """Minimum FOV the database was built for (degrees)."""
         ...
 
+    @property
+    def parameters(self) -> dict:
+        """Database generation parameters as a dict.
+
+        Returns the settings baked into this database when it was generated
+        (stars per FOV, lattice field oversampling, pattern quantization, FOV
+        range, magnitude limit, epochs). Read from the stored properties, so
+        they reflect the actual database on disk -- not solve-time options.
+        """
+        ...
+
+    def print_parameters(self) -> None:
+        """Print the database generation parameters to stdout.
+
+        Human-readable dump of the settings this database was built with --
+        stars per FOV, lattice field oversampling, pattern quantization, FOV
+        range, magnitude limit, and epochs. See ``parameters`` for the same
+        data as a dict.
+        """
+        ...
+
     def get_star(self, index: int) -> CatalogStar:
         """Get a catalog star by its internal index (0-based, brightness order).
 

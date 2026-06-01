@@ -153,7 +153,7 @@ impl PyExtractionResult {
         let centroids = ser
             .centroids
             .into_iter()
-            .map(|cs| PyCentroid { inner: cs.into() })
+            .map(|cs| PyCentroid { inner: cs })
             .collect();
         Ok(Self {
             centroids,
@@ -215,6 +215,7 @@ impl PyExtractionResult {
     max_elongation = Some(3.0),
     matched_filter_sigma = None,
 ))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_centroids(
     image: &Bound<'_, pyo3::PyAny>,
     sigma_threshold: f32,

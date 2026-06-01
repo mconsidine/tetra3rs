@@ -62,6 +62,7 @@ impl PySolverDatabase {
         epoch_proper_motion_year = Some(2025.0),
         catalog_nside = 16,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn generate_from_gaia(
         py: Python<'_>,
         catalog_path: Option<&str>,
@@ -308,6 +309,86 @@ impl PySolverDatabase {
         self.inner.props.min_fov_rad.to_degrees()
     }
 
+    /// Database generation parameters as a dict.
+    ///
+    /// Returns the settings baked into this database when it was generated
+    /// (stars per FOV, lattice field oversampling, pattern quantization, FOV
+    /// range, magnitude limit, epochs, …). These are read from the stored
+    /// [`DatabaseProperties`], so they reflect the actual database on disk —
+    /// not solve-time options.
+    ///
+    /// Returns:
+    ///     dict mapping parameter name to value.
+    #[getter]
+    fn parameters<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let p = &self.inner.props;
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("num_stars", self.inner.star_catalog.len())?;
+        d.set_item("num_patterns", p.num_patterns)?;
+        d.set_item("min_fov_deg", p.min_fov_rad.to_degrees())?;
+        d.set_item("max_fov_deg", p.max_fov_rad.to_degrees())?;
+        d.set_item("star_max_magnitude", p.star_max_magnitude)?;
+        d.set_item("pattern_bins", p.pattern_bins)?;
+        d.set_item("pattern_max_error", p.pattern_max_error)?;
+        d.set_item("verification_stars_per_fov", p.verification_stars_per_fov)?;
+        d.set_item("lattice_field_oversampling", p.lattice_field_oversampling)?;
+        d.set_item("patterns_per_lattice_field", p.patterns_per_lattice_field)?;
+        d.set_item("epoch_equinox", p.epoch_equinox)?;
+        d.set_item("epoch_proper_motion_year", p.epoch_proper_motion_year)?;
+        Ok(d)
+    }
+
+    /// Print the database generation parameters to stdout.
+    ///
+    /// Human-readable dump of the settings this database was built with —
+    /// stars per FOV, lattice field oversampling, pattern quantization, FOV
+    /// range, magnitude limit, and epochs. Useful for inspecting an opaque
+    /// `.bin` database. See [`parameters`] for the same data as a dict.
+    fn print_parameters(&self) {
+        let p = &self.inner.props;
+        println!("Solver database parameters:");
+        println!("  catalog");
+        println!(
+            "    num_stars                  : {}",
+            self.inner.star_catalog.len()
+        );
+        println!(
+            "    star_max_magnitude         : {:.2}",
+            p.star_max_magnitude
+        );
+        println!("    epoch_equinox              : {}", p.epoch_equinox);
+        println!(
+            "    epoch_proper_motion_year   : {:.1}",
+            p.epoch_proper_motion_year
+        );
+        println!("  field of view");
+        println!(
+            "    min_fov_deg                : {:.3}",
+            p.min_fov_rad.to_degrees()
+        );
+        println!(
+            "    max_fov_deg                : {:.3}",
+            p.max_fov_rad.to_degrees()
+        );
+        println!("  pattern hash");
+        println!("    num_patterns               : {}", p.num_patterns);
+        println!("    pattern_bins               : {}", p.pattern_bins);
+        println!("    pattern_max_error          : {}", p.pattern_max_error);
+        println!("  generation");
+        println!(
+            "    verification_stars_per_fov : {}",
+            p.verification_stars_per_fov
+        );
+        println!(
+            "    lattice_field_oversampling : {}",
+            p.lattice_field_oversampling
+        );
+        println!(
+            "    patterns_per_lattice_field : {}",
+            p.patterns_per_lattice_field
+        );
+    }
+
     fn __reduce__(slf: &Bound<'_, Self>) -> PyResult<(Py<PyAny>, (Vec<u8>,))> {
         let bytes = slf.borrow().inner.to_bytes();
         let from_bytes = slf.get_type().getattr("_from_pickle_bytes")?;
@@ -455,6 +536,7 @@ impl PySolverDatabase {
         sigma_clip = 3.0,
         convergence_threshold_px = 0.01,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn calibrate_camera<'py>(
         &self,
         _py: Python<'py>,

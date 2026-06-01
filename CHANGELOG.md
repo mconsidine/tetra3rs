@@ -4,6 +4,14 @@
 
 ### New features
 
+- **`SolverDatabase.print_parameters()` / `.parameters` (Python).** Report the
+  settings a database was generated with — stars per FOV
+  (`verification_stars_per_fov`), lattice field oversampling, patterns per
+  lattice field, pattern quantization (`pattern_bins` / `pattern_max_error`),
+  FOV range, magnitude limit, catalog/proper-motion epochs, and star/pattern
+  counts. `print_parameters()` prints a grouped, human-readable dump;
+  `parameters` returns the same data as a dict. Both read the stored database
+  properties, so they reflect the actual `.bin` on disk.
 - **Optional `parallel` cargo feature: multi-threaded centroid extraction.**
   Rayon-based parallelism for the extraction hot paths, off by default.
   Parallelizes the dominant local-background stage (independent block medians +
