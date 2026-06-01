@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.3
+## 0.7.4
 
 ### New features
 
@@ -12,6 +12,22 @@
   counts. `print_parameters()` prints a grouped, human-readable dump;
   `parameters` returns the same data as a dict. Both read the stored database
   properties, so they reflect the actual `.bin` on disk.
+
+### Internal
+
+- Silenced pre-existing clippy `too_many_arguments` warnings on the
+  kwargs-heavy PyO3 functions and a redundant `Centroid` conversion in the
+  Python crate.
+
+> **Note on 0.7.3 / PyPI.** The crates.io `tetra3` 0.7.3 release is valid. The
+> `tetra3rs` **PyPI** 0.7.3 wheels were withdrawn after a partial upload, and
+> PyPI permanently reserves used filenames — so the Python package skips from
+> 0.7.2 to 0.7.4. Everything in 0.7.3 below ships in the 0.7.4 wheels.
+
+## 0.7.3
+
+### New features
+
 - **Optional `parallel` cargo feature: multi-threaded centroid extraction.**
   Rayon-based parallelism for the extraction hot paths, off by default.
   Parallelizes the dominant local-background stage (independent block medians +
