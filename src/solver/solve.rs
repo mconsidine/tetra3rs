@@ -19,12 +19,16 @@ use tracing::debug;
 use crate::Centroid;
 
 use super::combinations::BreadthFirstCombinations;
+use super::database::separation_for_density;
 use super::pattern::{
     compute_edge_ratios, compute_pattern_key, compute_pattern_key_hash, compute_sorted_edge_angles,
-    hash_to_index, NUM_EDGES, NUM_EDGE_RATIOS, PATTERN_SIZE,
+    hash_to_index, sort_pattern_by_centroid_distance, NUM_EDGES, NUM_EDGE_RATIOS, PATTERN_SIZE,
 };
 use super::wcs_refine;
-use super::{SolveConfig, SolveResult, SolveStatus, SolverDatabase};
+use super::{
+    focal_length_from_fov, pixel_scale_from_fov, SolveConfig, SolveResult, SolveStatus,
+    SolverDatabase,
+};
 
 #[cfg(feature = "profile")]
 use crate::solver::profiling::{self, buckets};
@@ -129,6 +133,23 @@ impl SolverDatabase {
             debug!("Hinted solve failed; falling back to lost-in-space");
         }
 
+        // Too few centroids to ever form a 4-star pattern. This is
+        // FOV-independent, unlike the post-thinning TooFew inside
+        // `solve_at_fov`, so it ends the solve outright.
+        if working_centroids.len() < PATTERN_SIZE {
+            return SolveResult::failure(SolveStatus::TooFew, elapsed_ms(t0));
+        }
+
+        // Sort centroids by brightness (highest mass = brightest first);
+        // centroids without mass are placed last. FOV-independent, so computed
+        // once for the whole sweep.
+        let mut sorted_indices: Vec<usize> = (0..working_centroids.len()).collect();
+        sorted_indices.sort_by(|&a, &b| {
+            let ma = working_centroids[a].mass.unwrap_or(f32::MIN);
+            let mb = working_centroids[b].mass.unwrap_or(f32::MIN);
+            mb.partial_cmp(&ma).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
         // Build FOV sweep: exact estimate first, then spiral outward
         let fov_values = build_fov_sweep(
             config.fov_estimate_rad,
@@ -164,10 +185,20 @@ impl SolverDatabase {
             }
 
             debug!("Trying FOV = {:.3}°", fov_try.to_degrees());
-            let result = self.solve_at_fov(working_centroids, config, fov_try, &star_vecs, t0);
+            let result = self.solve_at_fov(
+                working_centroids,
+                &sorted_indices,
+                config,
+                fov_try,
+                &star_vecs,
+                t0,
+            );
             match result.status {
                 SolveStatus::MatchFound => return result,
-                SolveStatus::TooFew => return result,
+                // TooFew here means cluster-buster thinning left fewer than 4
+                // pattern centroids. The thinning separation scales with the
+                // FOV being tried, so a different FOV in the sweep may still
+                // succeed — keep going.
                 s => last_status = s,
             }
         }
@@ -176,9 +207,14 @@ impl SolverDatabase {
     }
 
     /// Attempt a solve at a specific FOV value.
+    ///
+    /// `sorted_indices` is the brightness-sorted centroid index order, computed
+    /// once by the caller (it does not depend on the FOV). The caller also
+    /// guarantees at least `PATTERN_SIZE` centroids.
     fn solve_at_fov(
         &self,
         centroids: &[Centroid],
+        sorted_indices: &[usize],
         config: &SolveConfig,
         fov_estimate: f32,
         star_vectors: &[[f32; 3]],
@@ -189,26 +225,12 @@ impl SolverDatabase {
 
         // True pinhole pixel scale (rad/px): ps = 1/f where f = (W/2) / tan(fov/2).
         let pixel_scale = if config.image_width > 0 && fov_estimate > 0.0 {
-            let f = (config.image_width as f32 / 2.0) / (fov_estimate / 2.0).tan();
-            1.0 / f
+            pixel_scale_from_fov(config.image_width, fov_estimate as f64) as f32
         } else {
             0.0
         };
 
-        // Sort centroids by brightness (highest mass = brightest first).
-        // Centroids without mass are placed last.
-        let mut sorted_indices: Vec<usize> = (0..centroids.len()).collect();
-        sorted_indices.sort_by(|&a, &b| {
-            let ma = centroids[a].mass.unwrap_or(f32::MIN);
-            let mb = centroids[b].mass.unwrap_or(f32::MIN);
-            mb.partial_cmp(&ma).unwrap_or(std::cmp::Ordering::Equal)
-        });
-
         let num_centroids = sorted_indices.len();
-
-        if num_centroids < PATTERN_SIZE {
-            return SolveResult::failure(SolveStatus::TooFew, elapsed_ms(t0));
-        }
 
         // ── Compute unit vectors in camera frame ──
         // Centroid (x, y) in pixels → scale to radians → uvec = normalize(x_rad, y_rad, 1)
@@ -280,6 +302,13 @@ impl SolverDatabase {
         let match_threshold = config.match_threshold / self.props.num_patterns as f64;
         let timeout_ms = config.solve_timeout_ms;
 
+        // Guard against an empty pattern table (corrupt or placeholder
+        // database): the hash-probe arithmetic below would divide by zero.
+        let table_len = self.pattern_catalog.len() as u64;
+        if table_len == 0 {
+            return SolveResult::failure(SolveStatus::NoMatch, elapsed_ms(t0));
+        }
+
         debug!(
             "Checking up to C({},{}) = {} image patterns",
             num_pattern_centroids,
@@ -344,8 +373,6 @@ impl SolverDatabase {
                 enumerate_key_range(&key_min, &key_max, &image_key, &mut pattern_key_list);
                 pattern_key_list.sort_unstable_by_key(|&(dist, _)| dist);
             });
-
-            let table_len = self.pattern_catalog.len() as u64;
 
             // Try each candidate pattern key
             for (_, pkey) in &pattern_key_list {
@@ -412,7 +439,7 @@ impl SolverDatabase {
 
                     // Sort image pattern by centroid distance (canonical ordering)
                     let mut img_order: [usize; 4] = [0, 1, 2, 3];
-                    sort_by_centroid_distance_inline(&mut img_order, &image_vecs);
+                    sort_pattern_by_centroid_distance(&mut img_order, |i| image_vecs[i]);
 
                     // Catalog pattern is already pre-sorted during database generation.
                     // Build matched vector pairs.
@@ -423,11 +450,15 @@ impl SolverDatabase {
                     #[cfg(feature = "profile")]
                     profiling::count(buckets::RATIO_PASS, 1);
 
-                    // SVD rotation: finds R such that camera_vec ≈ R * icrs_vec
-                    let mut rotation_matrix = timed!(
+                    // SVD rotation: finds R such that camera_vec ≈ R * icrs_vec.
+                    // A degenerate cross-covariance (e.g. duplicate or collinear
+                    // centroids) fails the SVD — skip the candidate, don't panic.
+                    let Some(mut rotation_matrix) = timed!(
                         buckets::SVD,
                         find_rotation_matrix(&matched_img, &matched_cat)
-                    );
+                    ) else {
+                        continue;
+                    };
 
                     // Determine parity from the rotation determinant.
                     // centroid_vectors is never mutated; when parity is needed we use
@@ -473,7 +504,7 @@ impl SolverDatabase {
 
                     // ── Verify by matching nearby catalog stars ──
 
-                    let fov_diagonal = fov * 1.42; // sqrt(2) ≈ 1.42 for square FOV
+                    let fov_diagonal = fov * diagonal_factor(config);
                     let match_radius_rad = config.match_radius * fov;
 
                     // Find catalog stars within the diagonal FOV
@@ -554,12 +585,9 @@ impl SolverDatabase {
                         })
                         .collect();
 
-                    // Compute pixel scale for WCS refine from the pattern-match refined FOV
-                    // True pinhole pixel scale for wcs_refine.
-                    let ps_refine = {
-                        let f = (config.image_width as f64 / 2.0) / (fov as f64 / 2.0).tan();
-                        1.0 / f
-                    };
+                    // True pinhole pixel scale for wcs_refine, from the
+                    // pattern-match refined FOV.
+                    let ps_refine = pixel_scale_from_fov(config.image_width, fov as f64);
 
                     #[cfg(feature = "profile")]
                     profiling::count(buckets::WCS_REFINE, 1);
@@ -586,7 +614,7 @@ impl SolverDatabase {
                     return self.finalize_solve_result(
                         &wcs_result,
                         star_vectors,
-                        &sorted_indices,
+                        sorted_indices,
                         &centroids_px,
                         config,
                         parity_flip,
@@ -629,10 +657,7 @@ impl SolverDatabase {
 
         // Build matched catalog IDs, centroid indices, and angular residuals.
         // True pinhole pixel scale derived from the angular `refined_fov`.
-        let ps = {
-            let f = (config.image_width.max(1) as f32 / 2.0) / (refined_fov / 2.0).tan();
-            1.0 / f
-        };
+        let ps = pixel_scale_from_fov(config.image_width, refined_fov as f64) as f32;
         let mut matched_cat_ids: Vec<i64> = Vec::with_capacity(wcs_result.matches.len());
         let mut matched_cent_inds: Vec<usize> = Vec::with_capacity(wcs_result.matches.len());
         let mut angular_residuals: Vec<f32> = Vec::with_capacity(wcs_result.matches.len());
@@ -674,8 +699,7 @@ impl SolverDatabase {
         // (always filled from config, even if the input camera_model was a
         // Default placeholder), and detected parity.
         let mut result_cam = config.camera_model.clone();
-        let refined_f = (config.image_width as f64 / 2.0) / (refined_fov as f64 / 2.0).tan();
-        result_cam.focal_length_px = refined_f;
+        result_cam.focal_length_px = focal_length_from_fov(config.image_width, refined_fov as f64);
         result_cam.image_width = config.image_width;
         result_cam.image_height = config.image_height;
         result_cam.parity_flip = parity_flip;
@@ -737,8 +761,15 @@ pub(super) fn elapsed_ms(t0: Instant) -> f32 {
     t0.elapsed().as_secs_f32() * 1000.0
 }
 
-fn separation_for_density(fov_rad: f32, stars_per_fov: u32) -> f32 {
-    (fov_rad / 2.0) * (std::f32::consts::PI / stars_per_fov as f32).sqrt()
+/// Ratio of the image diagonal to the image width, used to size the
+/// verification cone (`fov_diagonal = fov * factor`).
+///
+/// At least 1.42 (≳ √2, the historical square-image constant, kept as a
+/// conservative floor); larger for portrait images where the height exceeds
+/// the width-referenced FOV and √2 would under-query the corners.
+pub(super) fn diagonal_factor(config: &SolveConfig) -> f32 {
+    let aspect = config.image_height as f32 / config.image_width.max(1) as f32;
+    (1.0 + aspect * aspect).sqrt().max(1.42)
 }
 
 fn n_choose_k(n: usize, k: usize) -> usize {
@@ -788,39 +819,18 @@ fn enumerate_key_range_recursive(
     }
 }
 
-/// Sort 4 indices by their vectors' distance from the pattern centroid.
-fn sort_by_centroid_distance_inline(order: &mut [usize; 4], vectors: &[[f32; 3]; 4]) {
-    let mut cx = 0.0f32;
-    let mut cy = 0.0f32;
-    let mut cz = 0.0f32;
-    for v in vectors.iter() {
-        cx += v[0];
-        cy += v[1];
-        cz += v[2];
-    }
-    cx /= 4.0;
-    cy /= 4.0;
-    cz /= 4.0;
-
-    order.sort_by(|&a, &b| {
-        let va = &vectors[a];
-        let vb = &vectors[b];
-        let da = (va[0] - cx).powi(2) + (va[1] - cy).powi(2) + (va[2] - cz).powi(2);
-        let db = (vb[0] - cx).powi(2) + (vb[1] - cy).powi(2) + (vb[2] - cz).powi(2);
-        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-    });
-}
-
 /// Compute the least-squares rotation matrix from image vectors to catalog vectors.
 ///
 /// Uses SVD of the cross-covariance matrix H = Σ(img_i ⊗ cat_i).
 /// The resulting R satisfies: camera_vec ≈ R * icrs_vec.
 ///
-/// The SVD is computed in f64 for precision, then the result is converted back to f32.
+/// The SVD is computed in f64 for precision, then the result is converted back
+/// to f32. Returns `None` if the SVD fails (degenerate cross-covariance from
+/// pathological input vectors).
 pub(super) fn find_rotation_matrix<const N: usize>(
     image_vectors: &[[f32; 3]; N],
     catalog_vectors: &[[f32; 3]; N],
-) -> Matrix3<f32> {
+) -> Option<Matrix3<f32>> {
     let mut h = numeris::Matrix3::<f64>::zeros();
     for i in 0..N {
         let img = numeris::Vector3::<f64>::from_array([
@@ -836,11 +846,11 @@ pub(super) fn find_rotation_matrix<const N: usize>(
         h += img.outer(&cat);
     }
 
-    let svd = h.svd().expect("SVD failed");
+    let svd = h.svd().ok()?;
     let u = svd.u();
     let v_t = svd.vt();
     let r64 = *u * *v_t;
-    r64.cast::<f32>()
+    Some(r64.cast::<f32>())
 }
 
 /// Find unique 1-to-1 matches between image centroids and projected catalog positions.
@@ -909,7 +919,7 @@ pub(super) fn binomial_cdf(k: u32, n: u32, p: f64) -> f64 {
         return 1.0;
     }
     if p >= 1.0 {
-        return if k >= n { 1.0 } else { 0.0 };
+        return 0.0; // k < n here (k >= n already returned above)
     }
 
     let q = 1.0 - p;

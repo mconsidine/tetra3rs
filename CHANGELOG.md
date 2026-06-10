@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+### Breaking changes
+
+- **Removed `SolveConfig::refine_iterations` (Rust) and the
+  `refine_iterations=` kwarg of `solve_from_centroids` (Python).** The field
+  was never read by the solver — the documented "number of iterative SVD
+  refinement passes" did not exist; refinement depth has always been governed
+  by the WCS refinement loop's internal convergence (stable match set, capped
+  at 10 outer iterations). Setting it had no effect, so removal does not
+  change solver behavior. Python callers passing `refine_iterations=` must
+  drop the argument.
+
+### Solver robustness
+
+- **No more panics on degenerate input.** A failed SVD during attitude
+  estimation (e.g. pathological/duplicate centroids) now skips the candidate
+  (lost-in-space) or fails the hinted solve (tracking) instead of panicking;
+  NaN residuals no longer panic the WCS refinement's median/MAD statistics;
+  an empty pattern catalog (corrupt database) returns `NoMatch` instead of
+  dividing by zero.
+- **FOV sweep no longer aborts early on cluster-buster `TooFew`.** The
+  post-thinning "too few pattern centroids" condition depends on the FOV being
+  tried; the sweep now continues to other FOV values instead of returning.
+  A genuine input of fewer than 4 centroids still returns `TooFew` immediately.
+- **Verification cone sized for portrait images.** The catalog query radius
+  now uses the true image diagonal (`sqrt(1 + (h/w)²)`, floored at the
+  historical 1.42 factor) instead of assuming a square/landscape sensor.
+
+### Internal
+
+- Deduplicated solver helpers: one `separation_for_density` (was copied in
+  `solve.rs` and `database.rs`), one generic pattern centroid-distance sort,
+  shared `focal_length_from_fov` / `pixel_scale_from_fov` for the pinhole
+  formula, and extracted `compute_residuals` / `ls_fit_once` in the WCS
+  refinement (the residual loop appeared three times, the LS pass twice).
+  Brightness sorting is hoisted out of the per-FOV loop; the tracking solver's
+  catalog-index reverse lookup is gone (match pairs now carry local indices).
+
 ## 0.7.4
 
 ### New features

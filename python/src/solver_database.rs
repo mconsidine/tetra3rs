@@ -138,7 +138,6 @@ impl PySolverDatabase {
     ///     match_threshold: False-positive probability threshold. Default 1e-5.
     ///     solve_timeout_ms: Timeout in milliseconds. None = no timeout.
     ///     match_max_error: Maximum edge-ratio error. None = use database value.
-    ///     refine_iterations: Number of iterative SVD refinement passes. Default 2.
     ///     camera_model: A CameraModel specifying optical center, distortion, and parity.
     ///         None = simple pinhole model with no distortion.
     ///     observer_velocity_km_s: Observer's barycentric velocity as [vx, vy, vz] in km/s
@@ -186,7 +185,6 @@ impl PySolverDatabase {
         match_threshold = 1e-5,
         solve_timeout_ms = Some(5000),
         match_max_error = None,
-        refine_iterations = 2,
         camera_model = None,
         observer_velocity_km_s = None,
         attitude_hint = None,
@@ -210,7 +208,6 @@ impl PySolverDatabase {
         match_threshold: f64,
         solve_timeout_ms: Option<u64>,
         match_max_error: Option<f32>,
-        refine_iterations: u32,
         camera_model: Option<PyCameraModel>,
         observer_velocity_km_s: Option<[f64; 3]>,
         attitude_hint: Option<&Bound<'py, pyo3::PyAny>>,
@@ -269,7 +266,6 @@ impl PySolverDatabase {
             match_threshold,
             solve_timeout_ms,
             match_max_error,
-            refine_iterations,
             camera_model: cam,
             observer_velocity_km_s,
             attitude_hint: attitude_hint_q,

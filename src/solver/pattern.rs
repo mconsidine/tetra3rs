@@ -26,12 +26,6 @@ pub fn angle_from_distance(dist: f32) -> f32 {
     2.0 * (0.5 * dist).clamp(-1.0, 1.0).asin()
 }
 
-/// Center angle (radians) → Euclidean distance between two points on the unit sphere.
-#[inline]
-pub fn distance_from_angle(angle: f32) -> f32 {
-    2.0 * (angle / 2.0).sin()
-}
-
 // ── Edge-angle computation ──────────────────────────────────────────────────
 
 /// Euclidean distance between two 3-vectors.
@@ -125,19 +119,20 @@ pub fn insert_pattern(
 
 // ── Pattern centroid ordering ───────────────────────────────────────────────
 
-/// Sort a pattern's star indices (`[u32; 4]`) by each star's Euclidean distance
-/// from the pattern centroid (average position). This produces a canonical
-/// ordering that is invariant to the input star order, allowing image patterns
-/// to be matched against catalog patterns.
-pub fn sort_u32_pattern_by_centroid_distance(
-    pattern: &mut [u32; PATTERN_SIZE],
-    star_vectors: &[[f32; 3]],
+/// Sort a pattern's star indices by each star's Euclidean distance from the
+/// pattern centroid (average position). This produces a canonical ordering
+/// that is invariant to the input star order, allowing image patterns to be
+/// matched against catalog patterns. `vec_of` maps an index to its unit
+/// vector (e.g. into a star-vector table or a local 4-vector array).
+pub fn sort_pattern_by_centroid_distance<T: Copy>(
+    pattern: &mut [T; PATTERN_SIZE],
+    vec_of: impl Fn(T) -> [f32; 3],
 ) {
     let mut cx = 0.0f32;
     let mut cy = 0.0f32;
     let mut cz = 0.0f32;
     for &idx in pattern.iter() {
-        let v = &star_vectors[idx as usize];
+        let v = vec_of(idx);
         cx += v[0];
         cy += v[1];
         cz += v[2];
@@ -147,8 +142,8 @@ pub fn sort_u32_pattern_by_centroid_distance(
     cz /= PATTERN_SIZE as f32;
 
     pattern.sort_by(|&a, &b| {
-        let va = &star_vectors[a as usize];
-        let vb = &star_vectors[b as usize];
+        let va = vec_of(a);
+        let vb = vec_of(b);
         let da = (va[0] - cx).powi(2) + (va[1] - cy).powi(2) + (va[2] - cz).powi(2);
         let db = (vb[0] - cx).powi(2) + (vb[1] - cy).powi(2) + (vb[2] - cz).powi(2);
         da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)

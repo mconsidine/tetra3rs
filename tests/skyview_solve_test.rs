@@ -544,7 +544,6 @@ fn test_skyview_fits_solve() {
             match_threshold: 1e-5,
             solve_timeout_ms: Some(60_000),
             match_max_error: None,
-            refine_iterations: 2,
             ..Default::default()
         };
 

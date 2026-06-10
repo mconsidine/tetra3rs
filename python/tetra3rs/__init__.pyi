@@ -619,7 +619,6 @@ class SolverDatabase:
         match_threshold: float = 1e-5,
         solve_timeout_ms: Optional[int] = 5000,
         match_max_error: Optional[float] = None,
-        refine_iterations: int = 2,
         camera_model: Optional[CameraModel] = None,
         observer_velocity_km_s: Optional[list[float]] = None,
         attitude_hint: Optional[
@@ -650,9 +649,6 @@ class SolverDatabase:
             match_threshold: False-positive probability threshold.
             solve_timeout_ms: Timeout in milliseconds. None = no timeout.
             match_max_error: Maximum edge-ratio error. None = use database value.
-            refine_iterations: Number of iterative SVD refinement passes.
-                Each pass re-projects catalog stars and re-matches centroids
-                using the refined rotation. Default 2.
             camera_model: A CameraModel specifying optical center, distortion,
                 and parity. None = simple pinhole model with no distortion.
             observer_velocity_km_s: Observer's barycentric velocity as

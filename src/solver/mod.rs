@@ -311,18 +311,6 @@ pub struct SolveConfig {
     pub solve_timeout_ms: Option<u64>,
     /// Maximum edge-ratio error for matching. None = use database value.
     pub match_max_error: Option<f32>,
-    /// Number of iterative SVD refinement passes after the initial match.
-    ///
-    /// Each pass re-projects catalog stars using the refined rotation and
-    /// re-matches centroids, potentially discovering additional inliers at
-    /// the edges of the match radius.  Terminates early if no new inliers
-    /// are found.
-    ///
-    /// - `1` = single refinement pass (original behavior)
-    /// - `2` = one additional re-match after the first refinement (default)
-    ///
-    /// Default: 2.
-    pub refine_iterations: u32,
     /// Camera intrinsics model (focal length, optical center, parity, distortion).
     ///
     /// Encapsulates the lens distortion model, optical center offset (CRPIX),
@@ -390,7 +378,6 @@ impl Default for SolveConfig {
             match_threshold: 1e-5,
             solve_timeout_ms: Some(5000),
             match_max_error: None,
-            refine_iterations: 2,
             camera_model: CameraModel {
                 focal_length_px: 1.0,
                 image_width: 0,
@@ -424,8 +411,7 @@ impl SolveConfig {
     /// True pinhole: `ps = 1/f` where `f = (W/2) / tan(fov/2)`.
     pub fn pixel_scale(&self) -> f32 {
         if self.image_width > 0 && self.fov_estimate_rad > 0.0 {
-            let f = (self.image_width as f32 / 2.0) / (self.fov_estimate_rad / 2.0).tan();
-            1.0 / f
+            pixel_scale_from_fov(self.image_width, self.fov_estimate_rad as f64) as f32
         } else {
             0.0
         }
@@ -651,10 +637,14 @@ impl SolveResult {
     }
 }
 
-/// Pinhole pixel scale (radians per pixel) from an angular FOV and image width.
-///
-/// `pixel_scale = 1 / f`, with `f = (image_width / 2) / tan(fov / 2)`.
-fn pixel_scale_from_fov(image_width: u32, fov_rad: f64) -> f64 {
-    let f = (image_width.max(1) as f64 / 2.0) / (fov_rad / 2.0).tan();
-    1.0 / f
+/// Pinhole focal length in pixels from an angular FOV and image width:
+/// `f = (image_width / 2) / tan(fov / 2)`.
+pub(crate) fn focal_length_from_fov(image_width: u32, fov_rad: f64) -> f64 {
+    (image_width.max(1) as f64 / 2.0) / (fov_rad / 2.0).tan()
+}
+
+/// Pinhole pixel scale (radians per pixel) from an angular FOV and image width:
+/// `pixel_scale = 1 / focal_length_from_fov(...)`.
+pub(crate) fn pixel_scale_from_fov(image_width: u32, fov_rad: f64) -> f64 {
+    1.0 / focal_length_from_fov(image_width, fov_rad)
 }

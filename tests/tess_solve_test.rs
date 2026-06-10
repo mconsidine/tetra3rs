@@ -489,7 +489,6 @@ fn test_tess_fits_solve() {
             match_threshold: 1e-5,
             solve_timeout_ms: Some(60_000),
             match_max_error: None,
-            refine_iterations: 2,
             ..Default::default()
         };
 
@@ -653,7 +652,6 @@ fn test_tess_distortion_fit_and_center_accuracy() {
             match_threshold: 1e-5,
             solve_timeout_ms: Some(60_000),
             match_max_error: None,
-            refine_iterations: 2,
             ..Default::default()
         };
 
@@ -914,7 +912,6 @@ fn test_tess_multi_image_calibration() {
     // Progressively tighter match_radius and higher polynomial order.
     struct PassConfig {
         match_radius: f32,
-        refine_iterations: u32,
         calibration_order: u32,
         fov_max_error_deg: f32,
     }
@@ -922,25 +919,21 @@ fn test_tess_multi_image_calibration() {
     let pass_configs = [
         PassConfig {
             match_radius: 0.005,
-            refine_iterations: 10,
             calibration_order: 3,
             fov_max_error_deg: 0.5,
         },
         PassConfig {
             match_radius: 0.005,
-            refine_iterations: 10,
             calibration_order: 4,
             fov_max_error_deg: 0.5,
         },
         PassConfig {
             match_radius: 0.003,
-            refine_iterations: 10,
             calibration_order: 5,
             fov_max_error_deg: 0.5,
         },
         PassConfig {
             match_radius: 0.002,
-            refine_iterations: 10,
             calibration_order: 6,
             fov_max_error_deg: 0.5,
         },
@@ -958,10 +951,9 @@ fn test_tess_multi_image_calibration() {
         };
 
         println!(
-            "\n  Pass {}: match_radius={}, refine_iter={}, order={}, fov={:.2}°",
+            "\n  Pass {}: match_radius={}, order={}, fov={:.2}°",
             pass_idx + 1,
             pcfg.match_radius,
-            pcfg.refine_iterations,
             pcfg.calibration_order,
             fov_estimate_rad.to_degrees(),
         );
@@ -975,7 +967,6 @@ fn test_tess_multi_image_calibration() {
                 match_radius: pcfg.match_radius,
                 match_threshold: 1e-5,
                 solve_timeout_ms: Some(60_000),
-                refine_iterations: pcfg.refine_iterations,
                 camera_model: camera_model.clone().unwrap_or_else(|| {
                     tetra3::CameraModel::from_fov(
                         fov_estimate_rad as f64,

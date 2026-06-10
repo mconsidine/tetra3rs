@@ -22,9 +22,11 @@ use tracing::debug;
 
 use crate::{Centroid, Quaternion};
 
-use super::solve::{aberration_correct, binomial_cdf, elapsed_ms, find_centroid_matches, C_KM_S};
+use super::solve::{
+    aberration_correct, binomial_cdf, diagonal_factor, elapsed_ms, find_centroid_matches, C_KM_S,
+};
 use super::wcs_refine;
-use super::{SolveConfig, SolveResult, SolveStatus, SolverDatabase};
+use super::{pixel_scale_from_fov, SolveConfig, SolveResult, SolveStatus, SolverDatabase};
 
 /// Minimum unique correspondences required to attempt the SVD step.
 const MIN_HINT_MATCHES: usize = 3;
@@ -49,13 +51,10 @@ impl SolverDatabase {
         // True pinhole pixel scale (1/f). Prefer the camera model's focal length
         // when it was explicitly set; otherwise fall back to fov_estimate so a
         // default-constructed `SolveConfig` still works.
-        let camera_model_initialized =
-            cam.image_width == config.image_width && cam.focal_length_px > 2.0;
-        let pixel_scale: f32 = if camera_model_initialized {
+        let pixel_scale: f32 = if cam.is_initialized_for(config.image_width) {
             (1.0 / cam.focal_length_px) as f32
         } else if config.fov_estimate_rad > 0.0 && config.image_width > 0 {
-            let f = (config.image_width as f32 / 2.0) / (config.fov_estimate_rad / 2.0).tan();
-            1.0 / f
+            pixel_scale_from_fov(config.image_width, config.fov_estimate_rad as f64) as f32
         } else {
             return SolveResult::failure(SolveStatus::NoMatch, elapsed_ms(t0));
         };
@@ -72,7 +71,7 @@ impl SolverDatabase {
         let boresight_icrs = Vector3::from_array([r_hint[(2, 0)], r_hint[(2, 1)], r_hint[(2, 2)]]);
 
         // Cone radius: half-FOV (use diagonal for safety) + hint uncertainty + small margin
-        let fov_diagonal = fov_rad * 1.42;
+        let fov_diagonal = fov_rad * diagonal_factor(config);
         let cone_radius = fov_diagonal / 2.0 + config.hint_uncertainty_rad + 2.0 * pixel_scale;
         let nearby_inds = self.star_catalog.query_indices_from_uvec_cached(
             boresight_icrs,
@@ -131,6 +130,10 @@ impl SolverDatabase {
 
         // ── Project candidate catalog stars to camera-plane angles via the hint ──
         // Note: r_hint maps ICRS→camera, so cam_v = r_hint * icrs_v.
+        // `projected` carries the *local* index into `candidate_vecs` /
+        // `nearby_inds` so downstream lookups are direct array indexing.
+        let half_w = (config.image_width as f32 / 2.0 + 4.0) * pixel_scale;
+        let half_h = (config.image_height as f32 / 2.0 + 4.0) * pixel_scale;
         let mut projected: Vec<(usize, f32, f32)> = Vec::with_capacity(candidate_vecs.len());
         for (local_i, sv) in candidate_vecs.iter().enumerate() {
             let icrs_v = Vector3::from_array([sv[0], sv[1], sv[2]]);
@@ -139,11 +142,8 @@ impl SolverDatabase {
                 let cx = cam_v[0] / cam_v[2];
                 let cy = cam_v[1] / cam_v[2];
                 // Only keep stars geometrically inside the (slightly padded) image
-                let half_w = (config.image_width as f32 / 2.0 + 4.0) * pixel_scale;
-                let half_h = (config.image_height as f32 / 2.0 + 4.0) * pixel_scale;
                 if cx.abs() <= half_w && cy.abs() <= half_h {
-                    let cat_star_idx = nearby_inds[local_i];
-                    projected.push((cat_star_idx, cx, cy));
+                    projected.push((local_i, cx, cy));
                 }
             }
         }
@@ -174,12 +174,8 @@ impl SolverDatabase {
         }
 
         // ── Wahba SVD on the initial correspondence set ──
-        let (rotation_matrix, det_sign_ok) = wahba_svd_dynamic(
-            &centroid_vectors,
-            &candidate_vecs,
-            &nearby_inds,
-            &initial_matches,
-        );
+        let (rotation_matrix, det_sign_ok) =
+            wahba_svd_dynamic(&centroid_vectors, &candidate_vecs, &initial_matches);
         if !det_sign_ok {
             // Parity mismatch — bail (caller may still fall back to LIS).
             return SolveResult::failure(SolveStatus::NoMatch, elapsed_ms(t0));
@@ -284,33 +280,27 @@ impl SolverDatabase {
 
 /// Run Wahba SVD on a dynamic-sized correspondence set.
 ///
-/// `centroid_vectors` is indexed by sorted (brightness) centroid index; the
-/// match pairs reference this same index space. `candidate_vecs` is indexed
-/// by position within `nearby_inds` — match pairs reference the catalog star
-/// index, so we look it up.
+/// `centroid_vectors` is indexed by sorted (brightness) centroid index;
+/// `candidate_vecs` by local candidate position. The match pairs are
+/// `(centroid_idx, candidate_local_idx)` in those same index spaces.
 ///
 /// Returns the rotation matrix and a flag indicating whether the determinant
-/// is positive (true) or negative (false → likely parity mismatch).
+/// is positive (true) or negative (false → likely parity mismatch). A failed
+/// SVD (degenerate cross-covariance) returns `(zeros, false)`, which the
+/// caller treats as a failed hint.
 fn wahba_svd_dynamic(
     centroid_vectors: &[[f32; 3]],
     candidate_vecs: &[[f32; 3]],
-    nearby_inds: &[usize],
     matches: &[(usize, usize)],
 ) -> (Matrix3<f32>, bool) {
-    // Build catalog-index → local-position map for candidate_vecs lookup.
-    // Linear scan is fine — nearby_inds is typically <1000.
-    let cat_to_local =
-        |cat_idx: usize| -> Option<usize> { nearby_inds.iter().position(|&x| x == cat_idx) };
+    if matches.len() < MIN_HINT_MATCHES {
+        return (Matrix3::<f32>::zeros(), false);
+    }
 
-    // Collect paired vectors as Vec for find_rotation_matrix (which is generic
-    // on N — we'd need a const N. Instead, build the cross-covariance directly).
+    // Build the cross-covariance directly (find_rotation_matrix is generic on
+    // a const N, which a dynamic match set doesn't have).
     let mut h = numeris::Matrix3::<f64>::zeros();
-    let mut n_pairs = 0u32;
-    for &(cent_idx, cat_idx) in matches {
-        let local_i = match cat_to_local(cat_idx) {
-            Some(i) => i,
-            None => continue,
-        };
+    for &(cent_idx, local_i) in matches {
         let img = &centroid_vectors[cent_idx];
         let cat = &candidate_vecs[local_i];
         let img_v =
@@ -318,14 +308,11 @@ fn wahba_svd_dynamic(
         let cat_v =
             numeris::Vector3::<f64>::from_array([cat[0] as f64, cat[1] as f64, cat[2] as f64]);
         h += img_v.outer(&cat_v);
-        n_pairs += 1;
     }
 
-    if n_pairs < MIN_HINT_MATCHES as u32 {
+    let Ok(svd) = h.svd() else {
         return (Matrix3::<f32>::zeros(), false);
-    }
-
-    let svd = h.svd().expect("SVD failed");
+    };
     let u = svd.u();
     let v_t = svd.vt();
     let r64 = *u * *v_t;

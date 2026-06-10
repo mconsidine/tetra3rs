@@ -15,8 +15,8 @@ use crate::{Star, StarCatalog};
 use super::combinations::BreadthFirstCombinations;
 use super::pattern::{
     self, compute_edge_ratios, compute_pattern_key, compute_pattern_key_hash,
-    compute_sorted_edge_angles, distance_from_angle, hash_to_index, insert_pattern, next_prime,
-    sort_u32_pattern_by_centroid_distance, PATTERN_SIZE,
+    compute_sorted_edge_angles, hash_to_index, insert_pattern, next_prime,
+    sort_pattern_by_centroid_distance, PATTERN_SIZE,
 };
 use super::{DatabaseProperties, GenerateDatabaseConfig, PatternEntry, SolverDatabase};
 
@@ -37,8 +37,9 @@ fn num_fields_for_sky(fov_rad: f32) -> usize {
 
 /// Minimum angular separation between stars for a given FOV and star density.
 /// This is the "cluster buster" that prevents dense star clusters from
-/// dominating the pattern budget.
-fn separation_for_density(fov_rad: f32, stars_per_fov: u32) -> f32 {
+/// dominating the pattern budget. The solver applies the same constraint to
+/// image centroids so its thinning mirrors database generation.
+pub(super) fn separation_for_density(fov_rad: f32, stars_per_fov: u32) -> f32 {
     // Area of a FOV circle ≈ π(fov/2)². With N uniformly distributed stars,
     // average spacing ≈ (fov/2) * sqrt(π/N).
     (fov_rad / 2.0) * (std::f32::consts::PI / stars_per_fov as f32).sqrt()
@@ -226,7 +227,6 @@ impl SolverDatabase {
             } else {
                 separation_for_density(pattern_fov, config.verification_stars_per_fov)
             };
-            let _pattern_stars_dist = distance_from_angle(pattern_stars_separation);
 
             info!(
                 "FOV {:.2}°: cluster-buster separation {:.3}°",
@@ -260,7 +260,6 @@ impl SolverDatabase {
 
             // ── Distribute lattice fields and generate patterns ──
             let fov_angle = pattern_fov / 2.0;
-            let _fov_dist = distance_from_angle(fov_angle);
             let n_fields =
                 num_fields_for_sky(pattern_fov) * config.lattice_field_oversampling as usize;
 
@@ -349,7 +348,7 @@ impl SolverDatabase {
 
             // Sort pattern by centroid distance for canonical ordering
             let mut sorted_pat = *pat;
-            sort_u32_pattern_by_centroid_distance(&mut sorted_pat, &star_vectors);
+            sort_pattern_by_centroid_distance(&mut sorted_pat, |i| star_vectors[i as usize]);
 
             // Insert into hash table
             let entry = PatternEntry::new(sorted_pat, largest_angle, (pkey_hash & 0xFFFF) as u16);
