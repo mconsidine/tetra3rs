@@ -536,15 +536,12 @@ fn test_skyview_fits_solve() {
             .collect();
 
         let solve_config = SolveConfig {
-            fov_estimate_rad: (fov_h_deg as f32).to_radians(),
-            image_width: naxis1,
-            image_height: naxis2,
             fov_max_error_rad: Some((3.0_f32).to_radians()),
             match_radius: 0.01,
             match_threshold: 1e-5,
             solve_timeout_ms: Some(60_000),
             match_max_error: None,
-            ..Default::default()
+            ..SolveConfig::new((fov_h_deg as f32).to_radians(), naxis1, naxis2)
         };
 
         let ref_result = db.solve_from_centroids(&ref_centroids, &solve_config);

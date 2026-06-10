@@ -4,6 +4,20 @@
 
 ### Breaking changes
 
+- **`SolveConfig`: `CameraModel` is now the single source of camera geometry
+  (Rust).** The redundant `fov_estimate_rad`, `image_width`, and
+  `image_height` fields are removed; the FOV estimate, image dimensions, and
+  pixel scale all derive from `camera_model` (new accessors
+  `fov_estimate_rad()`, `image_width()`, `image_height()`, and a
+  `SolveConfig::with_camera_model()` constructor). `SolveConfig::new(fov, w,
+  h)` is unchanged and remains the easy path. This removes the possibility of
+  an inconsistent config (e.g. a calibrated model alongside a mismatched FOV
+  estimate — previously the estimate silently won) and deletes the tracking
+  path's "is the camera model real?" heuristic. The **Python API is
+  unchanged** except for precedence: when `camera_model=` is passed, its focal
+  length and dimensions are now authoritative and `fov_estimate_*` /
+  `image_shape` are ignored (previously `fov_estimate` set the pixel scale
+  even alongside a model).
 - **Removed `SolveConfig::refine_iterations` (Rust) and the
   `refine_iterations=` kwarg of `solve_from_centroids` (Python).** The field
   was never read by the solver — the documented "number of iterative SVD

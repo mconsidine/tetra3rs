@@ -133,15 +133,12 @@ fn main() {
     };
 
     let solve_config = SolveConfig {
-        fov_estimate_rad: fov_rad,
-        image_width,
-        image_height: image_width,
         fov_max_error_rad: Some(2.0_f32.to_radians()),
         match_radius: 0.01,
         match_threshold: 1e-5,
         solve_timeout_ms: Some(10_000),
         match_max_error: None,
-        ..Default::default()
+        ..SolveConfig::new(fov_rad, image_width, image_width)
     };
 
     // Scenario knobs (env vars):

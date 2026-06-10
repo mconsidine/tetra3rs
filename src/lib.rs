@@ -89,11 +89,9 @@
 //! ];
 //!
 //! let solve_config = SolveConfig {
-//!     fov_estimate_rad: (15.0_f32).to_radians(), // horizontal FOV
-//!     image_width: 1024,
-//!     image_height: 1024,
 //!     fov_max_error_rad: Some((2.0_f32).to_radians()),
-//!     ..Default::default()
+//!     // 15° horizontal FOV estimate, 1024×1024 image
+//!     ..SolveConfig::new((15.0_f32).to_radians(), 1024, 1024)
 //! };
 //!
 //! let result = db.solve_from_centroids(&centroids, &solve_config);
@@ -116,8 +114,7 @@
 //! let config = SolveConfig {
 //!     attitude_hint: prev.qicrs2cam,
 //!     hint_uncertainty_rad: 1.0_f32.to_radians(),
-//!     camera_model: prev.camera_model.clone().unwrap(),
-//!     ..SolveConfig::new((15.0_f32).to_radians(), 1024, 1024)
+//!     ..SolveConfig::with_camera_model(prev.camera_model.clone().unwrap())
 //! };
 //! let result = db.solve_from_centroids(&centroids, &config);
 //! # }

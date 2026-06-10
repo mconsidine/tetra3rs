@@ -26,7 +26,7 @@ use super::solve::{
     aberration_correct, binomial_cdf, diagonal_factor, elapsed_ms, find_centroid_matches, C_KM_S,
 };
 use super::wcs_refine;
-use super::{pixel_scale_from_fov, SolveConfig, SolveResult, SolveStatus, SolverDatabase};
+use super::{SolveConfig, SolveResult, SolveStatus, SolverDatabase};
 
 /// Minimum unique correspondences required to attempt the SVD step.
 const MIN_HINT_MATCHES: usize = 3;
@@ -48,18 +48,14 @@ impl SolverDatabase {
         let parity_flip = cam.parity_flip;
         let parity_sign: f32 = if parity_flip { -1.0 } else { 1.0 };
 
-        // True pinhole pixel scale (1/f). Prefer the camera model's focal length
-        // when it was explicitly set; otherwise fall back to fov_estimate so a
-        // default-constructed `SolveConfig` still works.
-        let pixel_scale: f32 = if cam.is_initialized_for(config.image_width) {
-            (1.0 / cam.focal_length_px) as f32
-        } else if config.fov_estimate_rad > 0.0 && config.image_width > 0 {
-            pixel_scale_from_fov(config.image_width, config.fov_estimate_rad as f64) as f32
-        } else {
+        // True pinhole pixel scale (1/f) from the camera model — the single
+        // source of camera geometry. Zero means the model is the unconfigured
+        // placeholder, so a hinted solve is impossible.
+        let pixel_scale: f32 = config.pixel_scale();
+        if pixel_scale <= 0.0 {
             return SolveResult::failure(SolveStatus::NoMatch, elapsed_ms(t0));
-        };
-        // Angular FOV derived from pixel scale.
-        let fov_rad = 2.0 * (config.image_width as f32 / 2.0 * pixel_scale).atan();
+        }
+        let fov_rad = config.fov_estimate_rad();
 
         if preprocessed.len() < MIN_HINT_MATCHES {
             return SolveResult::failure(SolveStatus::TooFew, elapsed_ms(t0));
@@ -132,8 +128,8 @@ impl SolverDatabase {
         // Note: r_hint maps ICRS→camera, so cam_v = r_hint * icrs_v.
         // `projected` carries the *local* index into `candidate_vecs` /
         // `nearby_inds` so downstream lookups are direct array indexing.
-        let half_w = (config.image_width as f32 / 2.0 + 4.0) * pixel_scale;
-        let half_h = (config.image_height as f32 / 2.0 + 4.0) * pixel_scale;
+        let half_w = (config.image_width() as f32 / 2.0 + 4.0) * pixel_scale;
+        let half_h = (config.image_height() as f32 / 2.0 + 4.0) * pixel_scale;
         let mut projected: Vec<(usize, f32, f32)> = Vec::with_capacity(candidate_vecs.len());
         for (local_i, sv) in candidate_vecs.iter().enumerate() {
             let icrs_v = Vector3::from_array([sv[0], sv[1], sv[2]]);

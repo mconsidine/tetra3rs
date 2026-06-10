@@ -64,9 +64,10 @@ impl SolverDatabase {
     /// Centroid (x, y) are in pixel coordinates with (0, 0) at the image center.
     /// +X points right, +Y points down in the image.
     ///
-    /// The `SolveConfig` must specify `fov_estimate_rad` (horizontal FOV in radians)
-    /// and `image_width` / `image_height` (in pixels) so the solver can compute the
-    /// pixel scale.
+    /// The `SolveConfig`'s camera model supplies all camera geometry: the FOV
+    /// estimate (from its focal length and image width), the image dimensions,
+    /// optical center, parity, and distortion. Use [`SolveConfig::new`] to
+    /// build one from a FOV estimate and image dimensions.
     ///
     /// If `fov_max_error_rad` is set, the solver sweeps FOV values across the range
     /// `[fov_estimate - fov_max_error, fov_estimate + fov_max_error]`, trying the
@@ -152,7 +153,7 @@ impl SolverDatabase {
 
         // Build FOV sweep: exact estimate first, then spiral outward
         let fov_values = build_fov_sweep(
-            config.fov_estimate_rad,
+            config.fov_estimate_rad(),
             config.fov_max_error_rad,
             config.match_radius,
         );
@@ -224,8 +225,10 @@ impl SolverDatabase {
         profiling::count(buckets::FOV_PASS, 1);
 
         // True pinhole pixel scale (rad/px): ps = 1/f where f = (W/2) / tan(fov/2).
-        let pixel_scale = if config.image_width > 0 && fov_estimate > 0.0 {
-            pixel_scale_from_fov(config.image_width, fov_estimate as f64) as f32
+        // Derived from the sweep's FOV value, not the camera model's focal
+        // length — each sweep iteration tries a different scale.
+        let pixel_scale = if config.image_width() > 0 && fov_estimate > 0.0 {
+            pixel_scale_from_fov(config.image_width(), fov_estimate as f64) as f32
         } else {
             0.0
         };
@@ -587,7 +590,7 @@ impl SolverDatabase {
 
                     // True pinhole pixel scale for wcs_refine, from the
                     // pattern-match refined FOV.
-                    let ps_refine = pixel_scale_from_fov(config.image_width, fov as f64);
+                    let ps_refine = pixel_scale_from_fov(config.image_width(), fov as f64);
 
                     #[cfg(feature = "profile")]
                     profiling::count(buckets::WCS_REFINE, 1);
@@ -652,12 +655,12 @@ impl SolverDatabase {
             &wcs_result.cd_matrix,
             wcs_result.crval_rad[0],
             wcs_result.crval_rad[1],
-            config.image_width,
+            config.image_width(),
         );
 
         // Build matched catalog IDs, centroid indices, and angular residuals.
         // True pinhole pixel scale derived from the angular `refined_fov`.
-        let ps = pixel_scale_from_fov(config.image_width, refined_fov as f64) as f32;
+        let ps = pixel_scale_from_fov(config.image_width(), refined_fov as f64) as f32;
         let mut matched_cat_ids: Vec<i64> = Vec::with_capacity(wcs_result.matches.len());
         let mut matched_cent_inds: Vec<usize> = Vec::with_capacity(wcs_result.matches.len());
         let mut angular_residuals: Vec<f32> = Vec::with_capacity(wcs_result.matches.len());
@@ -695,13 +698,12 @@ impl SolverDatabase {
         // Convert rotation to quaternion
         let quat = Quaternion::from_rotation_matrix(&refined_rotation);
 
-        // Build result camera model with refined focal length, image dimensions
-        // (always filled from config, even if the input camera_model was a
-        // Default placeholder), and detected parity.
+        // Build result camera model: copy the input model (which carries the
+        // image dimensions, CRPIX, and distortion), then update the focal
+        // length from the refined FOV and record the detected parity.
         let mut result_cam = config.camera_model.clone();
-        result_cam.focal_length_px = focal_length_from_fov(config.image_width, refined_fov as f64);
-        result_cam.image_width = config.image_width;
-        result_cam.image_height = config.image_height;
+        result_cam.focal_length_px =
+            focal_length_from_fov(config.image_width(), refined_fov as f64);
         result_cam.parity_flip = parity_flip;
 
         SolveResult {
@@ -717,8 +719,8 @@ impl SolverDatabase {
             parity_flip,
             matched_catalog_ids: matched_cat_ids,
             matched_centroid_indices: matched_cent_inds,
-            image_width: config.image_width,
-            image_height: config.image_height,
+            image_width: config.image_width(),
+            image_height: config.image_height(),
             cd_matrix: Some(wcs_result.cd_matrix),
             crval_rad: Some(wcs_result.crval_rad),
             camera_model: Some(result_cam),
@@ -768,7 +770,7 @@ pub(super) fn elapsed_ms(t0: Instant) -> f32 {
 /// conservative floor); larger for portrait images where the height exceeds
 /// the width-referenced FOV and √2 would under-query the corners.
 pub(super) fn diagonal_factor(config: &SolveConfig) -> f32 {
-    let aspect = config.image_height as f32 / config.image_width.max(1) as f32;
+    let aspect = config.image_height() as f32 / config.image_width().max(1) as f32;
     (1.0 + aspect * aspect).sqrt().max(1.42)
 }
 

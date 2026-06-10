@@ -101,11 +101,9 @@ let centroids = vec![
 ];
 
 let solve_config = SolveConfig {
-    fov_estimate_rad: (15.0_f32).to_radians(),
-    image_width: 1024,
-    image_height: 1024,
     fov_max_error_rad: Some((2.0_f32).to_radians()),
-    ..Default::default()
+    // 15° horizontal FOV estimate, 1024×1024 image
+    ..SolveConfig::new((15.0_f32).to_radians(), 1024, 1024)
 };
 
 let result = db.solve_from_centroids(&centroids, &solve_config);

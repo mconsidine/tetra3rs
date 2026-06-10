@@ -481,15 +481,12 @@ fn test_tess_fits_solve() {
         // known limitation — pre-undistorting centroids doesn't help because the
         // solver's internal projection model also assumes uniform pixel scale.
         let solve_config = SolveConfig {
-            fov_estimate_rad: (12.0_f32).to_radians(),
-            image_width: sci_width,
-            image_height: sci_height,
             fov_max_error_rad: Some((2.0_f32).to_radians()),
             match_radius: 0.005,
             match_threshold: 1e-5,
             solve_timeout_ms: Some(60_000),
             match_max_error: None,
-            ..Default::default()
+            ..SolveConfig::new((12.0_f32).to_radians(), sci_width, sci_height)
         };
 
         let result = db.solve_from_centroids(&extraction.centroids, &solve_config);
@@ -644,15 +641,12 @@ fn test_tess_distortion_fit_and_center_accuracy() {
 
         // ── 1. Initial solve (raw centroids) ──
         let solve_cfg = SolveConfig {
-            fov_estimate_rad: (12.0_f32).to_radians(),
-            image_width: sci_width,
-            image_height: sci_height,
             fov_max_error_rad: Some((2.0_f32).to_radians()),
             match_radius: 0.005,
             match_threshold: 1e-5,
             solve_timeout_ms: Some(60_000),
             match_max_error: None,
-            ..Default::default()
+            ..SolveConfig::new((12.0_f32).to_radians(), sci_width, sci_height)
         };
 
         let result_raw = db.solve_from_centroids(&extraction.centroids, &solve_cfg);
@@ -960,21 +954,17 @@ fn test_tess_multi_image_calibration() {
 
         for img in &images {
             let solve_cfg = SolveConfig {
-                fov_estimate_rad,
-                image_width: img.sci_width,
-                image_height: img.sci_height,
                 fov_max_error_rad: Some(pcfg.fov_max_error_deg.to_radians()),
                 match_radius: pcfg.match_radius,
                 match_threshold: 1e-5,
                 solve_timeout_ms: Some(60_000),
-                camera_model: camera_model.clone().unwrap_or_else(|| {
+                ..SolveConfig::with_camera_model(camera_model.clone().unwrap_or_else(|| {
                     tetra3::CameraModel::from_fov(
                         fov_estimate_rad as f64,
                         img.sci_width,
                         img.sci_height,
                     )
-                }),
-                ..Default::default()
+                }))
             };
 
             let result = db.solve_from_centroids(&img.centroids, &solve_cfg);

@@ -68,15 +68,6 @@ impl CameraModel {
         1.0 / self.focal_length_px
     }
 
-    /// Whether this model looks explicitly configured for an image of
-    /// `image_width` pixels, as opposed to the placeholder used by
-    /// `SolveConfig::default()` (`focal_length_px == 1.0`, zero dimensions).
-    /// Used by the tracking solver to decide between the model's focal length
-    /// and the FOV-estimate fallback.
-    pub(crate) fn is_initialized_for(&self, image_width: u32) -> bool {
-        self.image_width == image_width && self.focal_length_px > 2.0
-    }
-
     /// Horizontal field of view in degrees, using the stored `image_width`.
     pub fn fov_deg(&self) -> f64 {
         self.fov_rad().to_degrees()

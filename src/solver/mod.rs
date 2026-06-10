@@ -292,16 +292,21 @@ impl Default for GenerateDatabaseConfig {
 
 /// Parameters controlling the plate-solve attempt.
 pub struct SolveConfig {
-    /// Estimated horizontal field of view in radians (along columns / image width).
-    /// This is used together with `image_width` to compute the pixel scale.
-    pub fov_estimate_rad: f32,
-    /// Image width in pixels (number of columns).
-    /// Together with `fov_estimate_rad`, defines the focal length:
-    /// `f = (image_width / 2) / tan(fov_estimate_rad / 2)`; pixel scale is `1/f`.
-    pub image_width: u32,
-    /// Image height in pixels (number of rows).
-    pub image_height: u32,
+    /// Camera intrinsics model — the single source of camera geometry.
+    ///
+    /// The model's focal length and image width define the solver's FOV
+    /// estimate ([`SolveConfig::fov_estimate_rad`]); its image dimensions,
+    /// optical center (CRPIX), parity, and distortion drive centroid
+    /// preprocessing and WCS refinement. Build it with
+    /// [`CameraModel::from_fov`] (or use [`SolveConfig::new`]) when only a
+    /// FOV estimate is known, or pass a calibrated model from a previous
+    /// solve / [`crate::calibrate_camera`] run.
+    pub camera_model: CameraModel,
     /// Maximum acceptable FOV error in radians. None = no FOV filtering.
+    ///
+    /// When set, the solver sweeps FOV values across
+    /// `fov_estimate ± fov_max_error` and rejects pattern matches implying a
+    /// FOV outside the range.
     pub fov_max_error_rad: Option<f32>,
     /// Maximum match distance as a fraction of the FOV. Default 0.01.
     pub match_radius: f32,
@@ -311,15 +316,6 @@ pub struct SolveConfig {
     pub solve_timeout_ms: Option<u64>,
     /// Maximum edge-ratio error for matching. None = use database value.
     pub match_max_error: Option<f32>,
-    /// Camera intrinsics model (focal length, optical center, parity, distortion).
-    ///
-    /// Encapsulates the lens distortion model, optical center offset (CRPIX),
-    /// and parity flip into a single struct. The solver uses this to preprocess
-    /// centroids before pattern matching and WCS refinement.
-    ///
-    /// If not explicitly set, uses a simple pinhole model with no distortion,
-    /// crpix=[0,0], and no parity flip.
-    pub camera_model: CameraModel,
     /// Observer's barycentric velocity in km/s (ICRS/GCRF Cartesian).
     ///
     /// When set, catalog star positions are aberration-corrected to apparent
@@ -370,9 +366,6 @@ pub struct SolveConfig {
 impl Default for SolveConfig {
     fn default() -> Self {
         Self {
-            fov_estimate_rad: 0.0,
-            image_width: 0,
-            image_height: 0,
             fov_max_error_rad: None,
             match_radius: 0.01,
             match_threshold: 1e-5,
@@ -395,23 +388,49 @@ impl Default for SolveConfig {
 }
 
 impl SolveConfig {
-    /// Create a solve configuration with the given FOV estimate (radians) and image dimensions.
+    /// Create a solve configuration with the given FOV estimate (radians) and
+    /// image dimensions, using a simple pinhole camera model (no distortion,
+    /// centered optical axis, no parity flip).
     pub fn new(fov_estimate_rad: f32, image_width: u32, image_height: u32) -> Self {
-        Self {
-            fov_estimate_rad,
+        Self::with_camera_model(CameraModel::from_fov(
+            fov_estimate_rad as f64,
             image_width,
             image_height,
-            camera_model: CameraModel::from_fov(fov_estimate_rad as f64, image_width, image_height),
+        ))
+    }
+
+    /// Create a solve configuration from an existing camera model, e.g. one
+    /// refined by a previous solve or fitted by [`crate::calibrate_camera`].
+    pub fn with_camera_model(camera_model: CameraModel) -> Self {
+        Self {
+            camera_model,
             ..Default::default()
         }
     }
 
-    /// Pixel scale in radians per pixel (horizontal).
+    /// Estimated horizontal field of view in radians, derived from the camera
+    /// model's focal length and image width.
+    pub fn fov_estimate_rad(&self) -> f32 {
+        self.camera_model.fov_rad() as f32
+    }
+
+    /// Image width in pixels (from the camera model).
+    pub fn image_width(&self) -> u32 {
+        self.camera_model.image_width
+    }
+
+    /// Image height in pixels (from the camera model).
+    pub fn image_height(&self) -> u32 {
+        self.camera_model.image_height
+    }
+
+    /// Pixel scale in radians per pixel (horizontal): `1 / focal_length_px`.
     ///
-    /// True pinhole: `ps = 1/f` where `f = (W/2) / tan(fov/2)`.
+    /// Returns `0.0` when the camera model is the unconfigured
+    /// `Default::default()` placeholder (zero image width).
     pub fn pixel_scale(&self) -> f32 {
-        if self.image_width > 0 && self.fov_estimate_rad > 0.0 {
-            pixel_scale_from_fov(self.image_width, self.fov_estimate_rad as f64) as f32
+        if self.camera_model.image_width > 0 && self.camera_model.focal_length_px > 0.0 {
+            self.camera_model.pixel_scale() as f32
         } else {
             0.0
         }

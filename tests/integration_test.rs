@@ -128,15 +128,12 @@ fn test_generate_and_solve() {
 
     // ── Step 3: Solve ──
     let solve_config = SolveConfig {
-        fov_estimate_rad: fov_rad,
-        image_width,
-        image_height,
         fov_max_error_rad: Some(5.0_f32.to_radians()), // generous tolerance
         match_radius: 0.01,
         match_threshold: 1e-5,
         solve_timeout_ms: Some(30_000), // 30s for test
         match_max_error: None,
-        ..Default::default()
+        ..SolveConfig::new(fov_rad, image_width, image_height)
     };
 
     let result = db.solve_from_centroids(&centroids, &solve_config);
@@ -338,15 +335,12 @@ fn test_statistical_1000_random_orientations() {
     };
 
     let solve_config = SolveConfig {
-        fov_estimate_rad: fov_rad,
-        image_width,
-        image_height,
         fov_max_error_rad: Some(2.0_f32.to_radians()),
         match_radius: 0.01,
         match_threshold: 1e-5,
         solve_timeout_ms: Some(10_000),
         match_max_error: None,
-        ..Default::default()
+        ..SolveConfig::new(fov_rad, image_width, image_height)
     };
 
     // Threshold for classifying a solve as "correct" vs "misidentified"
@@ -652,15 +646,12 @@ fn test_statistical_1000_noisy_centroids() {
     );
 
     let solve_config = SolveConfig {
-        fov_estimate_rad: fov_rad,
-        image_width,
-        image_height,
         fov_max_error_rad: Some(2.0_f32.to_radians()),
         match_radius: 0.01,
         match_threshold: 1e-5,
         solve_timeout_ms: Some(10_000),
         match_max_error: None,
-        ..Default::default()
+        ..SolveConfig::new(fov_rad, image_width, image_height)
     };
 
     let correct_threshold_arcsec = 180.0;
@@ -982,12 +973,9 @@ fn test_tracking_with_attitude_hint() {
 
         // ── Step 1: LIS solve (no hint) ──
         let lis_config = SolveConfig {
-            fov_estimate_rad: fov_rad,
-            image_width,
-            image_height,
             fov_max_error_rad: Some(2.0_f32.to_radians()),
             solve_timeout_ms: Some(10_000),
-            ..Default::default()
+            ..SolveConfig::new(fov_rad, image_width, image_height)
         };
         let lis_result = db.solve_from_centroids(&centroids, &lis_config);
         if lis_result.status != SolveStatus::MatchFound {
@@ -1010,18 +998,16 @@ fn test_tracking_with_attitude_hint() {
         // ── Step 3: re-solve with the perturbed attitude as a hint ──
         // Reuse the camera model from the LIS result (refined focal length).
         let track_config = SolveConfig {
-            fov_estimate_rad: fov_rad,
-            image_width,
-            image_height,
             attitude_hint: Some(hinted_quat),
             hint_uncertainty_rad: 1.0_f32.to_radians(),
             strict_hint: true, // disable LIS fallback so we measure tracking alone
             solve_timeout_ms: Some(2_000),
-            camera_model: lis_result
-                .camera_model
-                .clone()
-                .expect("MatchFound implies camera_model"),
-            ..Default::default()
+            ..SolveConfig::with_camera_model(
+                lis_result
+                    .camera_model
+                    .clone()
+                    .expect("MatchFound implies camera_model"),
+            )
         };
         let track_result = db.solve_from_centroids(&centroids, &track_config);
         if track_result.status == SolveStatus::MatchFound {
