@@ -90,9 +90,9 @@ q = [w, x, y, z]    with    q = w + x·i + y·j + z·k
 use tetra3::{SolveConfig, SolverDatabase};
 
 let config = SolveConfig {
-    attitude_hint: prev_result.qicrs2cam,  // Option<Quaternion>
+    attitude_hint: Some(prev_solution.qicrs2cam),
     hint_uncertainty_rad: 1.0_f32.to_radians(),
-    ..SolveConfig::with_camera_model(prev_result.camera_model.clone().unwrap())
+    ..SolveConfig::with_camera_model(prev_solution.camera_model.clone())
 };
 let result = db.solve_from_centroids(&centroids, &config);
 ```

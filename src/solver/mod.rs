@@ -171,17 +171,26 @@ mod pattern_catalog_tests {
 
 // ── Status codes (matching tetra3) ──────────────────────────────────────────
 
-/// Outcome of a plate-solve attempt.
+/// Why a plate-solve attempt produced no solution.
+///
+/// A successful solve returns a [`Solution`] instead; see [`SolveResult`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SolveStatus {
-    /// A valid match was found.
-    MatchFound,
     /// All pattern combinations were exhausted without a match.
     NoMatch,
     /// The solve timeout was reached before a match was found.
     Timeout,
     /// Too few centroids were provided to form a pattern.
     TooFew,
+}
+
+/// A failed plate-solve attempt: why it failed and how long it took.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SolveFailure {
+    /// Why the solve produced no solution.
+    pub status: SolveStatus,
+    /// Wall-clock time spent before giving up, in milliseconds.
+    pub solve_time_ms: f32,
 }
 
 // ── Database properties ─────────────────────────────────────────────────────
@@ -439,35 +448,37 @@ impl SolveConfig {
 
 // ── Solve result ────────────────────────────────────────────────────────────
 
-/// Result of a plate-solve attempt.
+/// Outcome of a plate-solve attempt: a [`Solution`] on success, or a
+/// [`SolveFailure`] carrying the reason and elapsed time.
+pub type SolveResult = Result<Solution, SolveFailure>;
+
+/// A successful plate solve. Every field is guaranteed present.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SolveResult {
+pub struct Solution {
     /// Quaternion rotating ICRS vectors to camera-frame vectors.
     /// Camera frame: +X right, +Y down, +Z boresight.
     /// Usage: `camera_vec = qicrs2cam * icrs_vec`
-    pub qicrs2cam: Option<Quaternion>,
+    pub qicrs2cam: Quaternion,
     /// Estimated field of view (radians).
-    pub fov_rad: Option<f32>,
+    pub fov_rad: f32,
     /// Number of matched stars in the verification step.
-    pub num_matches: Option<u32>,
+    pub num_matches: u32,
     /// RMS angular residual (radians) of matched stars.
-    pub rmse_rad: Option<f32>,
+    pub rmse_rad: f32,
     /// 90th-percentile angular residual (radians).
-    pub p90e_rad: Option<f32>,
+    pub p90e_rad: f32,
     /// Maximum angular residual (radians).
-    pub max_err_rad: Option<f32>,
+    pub max_err_rad: f32,
     /// False-positive probability (lower is better).
-    pub prob: Option<f64>,
+    pub prob: f64,
     /// Wall-clock time spent solving, in milliseconds.
     pub solve_time_ms: f32,
-    /// Outcome status.
-    pub status: SolveStatus,
     /// Whether the image x-axis was flipped to achieve a proper rotation.
     ///
     /// When `true`, the rotation matrix assumes negated x-coordinates.
     /// Pixel↔sky conversions must account for this flip.
     pub parity_flip: bool,
-    /// Catalog IDs of matched stars (only populated on success).
+    /// Catalog IDs of matched stars.
     pub matched_catalog_ids: Vec<i64>,
     /// Indices into the input centroid slice for each match.
     pub matched_centroid_indices: Vec<usize>,
@@ -479,109 +490,45 @@ pub struct SolveResult {
     ///
     /// Maps pixel offsets from the optical center (CRPIX) to gnomonic tangent-plane
     /// coordinates at the reference point (CRVAL). Follows the FITS WCS TAN convention.
-    /// Only populated on successful solve (`MatchFound`).
-    pub cd_matrix: Option<[[f64; 2]; 2]>,
+    pub cd_matrix: [[f64; 2]; 2],
     /// WCS reference point `[RA, Dec]` in radians.
     ///
     /// The tangent point of the gnomonic (TAN) projection, typically very close to
-    /// the camera boresight. Only populated on successful solve (`MatchFound`).
-    pub crval_rad: Option<[f64; 2]>,
+    /// the camera boresight.
+    pub crval_rad: [f64; 2],
     /// Camera model used during solving (stored for coordinate transforms).
     ///
-    /// On success, this contains the camera model with the refined focal length
-    /// (from the matched FOV) and detected parity. The distortion model and CRPIX
-    /// are copied from the input [`SolveConfig::camera_model`].
-    pub camera_model: Option<CameraModel>,
+    /// The camera model with the refined focal length (from the matched FOV)
+    /// and detected parity. The distortion model and CRPIX are copied from
+    /// the input [`SolveConfig::camera_model`].
+    pub camera_model: CameraModel,
     /// Fitted rotation angle in radians (camera roll in tangent plane).
     ///
     /// The angle from the tangent-plane ξ (East) axis to the camera +X axis,
-    /// measured counter-clockwise. Only populated on successful solve.
-    pub theta_rad: Option<f64>,
+    /// measured counter-clockwise.
+    pub theta_rad: f64,
 }
 
-impl SolveResult {
-    /// Create a failure result with the given status and elapsed time.
-    pub(crate) fn failure(status: SolveStatus, solve_time_ms: f32) -> Self {
-        Self {
-            qicrs2cam: None,
-            fov_rad: None,
-            num_matches: None,
-            rmse_rad: None,
-            p90e_rad: None,
-            max_err_rad: None,
-            prob: None,
-            solve_time_ms,
-            status,
-            parity_flip: false,
-            matched_catalog_ids: Vec::new(),
-            matched_centroid_indices: Vec::new(),
-            image_width: 0,
-            image_height: 0,
-            cd_matrix: None,
-            crval_rad: None,
-            camera_model: None,
-            theta_rad: None,
-        }
-    }
-
+impl Solution {
     /// Convert centered pixel coordinates to world coordinates (RA, Dec) in degrees.
     ///
     /// Pixel coordinates use the same convention as solver centroids:
     /// origin at the geometric image center, +X right, +Y down.
     ///
-    /// When a CameraModel and theta are available (from the constrained WCS refinement),
-    /// the pipeline is:
+    /// Pipeline:
     /// 1. CameraModel.pixel_to_tanplane: crpix subtract → undistort → parity → divide by f
     /// 2. Rotate from camera frame to sky frame using theta
     /// 3. Inverse TAN projection at CRVAL → (RA, Dec)
-    ///
-    /// Falls back to the CD matrix path, then to the quaternion + FOV path.
-    ///
-    /// Returns `None` if the solve was unsuccessful.
-    pub fn pixel_to_world(&self, x: f64, y: f64) -> Option<(f64, f64)> {
-        if let (Some(ref cam), Some(crval), Some(theta)) =
-            (&self.camera_model, &self.crval_rad, self.theta_rad)
-        {
-            // ── CameraModel + theta path ──
-            let (xi_cam, eta_cam) = cam.pixel_to_tanplane(x, y);
-            // Rotate from camera frame to sky frame: R(θ) * [xi_cam, eta_cam]
-            let cos_t = theta.cos();
-            let sin_t = theta.sin();
-            let xi = cos_t * xi_cam - sin_t * eta_cam;
-            let eta = sin_t * xi_cam + cos_t * eta_cam;
-            let (ra, dec) = wcs_refine::inverse_tan_project(xi, eta, crval[0], crval[1]);
-            Some((ra.to_degrees().rem_euclid(360.0), dec.to_degrees()))
-        } else if let (Some(cd), Some(crval)) = (&self.cd_matrix, &self.crval_rad) {
-            // ── Legacy CD-matrix fallback (no CameraModel) ──
-            let xi = cd[0][0] * x + cd[0][1] * y;
-            let eta = cd[1][0] * x + cd[1][1] * y;
-            let (ra, dec) = wcs_refine::inverse_tan_project(xi, eta, crval[0], crval[1]);
-            Some((ra.to_degrees().rem_euclid(360.0), dec.to_degrees()))
-        } else {
-            // ── Fallback: quaternion + FOV ──
-            // True pinhole pixel scale (1/f) from the angular FOV.
-            let q = self.qicrs2cam.as_ref()?;
-            let fov = self.fov_rad? as f64;
-            let pixel_scale = pixel_scale_from_fov(self.image_width, fov);
-
-            let ps = if self.parity_flip { -1.0 } else { 1.0 };
-            let xr = ps * x * pixel_scale;
-            let yr = y * pixel_scale;
-
-            let norm = (xr * xr + yr * yr + 1.0).sqrt();
-            let cx = xr / norm;
-            let cy = yr / norm;
-            let cz = 1.0 / norm;
-
-            let m = q.to_rotation_matrix();
-            let ix = m[(0, 0)] as f64 * cx + m[(1, 0)] as f64 * cy + m[(2, 0)] as f64 * cz;
-            let iy = m[(0, 1)] as f64 * cx + m[(1, 1)] as f64 * cy + m[(2, 1)] as f64 * cz;
-            let iz = m[(0, 2)] as f64 * cx + m[(1, 2)] as f64 * cy + m[(2, 2)] as f64 * cz;
-
-            let dec = iz.asin();
-            let ra = iy.atan2(ix);
-            Some((ra.to_degrees().rem_euclid(360.0), dec.to_degrees()))
-        }
+    pub fn pixel_to_world(&self, x: f64, y: f64) -> (f64, f64) {
+        let (xi_cam, eta_cam) = self.camera_model.pixel_to_tanplane(x, y);
+        // Rotate from camera frame to sky frame: R(θ) * [xi_cam, eta_cam]
+        let cos_t = self.theta_rad.cos();
+        let sin_t = self.theta_rad.sin();
+        let xi = cos_t * xi_cam - sin_t * eta_cam;
+        let eta = sin_t * xi_cam + cos_t * eta_cam;
+        let (ra, dec) =
+            wcs_refine::inverse_tan_project(xi, eta, self.crval_rad[0], self.crval_rad[1]);
+        (ra.to_degrees().rem_euclid(360.0), dec.to_degrees())
     }
 
     /// Convert world coordinates (RA, Dec in degrees) to centered pixel coordinates.
@@ -589,70 +536,22 @@ impl SolveResult {
     /// Returns pixel coordinates in the same convention as solver centroids:
     /// origin at the geometric image center, +X right, +Y down.
     ///
-    /// When a CameraModel and theta are available, the pipeline is:
+    /// Pipeline:
     /// 1. TAN project (RA, Dec) at CRVAL → sky tangent-plane (ξ, η)
     /// 2. Rotate from sky frame to camera frame using -theta
     /// 3. CameraModel.tanplane_to_pixel: multiply by f → parity → distort → add crpix
     ///
-    /// Falls back to the CD matrix path, then to the quaternion + FOV path.
-    ///
-    /// Returns `None` if the solve was unsuccessful or the point is behind the camera.
+    /// Returns `None` if the point is behind the camera.
     pub fn world_to_pixel(&self, ra_deg: f64, dec_deg: f64) -> Option<(f64, f64)> {
-        if let (Some(ref cam), Some(crval), Some(theta)) =
-            (&self.camera_model, &self.crval_rad, self.theta_rad)
-        {
-            // ── CameraModel + theta path ──
-            let ra = ra_deg.to_radians();
-            let dec = dec_deg.to_radians();
-            let (xi, eta) = wcs_refine::tan_project(ra, dec, crval[0], crval[1])?;
-            // Rotate from sky frame to camera frame: R(-θ) * [xi, eta]
-            let cos_t = theta.cos();
-            let sin_t = theta.sin();
-            let xi_cam = cos_t * xi + sin_t * eta;
-            let eta_cam = -sin_t * xi + cos_t * eta;
-            let (px, py) = cam.tanplane_to_pixel(xi_cam, eta_cam);
-            Some((px, py))
-        } else if let (Some(cd), Some(crval)) = (&self.cd_matrix, &self.crval_rad) {
-            // ── Legacy CD-matrix fallback ──
-            let ra = ra_deg.to_radians();
-            let dec = dec_deg.to_radians();
-            let (xi, eta) = wcs_refine::tan_project(ra, dec, crval[0], crval[1])?;
-            let cd_inv = wcs_refine::cd_inverse(cd)?;
-            let px = cd_inv[0][0] * xi + cd_inv[0][1] * eta;
-            let py = cd_inv[1][0] * xi + cd_inv[1][1] * eta;
-            Some((px, py))
-        } else {
-            // ── Fallback: quaternion + FOV ──
-            // True pinhole pixel scale (1/f) from the angular FOV.
-            let q = self.qicrs2cam.as_ref()?;
-            let fov = self.fov_rad? as f64;
-            let pixel_scale = pixel_scale_from_fov(self.image_width, fov);
-
-            let ra = ra_deg.to_radians();
-            let dec = dec_deg.to_radians();
-            let cos_dec = dec.cos();
-            let ix = ra.cos() * cos_dec;
-            let iy = ra.sin() * cos_dec;
-            let iz = dec.sin();
-
-            let m = q.to_rotation_matrix();
-            let cx = m[(0, 0)] as f64 * ix + m[(0, 1)] as f64 * iy + m[(0, 2)] as f64 * iz;
-            let cy = m[(1, 0)] as f64 * ix + m[(1, 1)] as f64 * iy + m[(1, 2)] as f64 * iz;
-            let cz = m[(2, 0)] as f64 * ix + m[(2, 1)] as f64 * iy + m[(2, 2)] as f64 * iz;
-
-            if cz <= 0.0 {
-                return None;
-            }
-
-            let xr = cx / cz;
-            let yr = cy / cz;
-
-            let ps = if self.parity_flip { -1.0 } else { 1.0 };
-            let ux = ps * xr / pixel_scale;
-            let uy = yr / pixel_scale;
-
-            Some((ux, uy))
-        }
+        let ra = ra_deg.to_radians();
+        let dec = dec_deg.to_radians();
+        let (xi, eta) = wcs_refine::tan_project(ra, dec, self.crval_rad[0], self.crval_rad[1])?;
+        // Rotate from sky frame to camera frame: R(-θ) * [xi, eta]
+        let cos_t = self.theta_rad.cos();
+        let sin_t = self.theta_rad.sin();
+        let xi_cam = cos_t * xi + sin_t * eta;
+        let eta_cam = -sin_t * xi + cos_t * eta;
+        Some(self.camera_model.tanplane_to_pixel(xi_cam, eta_cam))
     }
 }
 

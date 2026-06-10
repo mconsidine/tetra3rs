@@ -111,7 +111,7 @@ Both produce byte-compatible output and share the Hipparcos bright-star merge. S
 ### Example
 
 ```rust
-use tetra3::{GenerateDatabaseConfig, SolverDatabase, SolveConfig, Centroid, SolveStatus};
+use tetra3::{GenerateDatabaseConfig, SolverDatabase, SolveConfig, Centroid};
 
 // Generate a database from the Gaia catalog
 let config = GenerateDatabaseConfig {
@@ -140,12 +140,12 @@ let solve_config = SolveConfig {
     ..SolveConfig::new((15.0_f32).to_radians(), 1024, 1024)
 };
 
-let result = db.solve_from_centroids(&centroids, &solve_config);
-if result.status == SolveStatus::MatchFound {
-    let q = result.qicrs2cam.unwrap();
-    println!("Attitude: {q}");
+// The solve returns Result<Solution, SolveFailure>; a Solution's
+// fields are all guaranteed present.
+if let Ok(solution) = db.solve_from_centroids(&centroids, &solve_config) {
+    println!("Attitude: {}", solution.qicrs2cam);
     println!("Matched {} stars in {:.1} ms",
-        result.num_matches.unwrap(), result.solve_time_ms);
+        solution.num_matches, solution.solve_time_ms);
 }
 ```
 
@@ -175,10 +175,9 @@ use tetra3::SolveConfig;
 
 // Reuse the camera model from the previous solve so the refined focal length carries over.
 let config = SolveConfig {
-    attitude_hint: prev_result.qicrs2cam,
+    attitude_hint: Some(prev_solution.qicrs2cam),
     hint_uncertainty_rad: 1.0_f32.to_radians(),
-    camera_model: prev_result.camera_model.clone().unwrap(),
-    ..SolveConfig::new((15.0_f32).to_radians(), 1024, 1024)
+    ..SolveConfig::with_camera_model(prev_solution.camera_model.clone())
 };
 let result = db.solve_from_centroids(&centroids, &config);
 ```

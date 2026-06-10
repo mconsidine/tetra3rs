@@ -10,9 +10,7 @@ use numeris::{Quaternion, Vector3};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use tetra3::{
-    CentroidExtractionConfig, GenerateDatabaseConfig, SolveConfig, SolveStatus, SolverDatabase,
-};
+use tetra3::{CentroidExtractionConfig, GenerateDatabaseConfig, SolveConfig, SolverDatabase};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Minimal FITS reader
@@ -546,13 +544,12 @@ fn test_skyview_fits_solve() {
 
         let ref_result = db.solve_from_centroids(&ref_centroids, &solve_config);
         println!(
-            "  Reference solve (WCS catalog): {:?} ({} centroids, {:.1}ms)",
-            ref_result.status,
+            "  Reference solve (WCS catalog): ok={} ({} centroids)",
+            ref_result.is_ok(),
             ref_centroids.len(),
-            ref_result.solve_time_ms
         );
-        if ref_result.status == SolveStatus::MatchFound {
-            let ref_q = ref_result.qicrs2cam.unwrap();
+        if let Ok(ref_solution) = &ref_result {
+            let ref_q = ref_solution.qicrs2cam;
             let ref_boresight = ref_q.inverse() * Vector3::from_array([0.0, 0.0, 1.0]);
             let ref_err = angular_separation(&ref_boresight, &true_boresight);
             println!(
@@ -564,11 +561,9 @@ fn test_skyview_fits_solve() {
         // ── Solve from parity-corrected extracted centroids ──
         let result = db.solve_from_centroids(&corrected_centroids, &solve_config);
 
-        println!("  Solve status: {:?}", result.status);
-        println!("  Solve time:   {:.1} ms", result.solve_time_ms);
-
-        if result.status == SolveStatus::MatchFound {
-            let solved_q = result.qicrs2cam.unwrap();
+        if let Ok(solution) = &result {
+            println!("  Solve time:   {:.1} ms", solution.solve_time_ms);
+            let solved_q = solution.qicrs2cam;
             let solved_boresight = solved_q.inverse() * Vector3::from_array([0.0, 0.0, 1.0]);
             let (solved_ra, solved_dec) = uvec_to_radec(&solved_boresight);
             let error_rad = angular_separation(&solved_boresight, &true_boresight);
@@ -583,15 +578,12 @@ fn test_skyview_fits_solve() {
                 error_arcmin,
                 error_arcmin * 60.0
             );
-            if let Some(n) = result.num_matches {
-                println!("  Matched stars: {}", n);
-            }
-            if let Some(rmse) = result.rmse_rad {
-                println!("  RMSE:         {:.1}\"", rmse.to_degrees() * 3600.0);
-            }
-            if let Some(fov) = result.fov_rad {
-                println!("  Solved FOV:   {:.2}°", fov.to_degrees());
-            }
+            println!("  Matched stars: {}", solution.num_matches);
+            println!(
+                "  RMSE:         {:.1}\"",
+                solution.rmse_rad.to_degrees() * 3600.0
+            );
+            println!("  Solved FOV:   {:.2}°", solution.fov_rad.to_degrees());
 
             if error_arcmin > 30.0 {
                 println!(

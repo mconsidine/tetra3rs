@@ -16,7 +16,7 @@
 use std::time::Instant;
 
 use numeris::{Matrix3, Vector3};
-use tetra3::{Centroid, GenerateDatabaseConfig, SolveConfig, SolveStatus, SolverDatabase};
+use tetra3::{Centroid, GenerateDatabaseConfig, SolveConfig, SolverDatabase};
 
 /// Minimal deterministic xorshift64* RNG — keeps the example dependency-light.
 struct Rng(u64);
@@ -204,7 +204,7 @@ fn main() {
         let t = Instant::now();
         let r = db.solve_from_centroids(c, &solve_config);
         total_solve_ns += t.elapsed().as_nanos();
-        if r.status == SolveStatus::MatchFound {
+        if r.is_ok() {
             n_found += 1;
         }
     }

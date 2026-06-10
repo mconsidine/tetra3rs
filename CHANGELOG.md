@@ -4,6 +4,23 @@
 
 ### Breaking changes
 
+- **`SolveResult` is now `Result<Solution, SolveFailure>` (Rust).** The old
+  struct-of-`Option`s is replaced by a `Solution` whose fields are all
+  guaranteed present (`qicrs2cam: Quaternion`, `fov_rad: f32`, `camera_model:
+  CameraModel`, `cd_matrix`, `crval_rad`, `theta_rad`, …) and a `SolveFailure
+  { status, solve_time_ms }` for the `NoMatch` / `Timeout` / `TooFew`
+  outcomes (`SolveStatus::MatchFound` is gone — success is the `Ok` arm).
+  `Solution::pixel_to_world` is now infallible and the legacy CD-matrix and
+  quaternion+FOV fallback transform paths are deleted (every `Solution`
+  carries a camera model and θ). `calibrate_camera` and the distortion
+  fitters still accept failed solves in their input slices and skip them.
+  **Python:** `solve_from_centroids` still returns a `SolveResult` object or
+  `None`; the change is that its attributes (`fov_deg`, `num_matches`,
+  `rmse_arcsec`, `camera_model`, `cd_matrix`, …) are no longer `Optional`,
+  and scalar `pixel_to_world` always returns a tuple. Pickles of
+  `SolveResult` objects from earlier versions do not load (wire format
+  changed).
+
 - **`SolveConfig`: `CameraModel` is now the single source of camera geometry
   (Rust).** The redundant `fov_estimate_rad`, `image_width`, and
   `image_height` fields are removed; the FOV estimate, image dimensions, and

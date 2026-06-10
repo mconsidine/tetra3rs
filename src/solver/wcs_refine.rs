@@ -84,6 +84,10 @@ pub fn inverse_tan_project(xi: f64, eta: f64, crval_ra: f64, crval_dec: f64) -> 
 // ── 2×2 matrix helpers ─────────────────────────────────────────────────────
 
 /// Invert a 2×2 matrix. Returns `None` if singular (|det| < 1e-30).
+///
+/// Retained for tests; production code converts CD ↔ (θ, ps, parity)
+/// analytically via `cd_from_theta` / `rotation_from_theta_crval`.
+#[cfg(test)]
 #[inline]
 pub fn cd_inverse(cd: &[[f64; 2]; 2]) -> Option<[[f64; 2]; 2]> {
     let det = cd[0][0] * cd[1][1] - cd[0][1] * cd[1][0];

@@ -14,7 +14,7 @@ use numeris::{DynMatrix, DynVector, Matrix3};
 use tracing::debug;
 
 use crate::centroid::Centroid;
-use crate::solver::{SolveResult, SolveStatus, SolverDatabase};
+use crate::solver::{SolveResult, SolverDatabase};
 
 use super::polynomial::{num_coeffs, term_pairs, PolynomialDistortion};
 use super::radial::RadialDistortion;
@@ -829,24 +829,16 @@ fn gather_matched_points(
     let mut points = Vec::new();
 
     for (sr, cents) in solve_results.iter().zip(centroids.iter()) {
-        if sr.status != SolveStatus::MatchFound {
-            continue;
-        }
-        let quat = match &sr.qicrs2cam {
-            Some(q) => q,
-            None => continue,
-        };
-        let fov_rad = match sr.fov_rad {
-            Some(f) => f,
-            None => continue,
+        let Ok(sr) = sr else {
+            continue; // skip failed solves
         };
 
         // True pinhole pixel scale (1/f).
         let pixel_scale = {
-            let f = (image_width as f32 / 2.0) / (fov_rad / 2.0).tan();
+            let f = (image_width as f32 / 2.0) / (sr.fov_rad / 2.0).tan();
             1.0 / f
         };
-        let rot: Matrix3<f32> = quat.to_rotation_matrix();
+        let rot: Matrix3<f32> = sr.qicrs2cam.to_rotation_matrix();
 
         let parity_sign: f64 = if sr.parity_flip { -1.0 } else { 1.0 };
 

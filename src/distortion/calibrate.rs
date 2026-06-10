@@ -19,7 +19,7 @@ use crate::distortion::fit::{
     fit_polynomial_distortion, fit_radial_distortion, DistortionFitConfig,
 };
 use crate::solver::wcs_refine;
-use crate::solver::{SolveResult, SolveStatus, SolverDatabase};
+use crate::solver::{SolveResult, SolverDatabase};
 
 use super::fit::{
     build_id_lookup, compute_corrected_rmse, compute_corrected_rmse_centered,
@@ -128,11 +128,8 @@ pub fn calibrate_camera(
         );
     }
 
-    // Count valid (MatchFound) solves
-    let n_valid = solve_results
-        .iter()
-        .filter(|sr| sr.status == SolveStatus::MatchFound && sr.qicrs2cam.is_some())
-        .count();
+    // Count valid (successful) solves
+    let n_valid = solve_results.iter().filter(|sr| sr.is_ok()).count();
 
     if n_valid <= 1 {
         single_image_calibrate(
@@ -225,17 +222,10 @@ fn single_image_calibrate(
         }
     };
 
-    // Get FOV from first successful solve result
-    let fov_rad = solve_results
-        .iter()
-        .find_map(|sr| sr.fov_rad)
-        .unwrap_or(0.1);
-
-    // Detect parity from solve results
-    let parity_flip = solve_results
-        .iter()
-        .find(|sr| sr.status == SolveStatus::MatchFound)
-        .is_some_and(|sr| sr.parity_flip);
+    // Get FOV and parity from the first successful solve result
+    let first_solution = solve_results.iter().find_map(|sr| sr.as_ref().ok());
+    let fov_rad = first_solution.map(|s| s.fov_rad).unwrap_or(0.1);
+    let parity_flip = first_solution.is_some_and(|s| s.parity_flip);
 
     // Polynomial: extract crpix from polynomial order-0 terms.
     // Radial: fit_result.crpix already carries the fitted optical-center
@@ -293,14 +283,9 @@ fn multi_image_calibrate(
     // Compute global properties from valid solves
     let mut fovs: Vec<f32> = Vec::new();
     let mut parity_flip = false;
-    for sr in solve_results.iter() {
-        if sr.status != SolveStatus::MatchFound {
-            continue;
-        }
-        if let Some(fov) = sr.fov_rad {
-            fovs.push(fov);
-        }
-        parity_flip = sr.parity_flip;
+    for sol in solve_results.iter().copied().flatten() {
+        fovs.push(sol.fov_rad);
+        parity_flip = sol.parity_flip;
     }
     fovs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let median_fov = fovs[fovs.len() / 2];
@@ -343,22 +328,13 @@ fn multi_image_calibrate(
 
     let mut image_data: Vec<ImageData> = Vec::new();
     for (idx, sr) in solve_results.iter().enumerate() {
-        if sr.status != SolveStatus::MatchFound {
+        let Ok(sol) = sr else {
             continue;
-        }
-        let quat = match &sr.qicrs2cam {
-            Some(q) => q,
-            None => continue,
         };
-        let fov = match sr.fov_rad {
-            Some(f) => f,
-            None => continue,
-        };
-        let rot: Matrix3<f32> = quat.to_rotation_matrix();
         image_data.push(ImageData {
             sr_idx: idx,
-            rotation: rot,
-            fov_rad: fov,
+            rotation: sol.qicrs2cam.to_rotation_matrix(),
+            fov_rad: sol.fov_rad,
         });
     }
 
@@ -381,7 +357,9 @@ fn multi_image_calibrate(
         let mut refined_images: Vec<RefinedImage> = Vec::new();
 
         for img in &image_data {
-            let sr = solve_results[img.sr_idx];
+            let Ok(sr) = solve_results[img.sr_idx] else {
+                continue; // image_data only contains successful solves
+            };
             let cents = centroids[img.sr_idx];
 
             // Per-image true pinhole pixel scale (1/f) from angular FOV.

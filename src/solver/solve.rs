@@ -25,7 +25,10 @@ use super::pattern::{
     hash_to_index, sort_pattern_by_centroid_distance, NUM_EDGES, NUM_EDGE_RATIOS, PATTERN_SIZE,
 };
 use super::wcs_refine;
-use super::{pixel_scale_from_fov, SolveConfig, SolveResult, SolveStatus, SolverDatabase};
+use super::{
+    pixel_scale_from_fov, Solution, SolveConfig, SolveFailure, SolveResult, SolveStatus,
+    SolverDatabase,
+};
 
 #[cfg(feature = "profile")]
 use crate::solver::profiling::{self, buckets};
@@ -115,27 +118,29 @@ impl SolverDatabase {
 
         // ── Tracking-mode shortcut: if a hint is provided, try direct correspondence first ──
         if let Some(ref hint) = config.attitude_hint {
-            let hint_result = self.solve_with_hint(working_centroids, &star_vecs, config, hint, t0);
-            if hint_result.status == SolveStatus::MatchFound {
-                debug!(
-                    "Hinted solve succeeded in {:.1} ms ({} matches)",
-                    hint_result.solve_time_ms,
-                    hint_result.num_matches.unwrap_or(0)
-                );
-                return hint_result;
+            match self.solve_with_hint(working_centroids, &star_vecs, config, hint, t0) {
+                Ok(solution) => {
+                    debug!(
+                        "Hinted solve succeeded in {:.1} ms ({} matches)",
+                        solution.solve_time_ms, solution.num_matches
+                    );
+                    return Ok(solution);
+                }
+                Err(fail) => {
+                    if config.strict_hint {
+                        debug!("Hinted solve failed and strict_hint is set — returning failure");
+                        return Err(fail);
+                    }
+                    debug!("Hinted solve failed; falling back to lost-in-space");
+                }
             }
-            if config.strict_hint {
-                debug!("Hinted solve failed and strict_hint is set — returning failure");
-                return hint_result;
-            }
-            debug!("Hinted solve failed; falling back to lost-in-space");
         }
 
         // Too few centroids to ever form a 4-star pattern. This is
         // FOV-independent, unlike the post-thinning TooFew inside
         // `solve_at_fov`, so it ends the solve outright.
         if working_centroids.len() < PATTERN_SIZE {
-            return SolveResult::failure(SolveStatus::TooFew, elapsed_ms(t0));
+            return failure(SolveStatus::TooFew, t0);
         }
 
         // Sort centroids by brightness (highest mass = brightest first);
@@ -178,7 +183,7 @@ impl SolverDatabase {
             // Check timeout
             if let Some(t) = config.solve_timeout_ms {
                 if elapsed_ms(t0) > t as f32 {
-                    return SolveResult::failure(SolveStatus::Timeout, elapsed_ms(t0));
+                    return failure(SolveStatus::Timeout, t0);
                 }
             }
 
@@ -191,17 +196,17 @@ impl SolverDatabase {
                 &star_vecs,
                 t0,
             );
-            match result.status {
-                SolveStatus::MatchFound => return result,
+            match result {
+                Ok(solution) => return Ok(solution),
                 // TooFew here means cluster-buster thinning left fewer than 4
                 // pattern centroids. The thinning separation scales with the
                 // FOV being tried, so a different FOV in the sweep may still
                 // succeed — keep going.
-                s => last_status = s,
+                Err(fail) => last_status = fail.status,
             }
         }
 
-        SolveResult::failure(last_status, elapsed_ms(t0))
+        failure(last_status, t0)
     }
 
     /// Attempt a solve at a specific FOV value.
@@ -287,7 +292,7 @@ impl SolverDatabase {
         );
 
         if num_pattern_centroids < PATTERN_SIZE {
-            return SolveResult::failure(SolveStatus::TooFew, elapsed_ms(t0));
+            return failure(SolveStatus::TooFew, t0);
         }
 
         // Trim match centroids to verification limit
@@ -306,7 +311,7 @@ impl SolverDatabase {
         // database): the hash-probe arithmetic below would divide by zero.
         let table_len = self.pattern_catalog.len() as u64;
         if table_len == 0 {
-            return SolveResult::failure(SolveStatus::NoMatch, elapsed_ms(t0));
+            return failure(SolveStatus::NoMatch, t0);
         }
 
         debug!(
@@ -541,13 +546,13 @@ impl SolverDatabase {
                         prob_mismatch * self.props.num_patterns as f64,
                         t0,
                     ) {
-                        return result;
+                        return Ok(result);
                     }
                 }
             }
         }
 
-        SolveResult::failure(status, elapsed_ms(t0))
+        failure(status, t0)
     }
 
     /// Verify a candidate attitude by projecting nearby catalog stars into
@@ -647,7 +652,7 @@ impl SolverDatabase {
         min_matches: usize,
         prob: f64,
         t0: Instant,
-    ) -> Option<SolveResult> {
+    ) -> Option<Solution> {
         // Build pixel coordinates: centroids are already CRPIX-subtracted and
         // undistorted. Apply the detected parity.
         let parity_sign: f64 = if parity_flip { -1.0 } else { 1.0 };
@@ -692,7 +697,7 @@ impl SolverDatabase {
         ))
     }
 
-    /// Assemble a successful [`SolveResult`] from a completed WCS refinement.
+    /// Assemble a [`Solution`] from a completed WCS refinement.
     ///
     /// Shared by the lost-in-space (`solve_at_fov`) and tracking
     /// (`solve_with_hint`) paths. `star_vectors` is the (possibly
@@ -710,7 +715,7 @@ impl SolverDatabase {
         parity_flip: bool,
         prob: f64,
         t0: Instant,
-    ) -> SolveResult {
+    ) -> Solution {
         // Derive the rotation directly from the constrained-fit parameters
         // (θ, CRVAL, parity). The pixel scale was locked during refinement, so
         // it is the exact scale of the solution — no CD-matrix decomposition
@@ -771,25 +776,24 @@ impl SolverDatabase {
         result_cam.focal_length_px = 1.0 / wcs_result.pixel_scale;
         result_cam.parity_flip = parity_flip;
 
-        SolveResult {
-            qicrs2cam: Some(quat),
-            fov_rad: Some(refined_fov),
-            num_matches: Some(wcs_result.matches.len() as u32),
-            rmse_rad: Some(rmse),
-            p90e_rad: Some(p90e),
-            max_err_rad: Some(max_err),
-            prob: Some(prob),
+        Solution {
+            qicrs2cam: quat,
+            fov_rad: refined_fov,
+            num_matches: wcs_result.matches.len() as u32,
+            rmse_rad: rmse,
+            p90e_rad: p90e,
+            max_err_rad: max_err,
+            prob,
             solve_time_ms: elapsed_ms(t0),
-            status: SolveStatus::MatchFound,
             parity_flip,
             matched_catalog_ids: matched_cat_ids,
             matched_centroid_indices: matched_cent_inds,
             image_width: config.image_width(),
             image_height: config.image_height(),
-            cd_matrix: Some(wcs_result.cd_matrix),
-            crval_rad: Some(wcs_result.crval_rad),
-            camera_model: Some(result_cam),
-            theta_rad: Some(wcs_result.theta_rad),
+            cd_matrix: wcs_result.cd_matrix,
+            crval_rad: wcs_result.crval_rad,
+            camera_model: result_cam,
+            theta_rad: wcs_result.theta_rad,
         }
     }
 }
@@ -826,6 +830,14 @@ fn build_fov_sweep(fov_estimate: f32, fov_max_error: Option<f32>, match_radius: 
 
 pub(super) fn elapsed_ms(t0: Instant) -> f32 {
     t0.elapsed().as_secs_f32() * 1000.0
+}
+
+/// Build a failed [`SolveResult`] with the elapsed time since `t0`.
+pub(super) fn failure(status: SolveStatus, t0: Instant) -> SolveResult {
+    Err(SolveFailure {
+        status,
+        solve_time_ms: elapsed_ms(t0),
+    })
 }
 
 /// Ratio of the image diagonal to the image width, used to size the

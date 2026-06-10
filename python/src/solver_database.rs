@@ -2,7 +2,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 use tetra3::camera_model::CameraModel;
-use tetra3::solver::{GenerateDatabaseConfig, SolveConfig, SolveStatus, SolverDatabase};
+use tetra3::solver::{GenerateDatabaseConfig, SolveConfig, SolverDatabase};
 use tetra3::Centroid;
 use tetra3::{calibrate_camera, CalibrateConfig, DistortionModelType};
 
@@ -278,10 +278,7 @@ impl PySolverDatabase {
 
         let result = self.inner.solve_from_centroids(&centroid_vec, &config);
 
-        match result.status {
-            SolveStatus::MatchFound => Ok(Some(PySolveResult::from_result(result))),
-            _ => Ok(None),
-        }
+        Ok(result.ok().map(PySolveResult::from_solution))
     }
 
     /// Number of stars in the catalog.

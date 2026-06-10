@@ -22,7 +22,7 @@ use tracing::debug;
 
 use crate::{Centroid, Quaternion};
 
-use super::solve::{diagonal_factor, elapsed_ms, find_centroid_matches};
+use super::solve::{diagonal_factor, failure, find_centroid_matches};
 use super::{SolveConfig, SolveResult, SolveStatus, SolverDatabase};
 
 /// Minimum unique correspondences required to attempt the SVD step.
@@ -55,12 +55,12 @@ impl SolverDatabase {
         // placeholder, so a hinted solve is impossible.
         let pixel_scale: f32 = config.pixel_scale();
         if pixel_scale <= 0.0 {
-            return SolveResult::failure(SolveStatus::NoMatch, elapsed_ms(t0));
+            return failure(SolveStatus::NoMatch, t0);
         }
         let fov_rad = config.fov_estimate_rad();
 
         if preprocessed.len() < MIN_HINT_MATCHES {
-            return SolveResult::failure(SolveStatus::TooFew, elapsed_ms(t0));
+            return failure(SolveStatus::TooFew, t0);
         }
 
         // ── Hint geometry ──
@@ -84,7 +84,7 @@ impl SolverDatabase {
         );
 
         if nearby_inds.len() < MIN_HINT_MATCHES {
-            return SolveResult::failure(SolveStatus::NoMatch, elapsed_ms(t0));
+            return failure(SolveStatus::NoMatch, t0);
         }
 
         // ── Sort centroids by brightness (mirrors LIS path) ──
@@ -131,7 +131,7 @@ impl SolverDatabase {
         }
 
         if projected.len() < MIN_HINT_MATCHES {
-            return SolveResult::failure(SolveStatus::NoMatch, elapsed_ms(t0));
+            return failure(SolveStatus::NoMatch, t0);
         }
 
         // ── Initial centroid → catalog star matching ──
@@ -152,7 +152,7 @@ impl SolverDatabase {
         );
 
         if initial_matches.len() < MIN_HINT_MATCHES {
-            return SolveResult::failure(SolveStatus::NoMatch, elapsed_ms(t0));
+            return failure(SolveStatus::NoMatch, t0);
         }
 
         // ── Wahba SVD on the initial correspondence set ──
@@ -160,7 +160,7 @@ impl SolverDatabase {
             wahba_svd_dynamic(&centroid_vectors, star_vectors, &initial_matches);
         if !det_sign_ok {
             // Parity mismatch — bail (caller may still fall back to LIS).
-            return SolveResult::failure(SolveStatus::NoMatch, elapsed_ms(t0));
+            return failure(SolveStatus::NoMatch, t0);
         }
 
         // ── Verification (same path as LIS) ──
@@ -181,7 +181,7 @@ impl SolverDatabase {
                 verify_matches.len(),
                 prob_mismatch
             );
-            return SolveResult::failure(SolveStatus::NoMatch, elapsed_ms(t0));
+            return failure(SolveStatus::NoMatch, t0);
         }
 
         debug!(
@@ -206,8 +206,8 @@ impl SolverDatabase {
             prob_mismatch,
             t0,
         ) {
-            Some(result) => result,
-            None => SolveResult::failure(SolveStatus::NoMatch, elapsed_ms(t0)),
+            Some(solution) => Ok(solution),
+            None => failure(SolveStatus::NoMatch, t0),
         }
     }
 }

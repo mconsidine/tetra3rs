@@ -79,7 +79,7 @@ if result is not None:
 ## Rust
 
 ```rust
-use tetra3::{GenerateDatabaseConfig, SolverDatabase, SolveConfig, Centroid, SolveStatus};
+use tetra3::{GenerateDatabaseConfig, SolverDatabase, SolveConfig, Centroid};
 
 // Generate a database from the Gaia catalog
 let config = GenerateDatabaseConfig {
@@ -106,11 +106,11 @@ let solve_config = SolveConfig {
     ..SolveConfig::new((15.0_f32).to_radians(), 1024, 1024)
 };
 
-let result = db.solve_from_centroids(&centroids, &solve_config);
-if result.status == SolveStatus::MatchFound {
-    let q = result.qicrs2cam.unwrap();
-    println!("Attitude: {q}");
+// The solve returns Result<Solution, SolveFailure>; a Solution's
+// fields are all guaranteed present.
+if let Ok(solution) = db.solve_from_centroids(&centroids, &solve_config) {
+    println!("Attitude: {}", solution.qicrs2cam);
     println!("Matched {} stars in {:.1} ms",
-        result.num_matches.unwrap(), result.solve_time_ms);
+        solution.num_matches, solution.solve_time_ms);
 }
 ```

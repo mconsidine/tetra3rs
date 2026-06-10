@@ -3,7 +3,7 @@ use numpy::{PyArray1, PyArray2, PyReadonlyArray1};
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 
-use tetra3::solver::SolveResult;
+use tetra3::solver::Solution;
 
 use crate::camera_model::PyCameraModel;
 
@@ -14,7 +14,7 @@ use crate::camera_model::PyCameraModel;
 #[pyclass(name = "SolveResult", module = "tetra3rs", frozen, from_py_object)]
 #[derive(Clone)]
 pub(crate) struct PySolveResult {
-    pub(crate) inner: SolveResult,
+    pub(crate) inner: Solution,
     /// Cached derived quantities (computed once at construction).
     ra_deg: f64,
     dec_deg: f64,
@@ -24,13 +24,9 @@ pub(crate) struct PySolveResult {
 }
 
 impl PySolveResult {
-    /// Construct from a successful `SolveResult`.
-    pub(crate) fn from_result(result: SolveResult) -> Self {
-        let q = result
-            .qicrs2cam
-            .as_ref()
-            .expect("MatchFound must have quaternion");
-        let m = q.to_rotation_matrix();
+    /// Construct from a plate-solve `Solution`.
+    pub(crate) fn from_solution(solution: Solution) -> Self {
+        let m = solution.qicrs2cam.to_rotation_matrix();
         let rot_elements = [
             m[(0, 0)] as f64,
             m[(0, 1)] as f64,
@@ -69,7 +65,7 @@ impl PySolveResult {
         let roll_deg = dot_east.atan2(dot_north).to_degrees();
 
         PySolveResult {
-            inner: result,
+            inner: solution,
             ra_deg,
             dec_deg,
             roll_deg,
@@ -107,11 +103,7 @@ impl PySolveResult {
     /// ``concepts/tracking.md`` for more on the convention.
     #[getter]
     fn quaternion<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        let q = self
-            .inner
-            .qicrs2cam
-            .as_ref()
-            .expect("MatchFound must have quaternion");
+        let q = &self.inner.qicrs2cam;
         PyArray1::from_vec(py, vec![q.w as f64, q.x as f64, q.y as f64, q.z as f64])
     }
 
@@ -135,39 +127,37 @@ impl PySolveResult {
 
     /// Solved horizontal field of view in degrees.
     #[getter]
-    fn fov_deg(&self) -> Option<f64> {
-        self.inner.fov_rad.map(|f| f.to_degrees() as f64)
+    fn fov_deg(&self) -> f64 {
+        self.inner.fov_rad.to_degrees() as f64
     }
 
     /// Number of matched star pairs.
     #[getter]
-    fn num_matches(&self) -> Option<u32> {
+    fn num_matches(&self) -> u32 {
         self.inner.num_matches
     }
 
     /// Root mean square error of matched stars in arcseconds.
     #[getter]
-    fn rmse_arcsec(&self) -> Option<f64> {
-        self.inner.rmse_rad.map(|r| r.to_degrees() as f64 * 3600.0)
+    fn rmse_arcsec(&self) -> f64 {
+        self.inner.rmse_rad.to_degrees() as f64 * 3600.0
     }
 
     /// 90th percentile error in arcseconds.
     #[getter]
-    fn p90e_arcsec(&self) -> Option<f64> {
-        self.inner.p90e_rad.map(|r| r.to_degrees() as f64 * 3600.0)
+    fn p90e_arcsec(&self) -> f64 {
+        self.inner.p90e_rad.to_degrees() as f64 * 3600.0
     }
 
     /// Maximum match error in arcseconds.
     #[getter]
-    fn max_err_arcsec(&self) -> Option<f64> {
-        self.inner
-            .max_err_rad
-            .map(|r| r.to_degrees() as f64 * 3600.0)
+    fn max_err_arcsec(&self) -> f64 {
+        self.inner.max_err_rad.to_degrees() as f64 * 3600.0
     }
 
     /// False-positive probability (lower is better).
     #[getter]
-    fn probability(&self) -> Option<f64> {
+    fn probability(&self) -> f64 {
         self.inner.prob
     }
 
@@ -211,65 +201,55 @@ impl PySolveResult {
         self.inner.parity_flip
     }
 
-    /// The camera model used during solving, if any.
-    ///
-    /// Returns a ``CameraModel`` instance, or ``None`` if the solve failed.
+    /// The camera model used during solving, with the refined focal length
+    /// and detected parity.
     #[getter]
-    fn camera_model(&self) -> Option<PyCameraModel> {
-        self.inner
-            .camera_model
-            .as_ref()
-            .map(|cam| PyCameraModel { inner: cam.clone() })
+    fn camera_model(&self) -> PyCameraModel {
+        PyCameraModel {
+            inner: self.inner.camera_model.clone(),
+        }
     }
 
     /// Fitted rotation angle in degrees (camera roll in tangent plane).
     ///
     /// The angle from the tangent-plane ξ (East) axis to the camera +X axis,
-    /// measured counter-clockwise. ``None`` if the solve failed.
+    /// measured counter-clockwise.
     #[getter]
-    fn theta_deg(&self) -> Option<f64> {
-        self.inner.theta_rad.map(|t| t.to_degrees())
+    fn theta_deg(&self) -> f64 {
+        self.inner.theta_rad.to_degrees()
     }
 
     /// WCS CD matrix as a 2x2 numpy array (tangent-plane radians per pixel).
     ///
     /// Maps pixel offsets from CRPIX to gnomonic tangent-plane coordinates
-    /// at CRVAL. ``None`` if the solve failed.
+    /// at CRVAL.
     #[getter]
-    fn cd_matrix<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
-        self.inner.cd_matrix.map(|cd| {
-            PyArray2::from_owned_array(
-                py,
-                ndarray::array![[cd[0][0], cd[0][1]], [cd[1][0], cd[1][1]]],
-            )
-        })
+    fn cd_matrix<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
+        let cd = self.inner.cd_matrix;
+        PyArray2::from_owned_array(
+            py,
+            ndarray::array![[cd[0][0], cd[0][1]], [cd[1][0], cd[1][1]]],
+        )
     }
 
     /// WCS reference point RA in degrees.
     ///
     /// The tangent point of the gnomonic (TAN) projection, close to the boresight.
     #[getter]
-    fn crval_ra_deg(&self) -> Option<f64> {
-        self.inner
-            .crval_rad
-            .map(|c| c[0].to_degrees().rem_euclid(360.0))
+    fn crval_ra_deg(&self) -> f64 {
+        self.inner.crval_rad[0].to_degrees().rem_euclid(360.0)
     }
 
     /// WCS reference point Dec in degrees.
     #[getter]
-    fn crval_dec_deg(&self) -> Option<f64> {
-        self.inner.crval_rad.map(|c| c[1].to_degrees())
+    fn crval_dec_deg(&self) -> f64 {
+        self.inner.crval_rad[1].to_degrees()
     }
 
     /// Optical center offset from the geometric image center, in pixels [x, y].
     #[getter]
     fn crpix<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        let crpix = self
-            .inner
-            .camera_model
-            .as_ref()
-            .map(|cam| cam.crpix)
-            .unwrap_or([0.0, 0.0]);
+        let crpix = self.inner.camera_model.crpix;
         PyArray1::from_vec(py, vec![crpix[0], crpix[1]])
     }
 
@@ -281,8 +261,8 @@ impl PySolveResult {
 
     #[staticmethod]
     fn _from_pickle_bytes(data: &[u8]) -> PyResult<Self> {
-        let result = crate::helpers::from_postcard_bytes::<SolveResult>(data)?;
-        Ok(Self::from_result(result))
+        let solution = crate::helpers::from_postcard_bytes::<Solution>(data)?;
+        Ok(Self::from_solution(solution))
     }
 
     fn __repr__(&self) -> String {
@@ -291,11 +271,8 @@ impl PySolveResult {
             self.ra_deg,
             self.dec_deg,
             self.roll_deg,
-            self.inner.num_matches.unwrap_or(0),
-            self.inner
-                .rmse_rad
-                .map(|r| r.to_degrees() as f64 * 3600.0)
-                .unwrap_or(0.0),
+            self.inner.num_matches,
+            self.inner.rmse_rad.to_degrees() as f64 * 3600.0,
             self.inner.parity_flip,
         )
     }
@@ -311,9 +288,9 @@ impl PySolveResult {
             self.ra_deg,
             self.dec_deg,
             self.roll_deg,
-            self.inner.num_matches.unwrap_or(0),
-            self.inner.rmse_rad.map(|r| r.to_degrees() as f64 * 3600.0).unwrap_or(0.0),
-            self.inner.prob.unwrap_or(0.0),
+            self.inner.num_matches,
+            self.inner.rmse_rad.to_degrees() as f64 * 3600.0,
+            self.inner.prob,
             flip_str,
         )
     }
@@ -354,26 +331,17 @@ impl PySolveResult {
             let mut ra_vec = Vec::with_capacity(n);
             let mut dec_vec = Vec::with_capacity(n);
             for i in 0..n {
-                match self.inner.pixel_to_world(xa[i], ya[i]) {
-                    Some((r, d)) => {
-                        ra_vec.push(r);
-                        dec_vec.push(d);
-                    }
-                    None => {
-                        ra_vec.push(f64::NAN);
-                        dec_vec.push(f64::NAN);
-                    }
-                }
+                let (r, d) = self.inner.pixel_to_world(xa[i], ya[i]);
+                ra_vec.push(r);
+                dec_vec.push(d);
             }
             let ra_out = PyArray1::from_vec(py, ra_vec);
             let dec_out = PyArray1::from_vec(py, dec_vec);
             Ok((ra_out, dec_out).into_pyobject(py)?.into_any().unbind())
         } else if let (Ok(xf), Ok(yf)) = (x.extract::<f64>(), y.extract::<f64>()) {
             // Scalar path
-            match self.inner.pixel_to_world(xf, yf) {
-                Some((ra, dec)) => Ok((ra, dec).into_pyobject(py)?.into_any().unbind()),
-                None => Ok(py.None()),
-            }
+            let (ra, dec) = self.inner.pixel_to_world(xf, yf);
+            Ok((ra, dec).into_pyobject(py)?.into_any().unbind())
         } else {
             Err(pyo3::exceptions::PyTypeError::new_err(
                 "x and y must be scalars or 1D numpy arrays of float64",

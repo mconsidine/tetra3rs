@@ -228,32 +228,32 @@ class SolveResult:
         ...
 
     @property
-    def fov_deg(self) -> Optional[float]:
+    def fov_deg(self) -> float:
         """Solved horizontal field of view in degrees."""
         ...
 
     @property
-    def num_matches(self) -> Optional[int]:
+    def num_matches(self) -> int:
         """Number of matched star pairs."""
         ...
 
     @property
-    def rmse_arcsec(self) -> Optional[float]:
+    def rmse_arcsec(self) -> float:
         """Root mean square error of matched stars in arcseconds."""
         ...
 
     @property
-    def p90e_arcsec(self) -> Optional[float]:
+    def p90e_arcsec(self) -> float:
         """90th percentile error in arcseconds."""
         ...
 
     @property
-    def max_err_arcsec(self) -> Optional[float]:
+    def max_err_arcsec(self) -> float:
         """Maximum match error in arcseconds."""
         ...
 
     @property
-    def probability(self) -> Optional[float]:
+    def probability(self) -> float:
         """False-positive probability (lower is better)."""
         ...
 
@@ -296,16 +296,16 @@ class SolveResult:
         ...
 
     @property
-    def cd_matrix(self) -> Optional[npt.NDArray[np.float64]]:
+    def cd_matrix(self) -> npt.NDArray[np.float64]:
         """WCS CD matrix as a 2x2 numpy array (tangent-plane radians per pixel).
 
         Maps pixel offsets from CRPIX to gnomonic tangent-plane coordinates
-        at CRVAL. ``None`` if the solve failed.
+        at CRVAL.
         """
         ...
 
     @property
-    def crval_ra_deg(self) -> Optional[float]:
+    def crval_ra_deg(self) -> float:
         """WCS reference point RA in degrees.
 
         The tangent point of the gnomonic (TAN) projection, close to the boresight.
@@ -313,7 +313,7 @@ class SolveResult:
         ...
 
     @property
-    def crval_dec_deg(self) -> Optional[float]:
+    def crval_dec_deg(self) -> float:
         """WCS reference point Dec in degrees."""
         ...
 
@@ -325,7 +325,7 @@ class SolveResult:
     from typing import overload
 
     @overload
-    def pixel_to_world(self, x: float, y: float) -> Optional[tuple[float, float]]: ...
+    def pixel_to_world(self, x: float, y: float) -> tuple[float, float]: ...
     @overload
     def pixel_to_world(
         self, x: npt.NDArray[np.float64], y: npt.NDArray[np.float64]
@@ -335,7 +335,7 @@ class SolveResult:
         self,
         x: Union[float, npt.NDArray[np.float64]],
         y: Union[float, npt.NDArray[np.float64]],
-    ) -> Union[Optional[tuple[float, float]], tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]]:
+    ) -> Union[tuple[float, float], tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]]:
         """Convert centered pixel coordinates to world coordinates (RA, Dec in degrees).
 
         Pixel coordinates use the same convention as solver centroids:
