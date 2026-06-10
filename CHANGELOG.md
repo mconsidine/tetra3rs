@@ -1,5 +1,88 @@
 # Changelog
 
+## Unreleased
+
+### Breaking changes
+
+- **`SolveResult` is now `Result<Solution, SolveFailure>` (Rust).** The old
+  struct-of-`Option`s is replaced by a `Solution` whose fields are all
+  guaranteed present (`qicrs2cam: Quaternion`, `fov_rad: f32`, `camera_model:
+  CameraModel`, `cd_matrix`, `crval_rad`, `theta_rad`, …) and a `SolveFailure
+  { status, solve_time_ms }` for the `NoMatch` / `Timeout` / `TooFew`
+  outcomes (`SolveStatus::MatchFound` is gone — success is the `Ok` arm).
+  `Solution::pixel_to_world` is now infallible and the legacy CD-matrix and
+  quaternion+FOV fallback transform paths are deleted (every `Solution`
+  carries a camera model and θ). `calibrate_camera` and the distortion
+  fitters still accept failed solves in their input slices and skip them.
+  **Python:** `solve_from_centroids` still returns a `SolveResult` object or
+  `None`; the change is that its attributes (`fov_deg`, `num_matches`,
+  `rmse_arcsec`, `camera_model`, `cd_matrix`, …) are no longer `Optional`,
+  and scalar `pixel_to_world` always returns a tuple. Pickles of
+  `SolveResult` objects from earlier versions do not load (wire format
+  changed).
+
+- **`SolveConfig`: `CameraModel` is now the single source of camera geometry
+  (Rust).** The redundant `fov_estimate_rad`, `image_width`, and
+  `image_height` fields are removed; the FOV estimate, image dimensions, and
+  pixel scale all derive from `camera_model` (new accessors
+  `fov_estimate_rad()`, `image_width()`, `image_height()`, and a
+  `SolveConfig::with_camera_model()` constructor). `SolveConfig::new(fov, w,
+  h)` is unchanged and remains the easy path. This removes the possibility of
+  an inconsistent config (e.g. a calibrated model alongside a mismatched FOV
+  estimate — previously the estimate silently won) and deletes the tracking
+  path's "is the camera model real?" heuristic. The **Python API is
+  unchanged** except for precedence: when `camera_model=` is passed, its focal
+  length and dimensions are now authoritative and `fov_estimate_*` /
+  `image_shape` are ignored (previously `fov_estimate` set the pixel scale
+  even alongside a model).
+- **Removed `SolveConfig::refine_iterations` (Rust) and the
+  `refine_iterations=` kwarg of `solve_from_centroids` (Python).** The field
+  was never read by the solver — the documented "number of iterative SVD
+  refinement passes" did not exist; refinement depth has always been governed
+  by the WCS refinement loop's internal convergence (stable match set, capped
+  at 10 outer iterations). Setting it had no effect, so removal does not
+  change solver behavior. Python callers passing `refine_iterations=` must
+  drop the argument.
+
+### Solver robustness
+
+- **No more panics on degenerate input.** A failed SVD during attitude
+  estimation (e.g. pathological/duplicate centroids) now skips the candidate
+  (lost-in-space) or fails the hinted solve (tracking) instead of panicking;
+  NaN residuals no longer panic the WCS refinement's median/MAD statistics;
+  an empty pattern catalog (corrupt database) returns `NoMatch` instead of
+  dividing by zero.
+- **FOV sweep no longer aborts early on cluster-buster `TooFew`.** The
+  post-thinning "too few pattern centroids" condition depends on the FOV being
+  tried; the sweep now continues to other FOV values instead of returning.
+  A genuine input of fewer than 4 centroids still returns `TooFew` immediately.
+- **Verification cone sized for portrait images.** The catalog query radius
+  now uses the true image diagonal (`sqrt(1 + (h/w)²)`, floored at the
+  historical 1.42 factor) instead of assuming a square/landscape sensor.
+- **Tracking solves are now aberration-consistent.** With
+  `observer_velocity_km_s` set, the hinted-solve path previously matched
+  against aberration-corrected star positions but ran the WCS refinement and
+  residual statistics against the raw catalog vectors. Tracking now uses the
+  same corrected unit-vector slice as lost-in-space end to end.
+
+### Internal
+
+- Deduplicated solver helpers: one `separation_for_density` (was copied in
+  `solve.rs` and `database.rs`), one generic pattern centroid-distance sort,
+  shared `focal_length_from_fov` / `pixel_scale_from_fov` for the pinhole
+  formula, and extracted `compute_residuals` / `ls_fit_once` in the WCS
+  refinement (the residual loop appeared three times, the LS pass twice).
+  Brightness sorting is hoisted out of the per-FOV loop; the tracking solver's
+  catalog-index reverse lookup is gone (match pairs now carry local indices).
+- One verification and one refinement pipeline: the catalog-projection /
+  greedy-match / binomial-FPR verification block and the WCS-refine +
+  finalize tail are now single shared methods (`verify_attitude`,
+  `refine_and_finalize`) used by both the lost-in-space and tracking paths
+  (each previously had its own copy). The final attitude is derived directly
+  from the constrained-fit parameters (θ, CRVAL, parity) and the locked pixel
+  scale instead of synthesizing a CD matrix and decomposing it back into a
+  rotation and FOV.
+
 ## 0.7.4
 
 ### New features

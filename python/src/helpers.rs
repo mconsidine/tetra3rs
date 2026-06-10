@@ -17,14 +17,15 @@ pub(crate) fn parse_solve_results_and_centroids(
     solve_results: &Bound<'_, pyo3::PyAny>,
     centroids: &Bound<'_, pyo3::PyAny>,
 ) -> PyResult<(Vec<SolveResult>, Vec<Vec<Centroid>>)> {
-    // Try to extract as a single SolveResult first
+    // Try to extract as a single SolveResult first. Python-side results are
+    // always successful solves, so wrap each as `Ok` for the Rust API.
     let sr_vec: Vec<SolveResult> = if let Ok(single) = solve_results.extract::<PySolveResult>() {
-        vec![single.inner]
+        vec![Ok(single.inner)]
     } else if let Ok(list) = solve_results.cast::<pyo3::types::PyList>() {
         list.iter()
             .map(|item| {
                 let sr: PySolveResult = item.extract()?;
-                Ok(sr.inner)
+                Ok(Ok(sr.inner))
             })
             .collect::<PyResult<Vec<SolveResult>>>()?
     } else {

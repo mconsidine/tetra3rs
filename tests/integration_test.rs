@@ -128,42 +128,27 @@ fn test_generate_and_solve() {
 
     // ── Step 3: Solve ──
     let solve_config = SolveConfig {
-        fov_estimate_rad: fov_rad,
-        image_width,
-        image_height,
         fov_max_error_rad: Some(5.0_f32.to_radians()), // generous tolerance
         match_radius: 0.01,
         match_threshold: 1e-5,
         solve_timeout_ms: Some(30_000), // 30s for test
         match_max_error: None,
-        refine_iterations: 2,
-        ..Default::default()
+        ..SolveConfig::new(fov_rad, image_width, image_height)
     };
 
     let result = db.solve_from_centroids(&centroids, &solve_config);
 
-    println!("Solve status: {:?}", result.status);
-    println!("Solve time: {:.1} ms", result.solve_time_ms);
-    if let Some(n) = result.num_matches {
-        println!("Matches: {}", n);
-    }
-    if let Some(rmse) = result.rmse_rad {
-        println!("RMSE: {:.1} arcsec", rmse.to_degrees() * 3600.0);
-    }
-    if let Some(prob) = result.prob {
-        println!("Probability: {:.2e}", prob);
-    }
-
-    assert_eq!(
-        result.status,
-        SolveStatus::MatchFound,
-        "Solver should find a match"
+    let solution = result.expect("Solver should find a match");
+    println!("Solve time: {:.1} ms", solution.solve_time_ms);
+    println!("Matches: {}", solution.num_matches);
+    println!(
+        "RMSE: {:.1} arcsec",
+        solution.rmse_rad.to_degrees() * 3600.0
     );
+    println!("Probability: {:.2e}", solution.prob);
 
     // ── Step 4: Verify the recovered quaternion ──
-    let solved_quat = result
-        .qicrs2cam
-        .expect("Should have quaternion on MatchFound");
+    let solved_quat = solution.qicrs2cam;
 
     // Compare the solved boresight direction with the true one.
     // solved_quat rotates ICRS → camera, so boresight in ICRS = solved_quat.inverse() * [0,0,1]
@@ -339,16 +324,12 @@ fn test_statistical_1000_random_orientations() {
     };
 
     let solve_config = SolveConfig {
-        fov_estimate_rad: fov_rad,
-        image_width,
-        image_height,
         fov_max_error_rad: Some(2.0_f32.to_radians()),
         match_radius: 0.01,
         match_threshold: 1e-5,
         solve_timeout_ms: Some(10_000),
         match_max_error: None,
-        refine_iterations: 2,
-        ..Default::default()
+        ..SolveConfig::new(fov_rad, image_width, image_height)
     };
 
     // Threshold for classifying a solve as "correct" vs "misidentified"
@@ -393,25 +374,21 @@ fn test_statistical_1000_random_orientations() {
 
         let result = db.solve_from_centroids(&centroids, &solve_config);
 
-        match result.status {
-            SolveStatus::MatchFound => {
-                all_solve_times_ms.push(result.solve_time_ms);
+        match result {
+            Ok(solution) => {
+                all_solve_times_ms.push(solution.solve_time_ms);
 
                 // Compute boresight error
                 let true_quat = Quaternion::from_rotation_matrix(&rot);
-                let solved_quat = result.qicrs2cam.unwrap();
+                let solved_quat = solution.qicrs2cam;
                 let solved_boresight = solved_quat.inverse() * Vector3::from_array([0.0, 0.0, 1.0]);
                 let true_boresight = true_quat.inverse() * Vector3::from_array([0.0, 0.0, 1.0]);
                 let err_rad = angular_separation(&solved_boresight, &true_boresight);
                 let err_arcsec = err_rad.to_degrees() * 3600.0;
 
                 all_errors_arcsec.push(err_arcsec);
-                if let Some(n) = result.num_matches {
-                    all_match_counts.push(n);
-                }
-                if let Some(rmse) = result.rmse_rad {
-                    all_rmse_arcsec.push(rmse.to_degrees() * 3600.0);
-                }
+                all_match_counts.push(solution.num_matches);
+                all_rmse_arcsec.push(solution.rmse_rad.to_degrees() * 3600.0);
 
                 if err_arcsec < correct_threshold_arcsec {
                     n_correct += 1;
@@ -419,27 +396,29 @@ fn test_statistical_1000_random_orientations() {
                     n_imprecise += 1;
                     println!(
                         "  Trial {:4}: IMPRECISE err={:.1}\" matches={} RA={:.1}° Dec={:.1}° ({} centroids)",
-                        trial, err_arcsec, result.num_matches.unwrap_or(0),
+                        trial, err_arcsec, solution.num_matches,
                         ra.to_degrees(), dec.to_degrees(), centroids.len(),
                     );
                 } else {
                     n_wrong += 1;
                     println!(
                         "  Trial {:4}: WRONG err={:.1}\" matches={} RA={:.1}° Dec={:.1}° ({} centroids)",
-                        trial, err_arcsec, result.num_matches.unwrap_or(0),
+                        trial, err_arcsec, solution.num_matches,
                         ra.to_degrees(), dec.to_degrees(), centroids.len(),
                     );
                 }
             }
-            SolveStatus::NoMatch => {
-                n_no_match += 1;
-                all_solve_times_ms.push(result.solve_time_ms);
-            }
-            SolveStatus::Timeout => {
-                n_timeout += 1;
-                all_solve_times_ms.push(result.solve_time_ms);
-            }
-            SolveStatus::TooFew => n_too_few += 1,
+            Err(fail) => match fail.status {
+                SolveStatus::NoMatch => {
+                    n_no_match += 1;
+                    all_solve_times_ms.push(fail.solve_time_ms);
+                }
+                SolveStatus::Timeout => {
+                    n_timeout += 1;
+                    all_solve_times_ms.push(fail.solve_time_ms);
+                }
+                SolveStatus::TooFew => n_too_few += 1,
+            },
         }
 
         // Progress reporting
@@ -654,16 +633,12 @@ fn test_statistical_1000_noisy_centroids() {
     );
 
     let solve_config = SolveConfig {
-        fov_estimate_rad: fov_rad,
-        image_width,
-        image_height,
         fov_max_error_rad: Some(2.0_f32.to_radians()),
         match_radius: 0.01,
         match_threshold: 1e-5,
         solve_timeout_ms: Some(10_000),
         match_max_error: None,
-        refine_iterations: 2,
-        ..Default::default()
+        ..SolveConfig::new(fov_rad, image_width, image_height)
     };
 
     let correct_threshold_arcsec = 180.0;
@@ -712,12 +687,12 @@ fn test_statistical_1000_noisy_centroids() {
 
         let result = db.solve_from_centroids(&centroids, &solve_config);
 
-        match result.status {
-            SolveStatus::MatchFound => {
-                all_solve_times_ms.push(result.solve_time_ms);
+        match result {
+            Ok(solution) => {
+                all_solve_times_ms.push(solution.solve_time_ms);
 
                 let true_quat = Quaternion::from_rotation_matrix(&rot);
-                let solved_quat = result.qicrs2cam.unwrap();
+                let solved_quat = solution.qicrs2cam;
                 let solved_boresight = solved_quat.inverse() * Vector3::from_array([0.0, 0.0, 1.0]);
                 let true_boresight = true_quat.inverse() * Vector3::from_array([0.0, 0.0, 1.0]);
                 let err_rad = angular_separation(&solved_boresight, &true_boresight);
@@ -740,12 +715,8 @@ fn test_statistical_1000_noisy_centroids() {
                 all_roll_errors_arcsec.push(roll_err_arcsec);
 
                 all_errors_arcsec.push(err_arcsec);
-                if let Some(n) = result.num_matches {
-                    all_match_counts.push(n);
-                }
-                if let Some(rmse) = result.rmse_rad {
-                    all_rmse_arcsec.push(rmse.to_degrees() * 3600.0);
-                }
+                all_match_counts.push(solution.num_matches);
+                all_rmse_arcsec.push(solution.rmse_rad.to_degrees() * 3600.0);
 
                 if err_arcsec < correct_threshold_arcsec {
                     n_correct += 1;
@@ -753,27 +724,29 @@ fn test_statistical_1000_noisy_centroids() {
                     n_imprecise += 1;
                     println!(
                         "  Trial {:4}: IMPRECISE err={:.1}\" matches={} RA={:.1}° Dec={:.1}° ({} centroids)",
-                        trial, err_arcsec, result.num_matches.unwrap_or(0),
+                        trial, err_arcsec, solution.num_matches,
                         ra.to_degrees(), dec.to_degrees(), centroids.len(),
                     );
                 } else {
                     n_wrong += 1;
                     println!(
                         "  Trial {:4}: WRONG err={:.1}\" matches={} RA={:.1}° Dec={:.1}° ({} centroids)",
-                        trial, err_arcsec, result.num_matches.unwrap_or(0),
+                        trial, err_arcsec, solution.num_matches,
                         ra.to_degrees(), dec.to_degrees(), centroids.len(),
                     );
                 }
             }
-            SolveStatus::NoMatch => {
-                n_no_match += 1;
-                all_solve_times_ms.push(result.solve_time_ms);
-            }
-            SolveStatus::Timeout => {
-                n_timeout += 1;
-                all_solve_times_ms.push(result.solve_time_ms);
-            }
-            SolveStatus::TooFew => n_too_few += 1,
+            Err(fail) => match fail.status {
+                SolveStatus::NoMatch => {
+                    n_no_match += 1;
+                    all_solve_times_ms.push(fail.solve_time_ms);
+                }
+                SolveStatus::Timeout => {
+                    n_timeout += 1;
+                    all_solve_times_ms.push(fail.solve_time_ms);
+                }
+                SolveStatus::TooFew => n_too_few += 1,
+            },
         }
 
         if (trial + 1) % 200 == 0 {
@@ -985,20 +958,16 @@ fn test_tracking_with_attitude_hint() {
 
         // ── Step 1: LIS solve (no hint) ──
         let lis_config = SolveConfig {
-            fov_estimate_rad: fov_rad,
-            image_width,
-            image_height,
             fov_max_error_rad: Some(2.0_f32.to_radians()),
             solve_timeout_ms: Some(10_000),
-            ..Default::default()
+            ..SolveConfig::new(fov_rad, image_width, image_height)
         };
-        let lis_result = db.solve_from_centroids(&centroids, &lis_config);
-        if lis_result.status != SolveStatus::MatchFound {
+        let Ok(lis_solution) = db.solve_from_centroids(&centroids, &lis_config) else {
             continue;
-        }
+        };
         n_lis_ok += 1;
-        lis_time_ms.push(lis_result.solve_time_ms);
-        let lis_quat = lis_result.qicrs2cam.expect("MatchFound implies quaternion");
+        lis_time_ms.push(lis_solution.solve_time_ms);
+        let lis_quat = lis_solution.qicrs2cam;
 
         // ── Step 2: perturb the attitude by `perturb_rad` around a random axis ──
         let axis_x: f32 = rng.random::<f32>() - 0.5;
@@ -1013,49 +982,44 @@ fn test_tracking_with_attitude_hint() {
         // ── Step 3: re-solve with the perturbed attitude as a hint ──
         // Reuse the camera model from the LIS result (refined focal length).
         let track_config = SolveConfig {
-            fov_estimate_rad: fov_rad,
-            image_width,
-            image_height,
             attitude_hint: Some(hinted_quat),
             hint_uncertainty_rad: 1.0_f32.to_radians(),
             strict_hint: true, // disable LIS fallback so we measure tracking alone
             solve_timeout_ms: Some(2_000),
-            camera_model: lis_result
-                .camera_model
-                .clone()
-                .expect("MatchFound implies camera_model"),
-            ..Default::default()
+            ..SolveConfig::with_camera_model(lis_solution.camera_model.clone())
         };
-        let track_result = db.solve_from_centroids(&centroids, &track_config);
-        if track_result.status == SolveStatus::MatchFound {
-            n_track_ok += 1;
-            track_time_ms.push(track_result.solve_time_ms);
+        match db.solve_from_centroids(&centroids, &track_config) {
+            Ok(track_solution) => {
+                n_track_ok += 1;
+                track_time_ms.push(track_solution.solve_time_ms);
 
-            // Verify the tracked solution agrees with the LIS solution.
-            // On noiseless synthetic data the two paths converge to the same
-            // fixed point of wcs_refine, so agreement is at f32 floating-point
-            // noise (effectively zero). 1″ is very loose and only catches
-            // gross regressions — tighten if we ever want to detect subtler
-            // divergence between the two paths.
-            let tq = track_result.qicrs2cam.unwrap();
-            let lis_bs = lis_quat.inverse() * Vector3::from_array([0.0, 0.0, 1.0]);
-            let track_bs = tq.inverse() * Vector3::from_array([0.0, 0.0, 1.0]);
-            let agreement = angular_separation(&lis_bs, &track_bs);
-            const AGREEMENT_THRESHOLD_ARCSEC: f32 = 1.0;
-            if agreement < (AGREEMENT_THRESHOLD_ARCSEC / 3600.0).to_radians() {
-                n_track_recovers_perturbed += 1;
-            } else {
+                // Verify the tracked solution agrees with the LIS solution.
+                // On noiseless synthetic data the two paths converge to the same
+                // fixed point of wcs_refine, so agreement is at f32 floating-point
+                // noise (effectively zero). 1″ is very loose and only catches
+                // gross regressions — tighten if we ever want to detect subtler
+                // divergence between the two paths.
+                let tq = track_solution.qicrs2cam;
+                let lis_bs = lis_quat.inverse() * Vector3::from_array([0.0, 0.0, 1.0]);
+                let track_bs = tq.inverse() * Vector3::from_array([0.0, 0.0, 1.0]);
+                let agreement = angular_separation(&lis_bs, &track_bs);
+                const AGREEMENT_THRESHOLD_ARCSEC: f32 = 1.0;
+                if agreement < (AGREEMENT_THRESHOLD_ARCSEC / 3600.0).to_radians() {
+                    n_track_recovers_perturbed += 1;
+                } else {
+                    println!(
+                        "  Trial {:2}: tracked but disagrees with LIS by {:.2}\"",
+                        trial,
+                        agreement.to_degrees() * 3600.0
+                    );
+                }
+            }
+            Err(fail) => {
                 println!(
-                    "  Trial {:2}: tracked but disagrees with LIS by {:.2}\"",
-                    trial,
-                    agreement.to_degrees() * 3600.0
+                    "  Trial {:2}: tracking FAILED (status={:?}, perturb={:.1}')",
+                    trial, fail.status, perturb_arcmin
                 );
             }
-        } else {
-            println!(
-                "  Trial {:2}: tracking FAILED (status={:?}, perturb={:.1}')",
-                trial, track_result.status, perturb_arcmin
-            );
         }
     }
 

@@ -2,7 +2,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 use tetra3::camera_model::CameraModel;
-use tetra3::solver::{GenerateDatabaseConfig, SolveConfig, SolveStatus, SolverDatabase};
+use tetra3::solver::{GenerateDatabaseConfig, SolveConfig, SolverDatabase};
 use tetra3::Centroid;
 use tetra3::{calibrate_camera, CalibrateConfig, DistortionModelType};
 
@@ -129,6 +129,9 @@ impl PySolverDatabase {
     ///     fov_estimate_deg: Estimated horizontal field of view in degrees.
     ///     fov_estimate_rad: Estimated horizontal field of view in radians.
     ///         Exactly one of fov_estimate_deg or fov_estimate_rad must be provided.
+    ///         Used (with the image dimensions) to build a pinhole camera model
+    ///         when camera_model is not given; ignored when it is — the model's
+    ///         focal length then defines the FOV estimate.
     ///     image_width: Image width in pixels.
     ///     image_height: Image height in pixels.
     ///     image_shape: Image shape as (height, width) tuple (numpy convention).
@@ -138,9 +141,11 @@ impl PySolverDatabase {
     ///     match_threshold: False-positive probability threshold. Default 1e-5.
     ///     solve_timeout_ms: Timeout in milliseconds. None = no timeout.
     ///     match_max_error: Maximum edge-ratio error. None = use database value.
-    ///     refine_iterations: Number of iterative SVD refinement passes. Default 2.
-    ///     camera_model: A CameraModel specifying optical center, distortion, and parity.
-    ///         None = simple pinhole model with no distortion.
+    ///     camera_model: A CameraModel specifying focal length, image dimensions,
+    ///         optical center, distortion, and parity. When provided it is the
+    ///         single source of camera geometry (fov_estimate and image
+    ///         dimensions are ignored). None = simple pinhole model built from
+    ///         fov_estimate and the image dimensions.
     ///     observer_velocity_km_s: Observer's barycentric velocity as [vx, vy, vz] in km/s
     ///         (ICRS/GCRF frame). When set, catalog positions are aberration-corrected
     ///         to apparent positions, removing ~20" bias from Earth's orbital velocity.
@@ -186,7 +191,6 @@ impl PySolverDatabase {
         match_threshold = 1e-5,
         solve_timeout_ms = Some(5000),
         match_max_error = None,
-        refine_iterations = 2,
         camera_model = None,
         observer_velocity_km_s = None,
         attitude_hint = None,
@@ -210,7 +214,6 @@ impl PySolverDatabase {
         match_threshold: f64,
         solve_timeout_ms: Option<u64>,
         match_max_error: Option<f32>,
-        refine_iterations: u32,
         camera_model: Option<PyCameraModel>,
         observer_velocity_km_s: Option<[f64; 3]>,
         attitude_hint: Option<&Bound<'py, pyo3::PyAny>>,
@@ -261,15 +264,11 @@ impl PySolverDatabase {
 
         let default_config = SolveConfig::default();
         let config = SolveConfig {
-            fov_estimate_rad: fov_rad,
-            image_width: img_width,
-            image_height: img_height,
             fov_max_error_rad: fov_max_err,
             match_radius,
             match_threshold,
             solve_timeout_ms,
             match_max_error,
-            refine_iterations,
             camera_model: cam,
             observer_velocity_km_s,
             attitude_hint: attitude_hint_q,
@@ -279,10 +278,7 @@ impl PySolverDatabase {
 
         let result = self.inner.solve_from_centroids(&centroid_vec, &config);
 
-        match result.status {
-            SolveStatus::MatchFound => Ok(Some(PySolveResult::from_result(result))),
-            _ => Ok(None),
-        }
+        Ok(result.ok().map(PySolveResult::from_solution))
     }
 
     /// Number of stars in the catalog.

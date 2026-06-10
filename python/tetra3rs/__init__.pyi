@@ -228,32 +228,32 @@ class SolveResult:
         ...
 
     @property
-    def fov_deg(self) -> Optional[float]:
+    def fov_deg(self) -> float:
         """Solved horizontal field of view in degrees."""
         ...
 
     @property
-    def num_matches(self) -> Optional[int]:
+    def num_matches(self) -> int:
         """Number of matched star pairs."""
         ...
 
     @property
-    def rmse_arcsec(self) -> Optional[float]:
+    def rmse_arcsec(self) -> float:
         """Root mean square error of matched stars in arcseconds."""
         ...
 
     @property
-    def p90e_arcsec(self) -> Optional[float]:
+    def p90e_arcsec(self) -> float:
         """90th percentile error in arcseconds."""
         ...
 
     @property
-    def max_err_arcsec(self) -> Optional[float]:
+    def max_err_arcsec(self) -> float:
         """Maximum match error in arcseconds."""
         ...
 
     @property
-    def probability(self) -> Optional[float]:
+    def probability(self) -> float:
         """False-positive probability (lower is better)."""
         ...
 
@@ -296,16 +296,16 @@ class SolveResult:
         ...
 
     @property
-    def cd_matrix(self) -> Optional[npt.NDArray[np.float64]]:
+    def cd_matrix(self) -> npt.NDArray[np.float64]:
         """WCS CD matrix as a 2x2 numpy array (tangent-plane radians per pixel).
 
         Maps pixel offsets from CRPIX to gnomonic tangent-plane coordinates
-        at CRVAL. ``None`` if the solve failed.
+        at CRVAL.
         """
         ...
 
     @property
-    def crval_ra_deg(self) -> Optional[float]:
+    def crval_ra_deg(self) -> float:
         """WCS reference point RA in degrees.
 
         The tangent point of the gnomonic (TAN) projection, close to the boresight.
@@ -313,7 +313,7 @@ class SolveResult:
         ...
 
     @property
-    def crval_dec_deg(self) -> Optional[float]:
+    def crval_dec_deg(self) -> float:
         """WCS reference point Dec in degrees."""
         ...
 
@@ -325,7 +325,7 @@ class SolveResult:
     from typing import overload
 
     @overload
-    def pixel_to_world(self, x: float, y: float) -> Optional[tuple[float, float]]: ...
+    def pixel_to_world(self, x: float, y: float) -> tuple[float, float]: ...
     @overload
     def pixel_to_world(
         self, x: npt.NDArray[np.float64], y: npt.NDArray[np.float64]
@@ -335,7 +335,7 @@ class SolveResult:
         self,
         x: Union[float, npt.NDArray[np.float64]],
         y: Union[float, npt.NDArray[np.float64]],
-    ) -> Union[Optional[tuple[float, float]], tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]]:
+    ) -> Union[tuple[float, float], tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]]:
         """Convert centered pixel coordinates to world coordinates (RA, Dec in degrees).
 
         Pixel coordinates use the same convention as solver centroids:
@@ -619,7 +619,6 @@ class SolverDatabase:
         match_threshold: float = 1e-5,
         solve_timeout_ms: Optional[int] = 5000,
         match_max_error: Optional[float] = None,
-        refine_iterations: int = 2,
         camera_model: Optional[CameraModel] = None,
         observer_velocity_km_s: Optional[list[float]] = None,
         attitude_hint: Optional[
@@ -639,6 +638,9 @@ class SolverDatabase:
             fov_estimate_deg: Estimated horizontal field of view in degrees.
             fov_estimate_rad: Estimated horizontal field of view in radians.
                 Exactly one of fov_estimate_deg or fov_estimate_rad must be provided.
+                Used (with the image dimensions) to build a pinhole camera model
+                when camera_model is not given; ignored when it is — the model's
+                focal length then defines the FOV estimate.
             image_width: Image width in pixels.
             image_height: Image height in pixels.
             image_shape: Image shape as (height, width) tuple (numpy convention).
@@ -650,11 +652,11 @@ class SolverDatabase:
             match_threshold: False-positive probability threshold.
             solve_timeout_ms: Timeout in milliseconds. None = no timeout.
             match_max_error: Maximum edge-ratio error. None = use database value.
-            refine_iterations: Number of iterative SVD refinement passes.
-                Each pass re-projects catalog stars and re-matches centroids
-                using the refined rotation. Default 2.
-            camera_model: A CameraModel specifying optical center, distortion,
-                and parity. None = simple pinhole model with no distortion.
+            camera_model: A CameraModel specifying focal length, image
+                dimensions, optical center, distortion, and parity. When
+                provided it is the single source of camera geometry
+                (fov_estimate and image dimensions are ignored). None = simple
+                pinhole model built from fov_estimate and the image dimensions.
             observer_velocity_km_s: Observer's barycentric velocity as
                 [vx, vy, vz] in km/s (ICRS/GCRF frame). When set, catalog
                 positions are aberration-corrected to apparent positions,

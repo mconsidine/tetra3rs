@@ -37,8 +37,8 @@
 //!   distortion) used throughout the solve and calibration pipeline
 //! - **Distortion calibration** — fit SIP polynomial or radial distortion models from one or
 //!   more solved images via [`calibrate_camera`]
-//! - **WCS output** — solve results include FITS-standard WCS fields (CD matrix, CRVAL) and
-//!   [`SolveResult::pixel_to_world`] / [`SolveResult::world_to_pixel`] methods
+//! - **WCS output** — solutions include FITS-standard WCS fields (CD matrix, CRVAL) and
+//!   [`Solution::pixel_to_world`] / [`Solution::world_to_pixel`] methods
 //! - **Stellar aberration** — optional correction for the ~20″ apparent shift in star
 //!   positions caused by the observer's barycentric velocity; set
 //!   [`SolveConfig::observer_velocity_km_s`] (use [`earth_barycentric_velocity`] for
@@ -67,7 +67,7 @@
 //! ## Example
 //!
 //! ```no_run
-//! use tetra3::{GenerateDatabaseConfig, SolverDatabase, SolveConfig, Centroid, SolveStatus};
+//! use tetra3::{GenerateDatabaseConfig, SolverDatabase, SolveConfig, Centroid};
 //!
 //! // Generate a database from the Gaia catalog
 //! let config = GenerateDatabaseConfig {
@@ -89,19 +89,17 @@
 //! ];
 //!
 //! let solve_config = SolveConfig {
-//!     fov_estimate_rad: (15.0_f32).to_radians(), // horizontal FOV
-//!     image_width: 1024,
-//!     image_height: 1024,
 //!     fov_max_error_rad: Some((2.0_f32).to_radians()),
-//!     ..Default::default()
+//!     // 15° horizontal FOV estimate, 1024×1024 image
+//!     ..SolveConfig::new((15.0_f32).to_radians(), 1024, 1024)
 //! };
 //!
-//! let result = db.solve_from_centroids(&centroids, &solve_config);
-//! if result.status == SolveStatus::MatchFound {
-//!     let q = result.qicrs2cam.unwrap();
-//!     println!("Attitude: {q}");
+//! // The solve returns Result<Solution, SolveFailure>; a Solution's fields
+//! // are all guaranteed present.
+//! if let Ok(solution) = db.solve_from_centroids(&centroids, &solve_config) {
+//!     println!("Attitude: {}", solution.qicrs2cam);
 //!     println!("Matched {} stars in {:.1} ms",
-//!         result.num_matches.unwrap(), result.solve_time_ms);
+//!         solution.num_matches, solution.solve_time_ms);
 //! }
 //! ```
 //!
@@ -111,13 +109,12 @@
 //! attitude as a hint to skip the 4-star pattern-hash phase:
 //!
 //! ```no_run
-//! # use tetra3::{SolveConfig, SolverDatabase, Centroid};
-//! # fn dummy(prev: tetra3::solver::SolveResult, db: SolverDatabase, centroids: Vec<Centroid>) {
+//! # use tetra3::{SolveConfig, SolverDatabase, Centroid, Solution};
+//! # fn dummy(prev: Solution, db: SolverDatabase, centroids: Vec<Centroid>) {
 //! let config = SolveConfig {
-//!     attitude_hint: prev.qicrs2cam,
+//!     attitude_hint: Some(prev.qicrs2cam),
 //!     hint_uncertainty_rad: 1.0_f32.to_radians(),
-//!     camera_model: prev.camera_model.clone().unwrap(),
-//!     ..SolveConfig::new((15.0_f32).to_radians(), 1024, 1024)
+//!     ..SolveConfig::with_camera_model(prev.camera_model.clone())
 //! };
 //! let result = db.solve_from_centroids(&centroids, &config);
 //! # }
@@ -215,8 +212,8 @@ pub use distortion::{
 };
 pub use error::{Error, Result};
 pub use solver::{
-    DatabaseProperties, GenerateDatabaseConfig, SolveConfig, SolveResult, SolveStatus,
-    SolverDatabase,
+    DatabaseProperties, GenerateDatabaseConfig, Solution, SolveConfig, SolveFailure, SolveResult,
+    SolveStatus, SolverDatabase,
 };
 pub use star::*;
 pub use starcatalog::*;

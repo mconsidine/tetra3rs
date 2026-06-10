@@ -15,7 +15,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use tetra3::{
     CalibrateConfig, CentroidExtractionConfig, DistortionModelType, GenerateDatabaseConfig,
-    SolveConfig, SolveStatus, SolverDatabase,
+    SolveConfig, SolverDatabase,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -481,25 +481,19 @@ fn test_tess_fits_solve() {
         // known limitation — pre-undistorting centroids doesn't help because the
         // solver's internal projection model also assumes uniform pixel scale.
         let solve_config = SolveConfig {
-            fov_estimate_rad: (12.0_f32).to_radians(),
-            image_width: sci_width,
-            image_height: sci_height,
             fov_max_error_rad: Some((2.0_f32).to_radians()),
             match_radius: 0.005,
             match_threshold: 1e-5,
             solve_timeout_ms: Some(60_000),
             match_max_error: None,
-            refine_iterations: 2,
-            ..Default::default()
+            ..SolveConfig::new((12.0_f32).to_radians(), sci_width, sci_height)
         };
 
         let result = db.solve_from_centroids(&extraction.centroids, &solve_config);
 
-        println!("  Solve status: {:?}", result.status);
-        println!("  Solve time:   {:.1} ms", result.solve_time_ms);
-
-        if result.status == SolveStatus::MatchFound {
-            let solved_q = result.qicrs2cam.unwrap();
+        if let Ok(solution) = &result {
+            println!("  Solve time:   {:.1} ms", solution.solve_time_ms);
+            let solved_q = solution.qicrs2cam;
             let solved_boresight = solved_q.inverse() * Vector3::from_array([0.0, 0.0, 1.0]);
             let error_rad = angular_separation(&solved_boresight, &true_boresight);
             let error_arcmin = error_rad.to_degrees() * 60.0;
@@ -516,15 +510,12 @@ fn test_tess_fits_solve() {
                 error_arcmin,
                 error_arcmin * 60.0
             );
-            if let Some(n) = result.num_matches {
-                println!("  Matched stars: {}", n);
-            }
-            if let Some(rmse) = result.rmse_rad {
-                println!("  RMSE:         {:.1}\"", rmse.to_degrees() * 3600.0);
-            }
-            if let Some(fov) = result.fov_rad {
-                println!("  Solved FOV:   {:.2}°", fov.to_degrees());
-            }
+            println!("  Matched stars: {}", solution.num_matches);
+            println!(
+                "  RMSE:         {:.1}\"",
+                solution.rmse_rad.to_degrees() * 3600.0
+            );
+            println!("  Solved FOV:   {:.2}°", solution.fov_rad.to_degrees());
 
             if error_arcmin > 30.0 {
                 println!(
@@ -645,31 +636,23 @@ fn test_tess_distortion_fit_and_center_accuracy() {
 
         // ── 1. Initial solve (raw centroids) ──
         let solve_cfg = SolveConfig {
-            fov_estimate_rad: (12.0_f32).to_radians(),
-            image_width: sci_width,
-            image_height: sci_height,
             fov_max_error_rad: Some((2.0_f32).to_radians()),
             match_radius: 0.005,
             match_threshold: 1e-5,
             solve_timeout_ms: Some(60_000),
             match_max_error: None,
-            refine_iterations: 2,
-            ..Default::default()
+            ..SolveConfig::new((12.0_f32).to_radians(), sci_width, sci_height)
         };
 
         let result_raw = db.solve_from_centroids(&extraction.centroids, &solve_cfg);
-        assert_eq!(
-            result_raw.status,
-            SolveStatus::MatchFound,
-            "Raw solve failed for {}",
-            tc.filename
-        );
+        let solution_raw = result_raw
+            .as_ref()
+            .unwrap_or_else(|_| panic!("Raw solve failed for {}", tc.filename));
 
-        let rmse_raw_arcsec = result_raw.rmse_rad.unwrap().to_degrees() as f64 * 3600.0;
+        let rmse_raw_arcsec = solution_raw.rmse_rad.to_degrees() as f64 * 3600.0;
         println!(
             "  Raw solve:   RMSE={:.1}\", {} matches",
-            rmse_raw_arcsec,
-            result_raw.num_matches.unwrap_or(0),
+            rmse_raw_arcsec, solution_raw.num_matches,
         );
 
         // ── 2. Calibrate camera model (polynomial order 4) ──
@@ -698,24 +681,18 @@ fn test_tess_distortion_fit_and_center_accuracy() {
             ..solve_cfg
         };
         let result_dist = db.solve_from_centroids(&extraction.centroids, &solve_cfg_dist);
-        assert_eq!(
-            result_dist.status,
-            SolveStatus::MatchFound,
-            "Distortion-corrected solve failed for {}",
-            tc.filename
-        );
+        let solution_dist = result_dist
+            .as_ref()
+            .unwrap_or_else(|_| panic!("Distortion-corrected solve failed for {}", tc.filename));
 
-        let rmse_dist_arcsec = result_dist.rmse_rad.unwrap().to_degrees() as f64 * 3600.0;
+        let rmse_dist_arcsec = solution_dist.rmse_rad.to_degrees() as f64 * 3600.0;
         println!(
             "  Dist solve:  RMSE={:.1}\", {} matches",
-            rmse_dist_arcsec,
-            result_dist.num_matches.unwrap_or(0),
+            rmse_dist_arcsec, solution_dist.num_matches,
         );
 
         // ── 4. Verify center pixel RA/Dec matches FITS WCS ──
-        let (solved_ra, solved_dec) = result_dist
-            .pixel_to_world(0.0, 0.0)
-            .expect("pixel_to_world failed for center pixel");
+        let (solved_ra, solved_dec) = solution_dist.pixel_to_world(0.0, 0.0);
 
         // Center of science region in full-frame 0-indexed coordinates
         let center_x_ff = 44.0 + sci_width as f64 / 2.0;
@@ -914,7 +891,6 @@ fn test_tess_multi_image_calibration() {
     // Progressively tighter match_radius and higher polynomial order.
     struct PassConfig {
         match_radius: f32,
-        refine_iterations: u32,
         calibration_order: u32,
         fov_max_error_deg: f32,
     }
@@ -922,25 +898,21 @@ fn test_tess_multi_image_calibration() {
     let pass_configs = [
         PassConfig {
             match_radius: 0.005,
-            refine_iterations: 10,
             calibration_order: 3,
             fov_max_error_deg: 0.5,
         },
         PassConfig {
             match_radius: 0.005,
-            refine_iterations: 10,
             calibration_order: 4,
             fov_max_error_deg: 0.5,
         },
         PassConfig {
             match_radius: 0.003,
-            refine_iterations: 10,
             calibration_order: 5,
             fov_max_error_deg: 0.5,
         },
         PassConfig {
             match_radius: 0.002,
-            refine_iterations: 10,
             calibration_order: 6,
             fov_max_error_deg: 0.5,
         },
@@ -958,45 +930,37 @@ fn test_tess_multi_image_calibration() {
         };
 
         println!(
-            "\n  Pass {}: match_radius={}, refine_iter={}, order={}, fov={:.2}°",
+            "\n  Pass {}: match_radius={}, order={}, fov={:.2}°",
             pass_idx + 1,
             pcfg.match_radius,
-            pcfg.refine_iterations,
             pcfg.calibration_order,
             fov_estimate_rad.to_degrees(),
         );
 
         for img in &images {
             let solve_cfg = SolveConfig {
-                fov_estimate_rad,
-                image_width: img.sci_width,
-                image_height: img.sci_height,
                 fov_max_error_rad: Some(pcfg.fov_max_error_deg.to_radians()),
                 match_radius: pcfg.match_radius,
                 match_threshold: 1e-5,
                 solve_timeout_ms: Some(60_000),
-                refine_iterations: pcfg.refine_iterations,
-                camera_model: camera_model.clone().unwrap_or_else(|| {
+                ..SolveConfig::with_camera_model(camera_model.clone().unwrap_or_else(|| {
                     tetra3::CameraModel::from_fov(
                         fov_estimate_rad as f64,
                         img.sci_width,
                         img.sci_height,
                     )
-                }),
-                ..Default::default()
+                }))
             };
 
             let result = db.solve_from_centroids(&img.centroids, &solve_cfg);
 
-            let status_str = if result.status == SolveStatus::MatchFound {
-                let rmse = result.rmse_rad.unwrap().to_degrees() as f64 * 3600.0;
-                format!(
+            let status_str = match &result {
+                Ok(solution) => format!(
                     "OK  RMSE={:.1}\", {} matches",
-                    rmse,
-                    result.num_matches.unwrap_or(0)
-                )
-            } else {
-                format!("{:?}", result.status)
+                    solution.rmse_rad.to_degrees() as f64 * 3600.0,
+                    solution.num_matches
+                ),
+                Err(fail) => format!("{:?}", fail.status),
             };
             println!("    {}: {}", img.description, status_str);
 
@@ -1037,17 +1001,21 @@ fn test_tess_multi_image_calibration() {
     println!("\n  Final results:");
     let mut failed = 0;
     let n_images = images.len();
-    let arcsec_per_px =
-        results[0].fov_rad.unwrap_or(0.0).to_degrees() as f64 * 3600.0 / sci_width as f64;
+    let arcsec_per_px = results[0]
+        .as_ref()
+        .map(|s| s.fov_rad.to_degrees() as f64)
+        .unwrap_or(0.0)
+        * 3600.0
+        / sci_width as f64;
 
     for (img, result) in images.iter().zip(results.iter()) {
-        if result.status != SolveStatus::MatchFound {
+        let Ok(solution) = result else {
             println!("    {}: *** FAIL: no match ***", img.description);
             failed += 1;
             continue;
-        }
+        };
 
-        let rmse_arcsec = result.rmse_rad.unwrap().to_degrees() as f64 * 3600.0;
+        let rmse_arcsec = solution.rmse_rad.to_degrees() as f64 * 3600.0;
         let rmse_px = rmse_arcsec / arcsec_per_px;
 
         // Compare center pixel against FITS WCS
@@ -1057,9 +1025,7 @@ fn test_tess_multi_image_calibration() {
             data_len: 0,
         };
 
-        let (solved_ra, solved_dec) = result
-            .pixel_to_world(0.0, 0.0)
-            .expect("pixel_to_world failed");
+        let (solved_ra, solved_dec) = solution.pixel_to_world(0.0, 0.0);
 
         let center_x_ff = 44.0 + img.sci_width as f64 / 2.0;
         let center_y_ff = img.sci_height as f64 / 2.0;
@@ -1074,11 +1040,7 @@ fn test_tess_multi_image_calibration() {
 
         println!(
             "    {}: {} matches, RMSE={:.2}\" ({:.3} px), vs WCS={:.2}\"",
-            img.description,
-            result.num_matches.unwrap_or(0),
-            rmse_arcsec,
-            rmse_px,
-            sep_arcsec,
+            img.description, solution.num_matches, rmse_arcsec, rmse_px, sep_arcsec,
         );
 
         if rmse_arcsec > 15.0 {
@@ -1095,10 +1057,7 @@ fn test_tess_multi_image_calibration() {
     }
 
     println!("\n══════════════════════════════════════════════════════════════");
-    let n_solved = results
-        .iter()
-        .filter(|r| r.status == SolveStatus::MatchFound)
-        .count();
+    let n_solved = results.iter().filter(|r| r.is_ok()).count();
     println!(
         "RESULT: {}/{} solved, {} failures",
         n_solved, n_images, failed,

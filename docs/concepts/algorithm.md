@@ -20,13 +20,9 @@ For each candidate match, solve Wahba's problem via SVD to find the optimal rota
 
 Project nearby catalog stars into the camera frame using the estimated rotation, count how many match observed centroids within a tolerance, and accept only if the false-positive probability (computed via the binomial CDF) is below a threshold. This statistical test ensures that the match is not a coincidence.
 
-### 5. Refinement
+### 5. Refinement and WCS Fit
 
-Re-estimate the rotation using *all* matched star pairs (not just the initial 4) via iterative SVD passes. Each pass re-projects catalog stars and re-matches centroids using the improved rotation. The number of passes is controlled by `refine_iterations` (default 2).
-
-### 6. WCS Fit
-
-A constrained 3-DOF tangent-plane refinement (rotation angle θ + CRVAL offset) with sigma-clipping produces FITS-standard WCS output: a CD matrix and CRVAL reference point. This allows direct pixel↔sky coordinate conversions.
+Refine the solution using *all* matched star pairs (not just the initial 4) via a constrained 3-DOF tangent-plane fit (rotation angle θ + CRVAL offset, pixel scale locked). The fit iterates internally: each pass re-fits the parameters, sigma-clips outliers, re-projects catalog stars, and re-matches centroids using the improved solution, stopping once the match set is stable. The result is FITS-standard WCS output — a CD matrix and CRVAL reference point — allowing direct pixel↔sky coordinate conversions.
 
 ## Parity Flip Detection
 

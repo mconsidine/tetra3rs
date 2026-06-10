@@ -54,16 +54,16 @@ class TestTessMultiImageCalibration:
 
         # -- Tiered solve + calibrate (matching notebook) --
         pass_configs = [
-            # (match_radius, refine_iterations, cal_order, fov_error_deg)
-            (0.01, 10, 3, 0.5),
-            (0.005, 10, 4, 0.5),
-            (0.003, 10, 5, 0.5),
-            (0.002, 10, 6, 0.5),
+            # (match_radius, cal_order, fov_error_deg)
+            (0.01, 3, 0.5),
+            (0.005, 4, 0.5),
+            (0.003, 5, 0.5),
+            (0.002, 6, 0.5),
         ]
 
         camera_model = None
 
-        for match_radius, refine_iter, cal_order, fov_err in pass_configs:
+        for match_radius, cal_order, fov_err in pass_configs:
             results = []
             fov_est = camera_model.fov_deg if camera_model else 11.8
 
@@ -75,7 +75,6 @@ class TestTessMultiImageCalibration:
                     image_shape=(sci_size, sci_size),
                     match_radius=match_radius,
                     match_threshold=1e-5,
-                    refine_iterations=refine_iter,
                     camera_model=camera_model,
                 )
                 results.append(result)
@@ -181,7 +180,6 @@ class TestTessMultiImageCalibration:
                 image_shape=(sci_size, sci_size),
                 match_radius=0.01,
                 match_threshold=1e-5,
-                refine_iterations=10,
             )
             initial_results.append(result)
 
@@ -240,7 +238,6 @@ class TestTessMultiImageCalibration:
                 image_shape=(sci_size, sci_size),
                 match_radius=0.01,
                 match_threshold=1e-5,
-                refine_iterations=10,
                 camera_model=cal.camera_model,
             )
             results.append(result)

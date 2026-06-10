@@ -16,7 +16,7 @@
 use std::time::Instant;
 
 use numeris::{Matrix3, Vector3};
-use tetra3::{Centroid, GenerateDatabaseConfig, SolveConfig, SolveStatus, SolverDatabase};
+use tetra3::{Centroid, GenerateDatabaseConfig, SolveConfig, SolverDatabase};
 
 /// Minimal deterministic xorshift64* RNG — keeps the example dependency-light.
 struct Rng(u64);
@@ -133,16 +133,12 @@ fn main() {
     };
 
     let solve_config = SolveConfig {
-        fov_estimate_rad: fov_rad,
-        image_width,
-        image_height: image_width,
         fov_max_error_rad: Some(2.0_f32.to_radians()),
         match_radius: 0.01,
         match_threshold: 1e-5,
         solve_timeout_ms: Some(10_000),
         match_max_error: None,
-        refine_iterations: 2,
-        ..Default::default()
+        ..SolveConfig::new(fov_rad, image_width, image_width)
     };
 
     // Scenario knobs (env vars):
@@ -208,7 +204,7 @@ fn main() {
         let t = Instant::now();
         let r = db.solve_from_centroids(c, &solve_config);
         total_solve_ns += t.elapsed().as_nanos();
-        if r.status == SolveStatus::MatchFound {
+        if r.is_ok() {
             n_found += 1;
         }
     }
