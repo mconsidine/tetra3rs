@@ -390,6 +390,10 @@ pub struct WcsRefineResult {
     pub crval_rad: [f64; 2],
     /// Fitted rotation angle in radians (camera roll in tangent plane).
     pub theta_rad: f64,
+    /// The pixel scale the fit was locked to (radians per pixel), echoed back
+    /// so callers can derive the focal length / FOV without decomposing the
+    /// CD matrix.
+    pub pixel_scale: f64,
     /// Final matched pairs: `(centroid_local_idx, catalog_star_idx)`.
     pub matches: Vec<(usize, usize)>,
     /// RMSE of angular residuals in radians.
@@ -960,9 +964,55 @@ pub fn wcs_refine(
         cd_matrix: cd,
         crval_rad: [crval_ra, crval_dec],
         theta_rad: theta,
+        pixel_scale: ps,
         matches: current_matches,
         rmse_rad: rmse,
     }
+}
+
+/// Build the ICRS→camera rotation matrix directly from the constrained-fit
+/// parameters `(θ, CRVAL, parity)`.
+///
+/// Equivalent to `wcs_to_rotation(&cd_from_theta(theta, ps, parity), …)` —
+/// the pixel scale cancels in the normalization, so it is not needed. The
+/// camera axes follow from the CD columns: `cam_x ∝ ±cosθ·e_ξ + sinθ·e_η`
+/// and `cam_y ∝ ∓sinθ·e_ξ + cosθ·e_η` (upper signs without parity flip).
+pub fn rotation_from_theta_crval(
+    theta: f64,
+    crval_ra: f64,
+    crval_dec: f64,
+    parity_flip: bool,
+) -> Matrix3<f32> {
+    let sin_a = crval_ra.sin();
+    let cos_a = crval_ra.cos();
+    let sin_d = crval_dec.sin();
+    let cos_d = crval_dec.cos();
+
+    // Tangent-plane basis vectors in ICRS
+    let e_xi = Vector3::<f64>::from_array([-sin_a, cos_a, 0.0]);
+    let e_eta = Vector3::<f64>::from_array([-sin_d * cos_a, -sin_d * sin_a, cos_d]);
+    let boresight = Vector3::<f64>::from_array([cos_d * cos_a, cos_d * sin_a, sin_d]);
+
+    let cos_t = theta.cos();
+    let sin_t = theta.sin();
+    let (cam_x, cam_y) = if parity_flip {
+        (e_xi * -cos_t + e_eta * sin_t, e_xi * sin_t + e_eta * cos_t)
+    } else {
+        (e_xi * cos_t + e_eta * sin_t, e_xi * -sin_t + e_eta * cos_t)
+    };
+    let cam_x = cam_x.normalize();
+    let cam_y = cam_y.normalize();
+
+    // Rows are camera axes expressed in ICRS: camera_vec = R * icrs_vec
+    Matrix3::new([
+        [cam_x[0] as f32, cam_x[1] as f32, cam_x[2] as f32],
+        [cam_y[0] as f32, cam_y[1] as f32, cam_y[2] as f32],
+        [
+            boresight[0] as f32,
+            boresight[1] as f32,
+            boresight[2] as f32,
+        ],
+    ])
 }
 
 // ── Derive rotation from WCS ────────────────────────────────────────────────

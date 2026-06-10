@@ -22,10 +22,7 @@ use tracing::debug;
 
 use crate::{Centroid, Quaternion};
 
-use super::solve::{
-    aberration_correct, binomial_cdf, diagonal_factor, elapsed_ms, find_centroid_matches, C_KM_S,
-};
-use super::wcs_refine;
+use super::solve::{diagonal_factor, elapsed_ms, find_centroid_matches};
 use super::{SolveConfig, SolveResult, SolveStatus, SolverDatabase};
 
 /// Minimum unique correspondences required to attempt the SVD step.
@@ -34,12 +31,17 @@ const MIN_HINT_MATCHES: usize = 3;
 impl SolverDatabase {
     /// Tracking solve using an attitude hint. See [`SolveConfig::attitude_hint`].
     ///
+    /// `star_vectors` is the (possibly aberration-corrected) catalog
+    /// unit-vector slice prepared by [`SolverDatabase::solve_from_centroids`]
+    /// — the same slice the LIS path matches and refines against.
+    ///
     /// Returns a [`SolveResult`] with the same shape as the LIS path. On failure
     /// the status is [`SolveStatus::NoMatch`] (or [`SolveStatus::TooFew`] if there
     /// aren't enough centroids).
     pub(crate) fn solve_with_hint(
         &self,
         preprocessed: &[Centroid],
+        star_vectors: &[[f32; 3]],
         config: &SolveConfig,
         hint: &Quaternion,
         t0: Instant,
@@ -85,21 +87,6 @@ impl SolverDatabase {
             return SolveResult::failure(SolveStatus::NoMatch, elapsed_ms(t0));
         }
 
-        // ── Aberration correction (only on the candidates) ──
-        let beta = config
-            .observer_velocity_km_s
-            .map(|v| [v[0] / C_KM_S, v[1] / C_KM_S, v[2] / C_KM_S]);
-        let candidate_vecs: Vec<[f32; 3]> = nearby_inds
-            .iter()
-            .map(|&idx| {
-                let raw = &self.star_vectors[idx];
-                match beta {
-                    Some(b) => aberration_correct(raw, &b),
-                    None => *raw,
-                }
-            })
-            .collect();
-
         // ── Sort centroids by brightness (mirrors LIS path) ──
         let mut sorted_indices: Vec<usize> = (0..preprocessed.len()).collect();
         sorted_indices.sort_by(|&a, &b| {
@@ -126,12 +113,11 @@ impl SolverDatabase {
 
         // ── Project candidate catalog stars to camera-plane angles via the hint ──
         // Note: r_hint maps ICRS→camera, so cam_v = r_hint * icrs_v.
-        // `projected` carries the *local* index into `candidate_vecs` /
-        // `nearby_inds` so downstream lookups are direct array indexing.
         let half_w = (config.image_width() as f32 / 2.0 + 4.0) * pixel_scale;
         let half_h = (config.image_height() as f32 / 2.0 + 4.0) * pixel_scale;
-        let mut projected: Vec<(usize, f32, f32)> = Vec::with_capacity(candidate_vecs.len());
-        for (local_i, sv) in candidate_vecs.iter().enumerate() {
+        let mut projected: Vec<(usize, f32, f32)> = Vec::with_capacity(nearby_inds.len());
+        for &cat_idx in &nearby_inds {
+            let sv = &star_vectors[cat_idx];
             let icrs_v = Vector3::from_array([sv[0], sv[1], sv[2]]);
             let cam_v = r_hint * icrs_v;
             if cam_v[2] > 0.0 {
@@ -139,7 +125,7 @@ impl SolverDatabase {
                 let cy = cam_v[1] / cam_v[2];
                 // Only keep stars geometrically inside the (slightly padded) image
                 if cx.abs() <= half_w && cy.abs() <= half_h {
-                    projected.push((local_i, cx, cy));
+                    projected.push((cat_idx, cx, cy));
                 }
             }
         }
@@ -171,114 +157,66 @@ impl SolverDatabase {
 
         // ── Wahba SVD on the initial correspondence set ──
         let (rotation_matrix, det_sign_ok) =
-            wahba_svd_dynamic(&centroid_vectors, &candidate_vecs, &initial_matches);
+            wahba_svd_dynamic(&centroid_vectors, star_vectors, &initial_matches);
         if !det_sign_ok {
             // Parity mismatch — bail (caller may still fall back to LIS).
             return SolveResult::failure(SolveStatus::NoMatch, elapsed_ms(t0));
         }
 
-        // ── Verification (mirrors solve.rs verify step) ──
-        let match_radius_rad = config.match_radius * fov_rad;
-        let image_center_icrs = rotation_matrix.transpose() * Vector3::from_array([0.0, 0.0, 1.0]);
-        let verify_inds = self.star_catalog.query_indices_from_uvec_cached(
-            image_center_icrs,
-            fov_diagonal / 2.0,
-            &self.star_vectors,
+        // ── Verification (same path as LIS) ──
+        let (verify_matches, prob_mismatch) = self.verify_attitude(
+            &rotation_matrix,
+            &centroid_vectors,
+            match_centroid_count,
+            fov_rad,
+            config,
+            star_vectors,
         );
-
-        let mut verify_positions: Vec<(usize, f32, f32)> = Vec::new();
-        for &cat_idx in &verify_inds {
-            let raw = &self.star_vectors[cat_idx];
-            let sv = match beta {
-                Some(b) => aberration_correct(raw, &b),
-                None => *raw,
-            };
-            let icrs_v = Vector3::from_array([sv[0], sv[1], sv[2]]);
-            let cam_v = rotation_matrix * icrs_v;
-            if cam_v[2] > 0.0 {
-                verify_positions.push((cat_idx, cam_v[0] / cam_v[2], cam_v[1] / cam_v[2]));
-            }
-        }
-        verify_positions.truncate(2 * match_centroid_count);
-        let num_nearby = verify_positions.len();
-
-        let verify_matches = find_centroid_matches(
-            &centroid_vectors[..match_centroid_count.min(centroid_vectors.len())],
-            &verify_positions,
-            match_radius_rad,
-        );
-        let current_num_matches = verify_matches.len();
 
         // Same false-positive probability test as LIS, but without the
         // /num_patterns Bonferroni division (no pattern-hash trials happened).
-        let prob_single = num_nearby as f64 * (config.match_radius as f64).powi(2);
-        let prob_mismatch = binomial_cdf(
-            (match_centroid_count as i64 - (current_num_matches as i64 - 2)).max(0) as u32,
-            match_centroid_count as u32,
-            1.0 - prob_single.min(1.0),
-        );
-
         if prob_mismatch >= config.match_threshold {
             debug!(
                 "Tracking: verification rejected (matches={}, prob={:.2e})",
-                current_num_matches, prob_mismatch
+                verify_matches.len(),
+                prob_mismatch
             );
             return SolveResult::failure(SolveStatus::NoMatch, elapsed_ms(t0));
         }
 
         debug!(
             "Tracking: VERIFIED — {} matches, prob={:.2e}",
-            current_num_matches, prob_mismatch
+            verify_matches.len(),
+            prob_mismatch
         );
 
-        // ── WCS refinement (same path as LIS) ──
-        let centroids_px: Vec<(f64, f64)> = sorted_indices
-            .iter()
-            .map(|&i| {
-                let px = parity_sign as f64 * preprocessed[i].x as f64;
-                let py = preprocessed[i].y as f64;
-                (px, py)
-            })
-            .collect();
-
-        // True pinhole pixel scale for wcs_refine (1/f).
-        let ps_refine = pixel_scale as f64;
-
-        let wcs_result = wcs_refine::wcs_refine(
+        // ── WCS refinement + finalization (same path as LIS) ──
+        match self.refine_and_finalize(
             &rotation_matrix,
             &verify_matches,
-            &centroids_px,
-            &self.star_vectors,
-            &self.star_catalog,
-            ps_refine,
-            parity_flip,
-            match_radius_rad,
-            match_centroid_count,
-            10,
-        );
-
-        if wcs_result.matches.len() < MIN_HINT_MATCHES {
-            return SolveResult::failure(SolveStatus::NoMatch, elapsed_ms(t0));
-        }
-
-        self.finalize_solve_result(
-            &wcs_result,
-            &self.star_vectors,
+            preprocessed,
             &sorted_indices,
-            &centroids_px,
+            star_vectors,
             config,
             parity_flip,
+            fov_rad,
+            pixel_scale as f64,
+            match_centroid_count,
+            MIN_HINT_MATCHES,
             prob_mismatch,
             t0,
-        )
+        ) {
+            Some(result) => result,
+            None => SolveResult::failure(SolveStatus::NoMatch, elapsed_ms(t0)),
+        }
     }
 }
 
 /// Run Wahba SVD on a dynamic-sized correspondence set.
 ///
 /// `centroid_vectors` is indexed by sorted (brightness) centroid index;
-/// `candidate_vecs` by local candidate position. The match pairs are
-/// `(centroid_idx, candidate_local_idx)` in those same index spaces.
+/// `star_vectors` by catalog star index. The match pairs are
+/// `(centroid_idx, catalog_star_idx)` in those same index spaces.
 ///
 /// Returns the rotation matrix and a flag indicating whether the determinant
 /// is positive (true) or negative (false → likely parity mismatch). A failed
@@ -286,7 +224,7 @@ impl SolverDatabase {
 /// caller treats as a failed hint.
 fn wahba_svd_dynamic(
     centroid_vectors: &[[f32; 3]],
-    candidate_vecs: &[[f32; 3]],
+    star_vectors: &[[f32; 3]],
     matches: &[(usize, usize)],
 ) -> (Matrix3<f32>, bool) {
     if matches.len() < MIN_HINT_MATCHES {
@@ -296,9 +234,9 @@ fn wahba_svd_dynamic(
     // Build the cross-covariance directly (find_rotation_matrix is generic on
     // a const N, which a dynamic match set doesn't have).
     let mut h = numeris::Matrix3::<f64>::zeros();
-    for &(cent_idx, local_i) in matches {
+    for &(cent_idx, cat_idx) in matches {
         let img = &centroid_vectors[cent_idx];
-        let cat = &candidate_vecs[local_i];
+        let cat = &star_vectors[cat_idx];
         let img_v =
             numeris::Vector3::<f64>::from_array([img[0] as f64, img[1] as f64, img[2] as f64]);
         let cat_v =

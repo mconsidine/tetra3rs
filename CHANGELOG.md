@@ -42,6 +42,11 @@
 - **Verification cone sized for portrait images.** The catalog query radius
   now uses the true image diagonal (`sqrt(1 + (h/w)²)`, floored at the
   historical 1.42 factor) instead of assuming a square/landscape sensor.
+- **Tracking solves are now aberration-consistent.** With
+  `observer_velocity_km_s` set, the hinted-solve path previously matched
+  against aberration-corrected star positions but ran the WCS refinement and
+  residual statistics against the raw catalog vectors. Tracking now uses the
+  same corrected unit-vector slice as lost-in-space end to end.
 
 ### Internal
 
@@ -52,6 +57,14 @@
   refinement (the residual loop appeared three times, the LS pass twice).
   Brightness sorting is hoisted out of the per-FOV loop; the tracking solver's
   catalog-index reverse lookup is gone (match pairs now carry local indices).
+- One verification and one refinement pipeline: the catalog-projection /
+  greedy-match / binomial-FPR verification block and the WCS-refine +
+  finalize tail are now single shared methods (`verify_attitude`,
+  `refine_and_finalize`) used by both the lost-in-space and tracking paths
+  (each previously had its own copy). The final attitude is derived directly
+  from the constrained-fit parameters (θ, CRVAL, parity) and the locked pixel
+  scale instead of synthesizing a CD matrix and decomposing it back into a
+  rotation and FOV.
 
 ## 0.7.4
 
