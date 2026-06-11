@@ -74,4 +74,6 @@ jobs:
             For generic installs use PyPI: `pip install tetra3rs`.
           generate_release_notes: true
           draft: false
-          prerelease: false
+          # Hyphenated tags (branch/test builds) are prereleases: excluded
+          # from "latest", so consumers only get them when selected explicitly.
+          prerelease: ${{ contains(steps.tag.outputs.name, '-') }}
