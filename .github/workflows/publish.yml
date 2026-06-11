@@ -105,7 +105,9 @@ jobs:
     name: Publish to PyPI
     needs: [build-wheels, build-sdist]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    # PyPI is upstream's (ssmichael1) release channel; this fork distributes
+    # via GitHub release assets only (see pi-wheels.yml).
+    if: github.repository_owner == 'ssmichael1' && startsWith(github.ref, 'refs/tags/v')
     environment: pypi
     permissions:
       id-token: write
