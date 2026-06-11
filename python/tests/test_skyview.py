@@ -76,7 +76,7 @@ class TestSkyViewSolve:
             solve_timeout_ms=60_000,
         )
 
-        assert solve is not None, f"{filename}: no solution found"
+        assert solve, f"{filename}: no solution found ({solve})"
         assert solve.status == "match_found"
         assert solve.num_matches >= 4
 

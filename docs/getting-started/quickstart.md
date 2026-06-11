@@ -31,10 +31,13 @@ result = db.solve_from_centroids(
     image_height=1536,
 )
 
-if result is not None:
+if result:
     print(f"RA: {result.ra_deg:.4f}°, Dec: {result.dec_deg:.4f}°")
     print(f"Roll: {result.roll_deg:.2f}°")
     print(f"Matched {result.num_matches} stars, RMSE: {result.rmse_arcsec:.1f}\"")
+else:
+    # A falsy SolveFailure: status is 'no_match', 'timeout', or 'too_few'
+    print(f"Solve failed: {result.status} after {result.solve_time_ms:.0f} ms")
 ```
 
 ### Extract centroids from an image
@@ -62,7 +65,7 @@ result = db.solve_from_centroids(
 ### Pixel ↔ sky coordinate conversion
 
 ```python
-if result is not None:
+if result:
     # Pixel to sky
     ra, dec = result.pixel_to_world(100.0, 200.0)
 

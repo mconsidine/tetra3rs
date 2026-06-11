@@ -3,7 +3,7 @@ use numpy::{PyArray1, PyArray2, PyReadonlyArray1};
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 
-use tetra3::solver::Solution;
+use tetra3::solver::{Solution, SolveFailure, SolveStatus};
 
 use crate::camera_model::PyCameraModel;
 
@@ -213,7 +213,9 @@ impl PySolveResult {
     /// Fitted rotation angle in degrees (camera roll in tangent plane).
     ///
     /// The angle from the tangent-plane ξ (East) axis to the camera +X axis,
-    /// measured counter-clockwise.
+    /// measured counter-clockwise. When ``parity_flip`` is ``True``,
+    /// "camera +X" means the x-negated (mirror-corrected) axis — the same
+    /// frame the quaternion rotates into.
     #[getter]
     fn theta_deg(&self) -> f64 {
         self.inner.theta_rad.to_degrees()
@@ -263,6 +265,12 @@ impl PySolveResult {
     fn _from_pickle_bytes(data: &[u8]) -> PyResult<Self> {
         let solution = crate::helpers::from_postcard_bytes::<Solution>(data)?;
         Ok(Self::from_solution(solution))
+    }
+
+    /// Always ``True`` — lets ``if result:`` distinguish success from a
+    /// (falsy) ``SolveFailure``.
+    fn __bool__(&self) -> bool {
+        true
     }
 
     fn __repr__(&self) -> String {
@@ -410,5 +418,82 @@ impl PySolveResult {
                 "ra_deg and dec_deg must be scalars or 1D numpy arrays of float64",
             ))
         }
+    }
+}
+
+/// A failed plate-solve attempt: why it failed and how long it took.
+///
+/// Returned by ``SolverDatabase.solve_from_centroids`` when no solution was
+/// found. Falsy, so ``if result:`` cleanly separates success from failure::
+///
+///     result = db.solve_from_centroids(centroids, ...)
+///     if result:
+///         print(result.ra_deg, result.dec_deg)
+///     else:
+///         print(f"solve failed: {result.status} after {result.solve_time_ms:.0f} ms")
+#[pyclass(name = "SolveFailure", module = "tetra3rs", frozen, from_py_object)]
+#[derive(Clone)]
+pub(crate) struct PySolveFailure {
+    pub(crate) inner: SolveFailure,
+}
+
+impl PySolveFailure {
+    fn status_str(&self) -> &'static str {
+        match self.inner.status {
+            SolveStatus::NoMatch => "no_match",
+            SolveStatus::Timeout => "timeout",
+            SolveStatus::TooFew => "too_few",
+        }
+    }
+}
+
+#[pymethods]
+impl PySolveFailure {
+    /// Why the solve produced no solution: ``'no_match'`` (all pattern
+    /// combinations exhausted), ``'timeout'`` (``solve_timeout_ms`` reached),
+    /// or ``'too_few'`` (fewer than 4 usable centroids).
+    #[getter]
+    fn status(&self) -> &'static str {
+        self.status_str()
+    }
+
+    /// Wall-clock time spent before giving up, in milliseconds.
+    #[getter]
+    fn solve_time_ms(&self) -> f64 {
+        self.inner.solve_time_ms as f64
+    }
+
+    /// Always ``False`` — lets ``if result:`` distinguish a (truthy)
+    /// ``SolveResult`` from a failure.
+    fn __bool__(&self) -> bool {
+        false
+    }
+
+    fn __reduce__(slf: &Bound<'_, Self>) -> PyResult<(Py<PyAny>, (Vec<u8>,))> {
+        let bytes = crate::helpers::to_postcard_bytes(&slf.borrow().inner)?;
+        let from_bytes = slf.get_type().getattr("_from_pickle_bytes")?;
+        Ok((from_bytes.unbind(), (bytes,)))
+    }
+
+    #[staticmethod]
+    fn _from_pickle_bytes(data: &[u8]) -> PyResult<Self> {
+        let inner = crate::helpers::from_postcard_bytes::<SolveFailure>(data)?;
+        Ok(Self { inner })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SolveFailure(status='{}', solve_time_ms={:.1})",
+            self.status_str(),
+            self.inner.solve_time_ms,
+        )
+    }
+
+    fn __str__(&self) -> String {
+        format!(
+            "SolveFailure: {} after {:.1} ms",
+            self.status_str(),
+            self.inner.solve_time_ms,
+        )
     }
 }

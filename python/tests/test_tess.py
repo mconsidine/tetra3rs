@@ -89,7 +89,7 @@ class TestTessMultiImageCalibration:
 
         # -- Verify final results --
         # All images should be solved
-        n_solved = sum(1 for r in results if r is not None)
+        n_solved = sum(1 for r in results if r)
         assert n_solved == len(sectors), f"Only {n_solved}/{len(sectors)} images solved"
 
         # Check per-image quality
@@ -98,7 +98,7 @@ class TestTessMultiImageCalibration:
         for idx, (result, headers, sector) in enumerate(
             zip(results, all_headers, sectors)
         ):
-            assert result is not None, f"Sector {sector}: no solution"
+            assert result, f"Sector {sector}: no solution ({result})"
             assert result.status == "match_found"
 
             rmse = result.rmse_arcsec

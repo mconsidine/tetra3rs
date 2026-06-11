@@ -114,7 +114,7 @@ class TestSolveFromCentroids:
             solve_timeout_ms=60_000,
         )
 
-        assert result is not None, f"{label}: no solution"
+        assert result, f"{label}: no solution ({result})"
         assert result.status == "match_found"
         error = angular_sep_deg(result.ra_deg, result.dec_deg, ra, dec)
         assert error < 0.5, f"{label}: boresight error {error:.3f}° > 0.5°"
@@ -137,7 +137,7 @@ class TestSolveFromCentroids:
             image_height=image_size,
             fov_max_error_deg=3.0,
         )
-        assert result is not None
+        assert result
         assert result.status == "match_found"
 
     def test_solve_with_numpy_array_3col(self, skyview_db):
@@ -161,7 +161,7 @@ class TestSolveFromCentroids:
             image_height=image_size,
             fov_max_error_deg=3.0,
         )
-        assert result is not None
+        assert result
         assert result.status == "match_found"
 
 
@@ -189,7 +189,7 @@ class TestSolveResult:
             image_height=image_size,
             fov_max_error_deg=3.0,
         )
-        assert result is not None
+        assert result
         return result
 
     def test_basic_properties(self, orion_result):
@@ -240,7 +240,7 @@ class TestSolveResult:
         """Center pixel should map to near the boresight."""
         r = orion_result
         result = r.pixel_to_world(0.0, 0.0)
-        assert result is not None
+        assert result
         ra, dec = result
         error = angular_sep_deg(ra, dec, r.ra_deg, r.dec_deg)
         assert error < 0.5
@@ -249,7 +249,7 @@ class TestSolveResult:
         """Boresight RA/Dec should map back to near image center."""
         r = orion_result
         result = r.world_to_pixel(r.ra_deg, r.dec_deg)
-        assert result is not None
+        assert result
         x, y = result
         assert abs(x) < 10.0
         assert abs(y) < 10.0
@@ -269,7 +269,7 @@ class TestSolveResult:
         xs = np.array([0.0, 100.0, -100.0])
         ys = np.array([0.0, 50.0, -50.0])
         result = r.pixel_to_world(xs, ys)
-        assert result is not None
+        assert result
         ras, decs = result
         assert len(ras) == 3
         assert len(decs) == 3
@@ -304,7 +304,7 @@ class TestCalibration:
             image_height=image_size,
             fov_max_error_deg=3.0,
         )
-        assert result is not None
+        assert result
 
         cal = skyview_db.calibrate_camera(
             result,
@@ -371,7 +371,7 @@ class TestTrackingMode:
             image_height=image_size,
             fov_max_error_deg=3.0,
         )
-        assert lis is not None, "LIS solve failed"
+        assert lis, f"LIS solve failed ({lis})"
 
         # Step 2: perturb the recovered attitude by 15' around a random axis.
         # Small-angle quaternion: q_pert = [cos(θ/2), sin(θ/2)·axis]
@@ -414,7 +414,7 @@ class TestTrackingMode:
             strict_hint=True,  # no LIS fallback — we want to test tracking specifically
         )
 
-        assert tracked is not None, f"Tracking solve failed with {hint_kind} hint"
+        assert tracked, f"Tracking solve failed with {hint_kind} hint ({tracked})"
         # On noiseless synthetic data, tracking and LIS converge to the same
         # fixed point of wcs_refine — agreement should be well below 1″.
         # We use 1″ as a loose bound that catches gross regressions but
@@ -443,7 +443,7 @@ class TestTrackingMode:
             # strict_hint=False → fallback to LIS
         )
 
-        assert result is not None, "Should have fallen back to LIS"
+        assert result, f"Should have fallen back to LIS ({result})"
         error = angular_sep_deg(result.ra_deg, result.dec_deg, ra, dec)
         assert error < 0.5, f"LIS fallback solved wrong field (error {error:.3f}°)"
 
@@ -462,7 +462,8 @@ class TestTrackingMode:
             hint_uncertainty_deg=0.5,
             strict_hint=True,
         )
-        assert result is None, "strict_hint should suppress LIS fallback on bad hint"
+        assert not result, "strict_hint should suppress LIS fallback on bad hint"
+        assert result.status in ("no_match", "too_few")
 
     def test_attitude_hint_invalid_shape_raises(self, skyview_db):
         """Passing a hint with wrong shape should raise ValueError."""

@@ -13,7 +13,7 @@ use crate::helpers::{
     at_most_one_angle_rad, exactly_one_angle_rad, parse_centroids_single,
     parse_solve_results_and_centroids, resolve_image_dims,
 };
-use crate::solve_result::PySolveResult;
+use crate::solve_result::{PySolveFailure, PySolveResult};
 
 /// A star pattern database for plate solving.
 ///
@@ -141,6 +141,7 @@ impl PySolverDatabase {
     ///     match_threshold: False-positive probability threshold. Default 1e-5.
     ///     solve_timeout_ms: Timeout in milliseconds. None = no timeout.
     ///     match_max_error: Maximum edge-ratio error. None = use database value.
+    ///         Values below the database's pattern quantization error are clamped up to it.
     ///     camera_model: A CameraModel specifying focal length, image dimensions,
     ///         optical center, distortion, and parity. When provided it is the
     ///         single source of camera geometry (fov_estimate and image
@@ -177,7 +178,10 @@ impl PySolverDatabase {
     ///         solve fails. Default False. Ignored unless ``attitude_hint`` is set.
     ///
     /// Returns:
-    ///     SolveResult on success, None if no match was found.
+    ///     SolveResult on success, or a (falsy) SolveFailure carrying the
+    ///     failure reason (``status``: ``'no_match'`` / ``'timeout'`` /
+    ///     ``'too_few'``) and ``solve_time_ms``. Use ``if result:`` to
+    ///     distinguish the two.
     #[pyo3(signature = (
         centroids,
         fov_estimate_deg = None,
@@ -201,7 +205,7 @@ impl PySolverDatabase {
     #[allow(clippy::too_many_arguments)]
     fn solve_from_centroids<'py>(
         &self,
-        _py: Python<'py>,
+        py: Python<'py>,
         centroids: &Bound<'py, pyo3::PyAny>,
         fov_estimate_deg: Option<f64>,
         fov_estimate_rad: Option<f64>,
@@ -220,7 +224,7 @@ impl PySolverDatabase {
         hint_uncertainty_deg: Option<f64>,
         hint_uncertainty_rad: Option<f64>,
         strict_hint: bool,
-    ) -> PyResult<Option<PySolveResult>> {
+    ) -> PyResult<Py<pyo3::PyAny>> {
         // Resolve FOV estimate: exactly one of deg or rad must be provided
         let fov_rad = exactly_one_angle_rad(
             fov_estimate_deg,
@@ -278,7 +282,16 @@ impl PySolverDatabase {
 
         let result = self.inner.solve_from_centroids(&centroid_vec, &config);
 
-        Ok(result.ok().map(PySolveResult::from_solution))
+        match result {
+            Ok(solution) => Ok(PySolveResult::from_solution(solution)
+                .into_pyobject(py)?
+                .into_any()
+                .unbind()),
+            Err(failure) => Ok(PySolveFailure { inner: failure }
+                .into_pyobject(py)?
+                .into_any()
+                .unbind()),
+        }
     }
 
     /// Number of stars in the catalog.
