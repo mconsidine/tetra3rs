@@ -300,10 +300,19 @@ impl SolverDatabase {
 
         // ── Solver parameters ──
         let p_bins = self.props.pattern_bins;
-        let p_max_err = config
-            .match_max_error
-            .unwrap_or(self.props.pattern_max_error)
-            .max(self.props.pattern_max_error);
+        // A tolerance below the database's quantization error cannot work
+        // (patterns were binned at pattern_max_error), so floor it there.
+        let p_max_err = match config.match_max_error {
+            Some(user_err) if user_err < self.props.pattern_max_error => {
+                debug!(
+                    "match_max_error {:.2e} below database pattern_max_error {:.2e}; using the latter",
+                    user_err, self.props.pattern_max_error
+                );
+                self.props.pattern_max_error
+            }
+            Some(user_err) => user_err,
+            None => self.props.pattern_max_error,
+        };
         let match_threshold = config.match_threshold / self.props.num_patterns as f64;
         let timeout_ms = config.solve_timeout_ms;
 
@@ -529,8 +538,14 @@ impl SolverDatabase {
                     );
 
                     // ── WCS TAN-projection refinement ──
-                    // True pinhole pixel scale from the pattern-match refined
-                    // FOV. Fewer than 4 surviving matches → try next candidate.
+                    // The refinement locks its pixel scale to the
+                    // pattern-match refined FOV, NOT the camera model's focal
+                    // length — deliberately asymmetric with the tracking path
+                    // (which trusts the model's 1/f). Lost-in-space must stay
+                    // robust to a wrong focal-length estimate; the pattern
+                    // match measures the true scale, and the model's f is only
+                    // a search seed here. Fewer than 4 surviving matches → try
+                    // next candidate.
                     if let Some(result) = self.refine_and_finalize(
                         &rotation_matrix,
                         &current_matches,
@@ -717,14 +732,15 @@ impl SolverDatabase {
         t0: Instant,
     ) -> Solution {
         // Derive the rotation directly from the constrained-fit parameters
-        // (θ, CRVAL, parity). The pixel scale was locked during refinement, so
-        // it is the exact scale of the solution — no CD-matrix decomposition
-        // needed.
+        // (θ, CRVAL). The pixel scale was locked during refinement, so it is
+        // the exact scale of the solution — no CD-matrix decomposition
+        // needed. θ describes the parity-applied working frame, so the
+        // rotation is proper regardless of `parity_flip`; the residual loop
+        // below consistently uses the parity-applied `centroids_px`.
         let refined_rotation = wcs_refine::rotation_from_theta_crval(
             wcs_result.theta_rad,
             wcs_result.crval_rad[0],
             wcs_result.crval_rad[1],
-            parity_flip,
         );
         let ps = wcs_result.pixel_scale as f32;
         let refined_fov =

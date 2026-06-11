@@ -324,6 +324,10 @@ pub struct SolveConfig {
     /// Timeout in milliseconds. None = no timeout. Default 5000.
     pub solve_timeout_ms: Option<u64>,
     /// Maximum edge-ratio error for matching. None = use database value.
+    ///
+    /// Values below the database's `pattern_max_error` are clamped up to it —
+    /// patterns were quantized at that tolerance during generation, so a
+    /// tighter match tolerance cannot be honored.
     pub match_max_error: Option<f32>,
     /// Observer's barycentric velocity in km/s (ICRS/GCRF Cartesian).
     ///
@@ -505,7 +509,9 @@ pub struct Solution {
     /// Fitted rotation angle in radians (camera roll in tangent plane).
     ///
     /// The angle from the tangent-plane ξ (East) axis to the camera +X axis,
-    /// measured counter-clockwise.
+    /// measured counter-clockwise. When [`Solution::parity_flip`] is `true`,
+    /// "camera +X" means the x-negated (mirror-corrected) axis — the same
+    /// frame [`Solution::qicrs2cam`] rotates into.
     pub theta_rad: f64,
 }
 

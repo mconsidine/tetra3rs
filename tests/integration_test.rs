@@ -171,6 +171,132 @@ fn test_generate_and_solve() {
     );
 }
 
+/// Solve a mirrored (parity-flipped) synthetic field end to end.
+///
+/// Regression test: the finalize path used to rebuild the rotation with a
+/// parity branch that produced a reflection (det −1), so every
+/// `parity_flip = true` solve returned a meaningless quaternion and huge
+/// residuals. The rest of the suite never exercised this (the skyview tests
+/// pre-correct parity and the synthetic fields are proper), so the full
+/// pipeline is covered here: mirrored centroids → parity detection → WCS
+/// refinement → quaternion / residuals / pixel_to_world.
+#[test]
+fn test_parity_flipped_solve() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+
+    let config = GenerateDatabaseConfig {
+        max_fov_deg: 20.0,
+        min_fov_deg: None,
+        star_max_magnitude: Some(6.0),
+        pattern_max_error: 0.005,
+        lattice_field_oversampling: 30,
+        patterns_per_lattice_field: 25,
+        verification_stars_per_fov: 50,
+        multiscale_step: 1.5,
+        epoch_proper_motion_year: Some(2025.0),
+        catalog_nside: 8,
+    };
+    let db = SolverDatabase::generate_from_gaia(&gaia_catalog_path(), &config)
+        .expect("Failed to generate database");
+
+    // A non-trivial roll matters: the broken branch also depended on θ.
+    let ra = 83.0_f32.to_radians();
+    let dec = (-1.0_f32).to_radians();
+    let roll = 40.0_f32.to_radians();
+    let rot = rotation_from_ra_dec_roll(ra, dec, roll);
+    let boresight_icrs =
+        Vector3::from_array([dec.cos() * ra.cos(), dec.cos() * ra.sin(), dec.sin()]);
+
+    let fov_rad = 15.0_f32.to_radians();
+    let image_width = 1024u32;
+    let image_height = 1024u32;
+    let pixel_scale = {
+        let f = (image_width as f32 / 2.0) / (fov_rad / 2.0).tan();
+        1.0 / f
+    };
+
+    // Generate a proper field, then mirror the x-axis (e.g. a FITS image with
+    // det(CD) < 0 read without parity correction).
+    let mut centroids = generate_centroids(&db, &rot, &boresight_icrs, fov_rad / 2.0, pixel_scale);
+    assert!(centroids.len() >= 4, "need ≥4 centroids");
+    for c in &mut centroids {
+        c.x = -c.x;
+    }
+
+    let solve_config = SolveConfig {
+        fov_max_error_rad: Some(5.0_f32.to_radians()),
+        match_radius: 0.01,
+        match_threshold: 1e-5,
+        solve_timeout_ms: Some(30_000),
+        match_max_error: None,
+        ..SolveConfig::new(fov_rad, image_width, image_height)
+    };
+
+    let solution = db
+        .solve_from_centroids(&centroids, &solve_config)
+        .expect("mirrored field should solve");
+
+    assert!(
+        solution.parity_flip,
+        "mirrored field must be detected as parity-flipped"
+    );
+
+    // Full-attitude check: negating x undoes the mirror, so qicrs2cam must be
+    // the rotation of the original (pre-mirror) camera frame.
+    let solved_rot = solution.qicrs2cam.to_rotation_matrix();
+    let rel = solved_rot * rot.transpose();
+    let trace = rel[(0, 0)] + rel[(1, 1)] + rel[(2, 2)];
+    let attitude_err = (((trace - 1.0) / 2.0).clamp(-1.0, 1.0) as f64).acos();
+    println!(
+        "Parity solve: attitude error {:.1}\", rmse {:.1}\", {} matches",
+        attitude_err.to_degrees() * 3600.0,
+        solution.rmse_rad.to_degrees() * 3600.0,
+        solution.num_matches
+    );
+    assert!(
+        attitude_err < (120.0 / 3600.0_f64).to_radians(),
+        "attitude error {:.1}\" exceeds 120\"",
+        attitude_err.to_degrees() * 3600.0
+    );
+
+    // The finalize residuals are recomputed from the quaternion-bearing
+    // rotation — they blow up to degrees if the conventions diverge.
+    assert!(
+        solution.rmse_rad.to_degrees() * 3600.0 < 60.0,
+        "rmse {:.1}\" exceeds 60\"",
+        solution.rmse_rad.to_degrees() * 3600.0
+    );
+
+    // pixel_to_world takes *observed* (mirrored) pixels; the camera model
+    // applies the parity internally. Check every matched star round-trips.
+    for (k, &cent_idx) in solution.matched_centroid_indices.iter().enumerate() {
+        let cat_id = solution.matched_catalog_ids[k];
+        let star_idx = db
+            .star_catalog_ids
+            .iter()
+            .position(|&id| id == cat_id)
+            .expect("matched catalog id present");
+        let sv = &db.star_vectors[star_idx];
+        let star_v = Vector3::from_array([sv[0], sv[1], sv[2]]);
+
+        let (ra_deg, dec_deg) =
+            solution.pixel_to_world(centroids[cent_idx].x as f64, centroids[cent_idx].y as f64);
+        let (ra_r, dec_r) = (ra_deg.to_radians() as f32, dec_deg.to_radians() as f32);
+        let pred_v = Vector3::from_array([
+            dec_r.cos() * ra_r.cos(),
+            dec_r.cos() * ra_r.sin(),
+            dec_r.sin(),
+        ]);
+        let sep = angular_separation(&pred_v, &star_v);
+        assert!(
+            sep.to_degrees() * 3600.0 < 60.0,
+            "pixel_to_world off by {:.1}\" for catalog id {}",
+            sep.to_degrees() * 3600.0,
+            cat_id
+        );
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Numerically stable angular separation between two unit vectors.

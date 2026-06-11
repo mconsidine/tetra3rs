@@ -103,17 +103,20 @@ pub fn cd_inverse(cd: &[[f64; 2]; 2]) -> Option<[[f64; 2]; 2]> {
 
 /// Synthesize a CD matrix from rotation angle, pixel scale, and parity.
 ///
-/// The CD matrix maps pixel offsets to tangent-plane coordinates:
+/// The CD matrix maps *observed* pixel offsets to tangent-plane coordinates.
+/// θ is the fitted roll of the solve's working pixel frame — the frame in
+/// which a detected parity flip has already negated x — so for a flipped
+/// image the observed x must be negated before the rotation is applied:
 /// ```text
-/// CD = ps * R(θ)  (if parity_flip=false, det > 0)
-/// CD = ps * [[−cos θ, sin θ], [sin θ, cos θ]]  (if parity_flip=true, det < 0)
+/// CD = ps * R(θ)               (if parity_flip=false, det > 0)
+/// CD = ps * R(θ) * diag(−1, 1)  (if parity_flip=true, det < 0)
 /// ```
 pub fn cd_from_theta(theta: f64, pixel_scale: f64, parity_flip: bool) -> [[f64; 2]; 2] {
     let cos_t = theta.cos();
     let sin_t = theta.sin();
     let ps = pixel_scale;
     if parity_flip {
-        [[-ps * cos_t, ps * sin_t], [ps * sin_t, ps * cos_t]]
+        [[-ps * cos_t, -ps * sin_t], [-ps * sin_t, ps * cos_t]]
     } else {
         [[ps * cos_t, -ps * sin_t], [ps * sin_t, ps * cos_t]]
     }
@@ -131,12 +134,11 @@ pub fn decompose_cd(cd: &[[f64; 2]; 2]) -> (f64, f64, f64, bool) {
     let scale_x = (cd[0][0] * cd[0][0] + cd[1][0] * cd[1][0]).sqrt();
     let scale_y = (cd[0][1] * cd[0][1] + cd[1][1] * cd[1][1]).sqrt();
 
-    // Rotation angle from the first column (camera +X direction)
-    // For no parity: CD11 = ps*cos θ, CD21 = ps*sin θ
-    // For parity:    CD11 = -ps*cos θ, CD21 = ps*sin θ
+    // Rotation angle from the first column (observed +X direction).
+    // For no parity: CD11 = ps*cos θ,  CD21 = ps*sin θ
+    // For parity:    CD11 = -ps*cos θ, CD21 = -ps*sin θ  (CD = ps·R(θ)·diag(−1,1))
     let theta = if parity_flip {
-        // CD21 = ps*sin θ, CD11 = -ps*cos θ
-        cd[1][0].atan2(-cd[0][0])
+        (-cd[1][0]).atan2(-cd[0][0])
     } else {
         cd[1][0].atan2(cd[0][0])
     };
@@ -975,18 +977,18 @@ pub fn wcs_refine(
 }
 
 /// Build the ICRS→camera rotation matrix directly from the constrained-fit
-/// parameters `(θ, CRVAL, parity)`.
+/// parameters `(θ, CRVAL)`.
 ///
-/// Equivalent to `wcs_to_rotation(&cd_from_theta(theta, ps, parity), …)` —
-/// the pixel scale cancels in the normalization, so it is not needed. The
-/// camera axes follow from the CD columns: `cam_x ∝ ±cosθ·e_ξ + sinθ·e_η`
-/// and `cam_y ∝ ∓sinθ·e_ξ + cosθ·e_η` (upper signs without parity flip).
-pub fn rotation_from_theta_crval(
-    theta: f64,
-    crval_ra: f64,
-    crval_dec: f64,
-    parity_flip: bool,
-) -> Matrix3<f32> {
+/// θ is the fitted roll of the solve's *working* pixel frame — the frame in
+/// which a detected parity flip has already negated x. That frame is always
+/// a proper right-handed frame (negating x undoes the mirror), so the same
+/// formula applies regardless of parity and the result always has det +1:
+/// `cam_x = cosθ·e_ξ + sinθ·e_η`, `cam_y = −sinθ·e_ξ + cosθ·e_η`. The mirror
+/// itself is recorded separately in `parity_flip` (callers must negate
+/// observed x before applying this rotation when it is set). Equivalent to
+/// `wcs_to_rotation(&cd_from_theta(theta, ps, parity), …)` — the pixel scale
+/// cancels in the normalization, so it is not needed.
+pub fn rotation_from_theta_crval(theta: f64, crval_ra: f64, crval_dec: f64) -> Matrix3<f32> {
     let sin_a = crval_ra.sin();
     let cos_a = crval_ra.cos();
     let sin_d = crval_dec.sin();
@@ -999,13 +1001,8 @@ pub fn rotation_from_theta_crval(
 
     let cos_t = theta.cos();
     let sin_t = theta.sin();
-    let (cam_x, cam_y) = if parity_flip {
-        (e_xi * -cos_t + e_eta * sin_t, e_xi * sin_t + e_eta * cos_t)
-    } else {
-        (e_xi * cos_t + e_eta * sin_t, e_xi * -sin_t + e_eta * cos_t)
-    };
-    let cam_x = cam_x.normalize();
-    let cam_y = cam_y.normalize();
+    let cam_x = (e_xi * cos_t + e_eta * sin_t).normalize();
+    let cam_y = (e_xi * -sin_t + e_eta * cos_t).normalize();
 
     // Rows are camera axes expressed in ICRS: camera_vec = R * icrs_vec
     Matrix3::new([
@@ -1029,7 +1026,15 @@ pub fn rotation_from_theta_crval(
 /// - boresight: `(cos δ₀ cos α₀, cos δ₀ sin α₀, sin δ₀)`
 ///
 /// The CD matrix maps pixel `(Δx, Δy)` to tangent-plane `(ξ, η)`, so the
-/// camera X direction in the tangent plane is proportional to `(CD11, CD21)`.
+/// observed +X pixel direction in the tangent plane is proportional to
+/// `(CD11, CD21)`.
+///
+/// When `det(CD) < 0` the image is mirrored (`parity_flip = true`). The
+/// returned matrix is then the rotation of the *x-negated* (proper) frame —
+/// the observed +X column is negated so the rows always form a right-handed
+/// triad (det +1) — matching the convention of [`Solution`]'s
+/// `qicrs2cam` / `parity_flip` pair: negate observed x before applying the
+/// rotation.
 ///
 /// # Returns
 /// `(rotation_matrix_f32, fov_rad_f32, parity_flip)`
@@ -1049,9 +1054,18 @@ pub fn wcs_to_rotation(
     let e_eta = Vector3::from_array([-sin_d * cos_a, -sin_d * sin_a, cos_d]);
     let boresight = Vector3::from_array([cos_d * cos_a, cos_d * sin_a, sin_d]);
 
+    // Parity from determinant of CD
+    let det_cd = cd[0][0] * cd[1][1] - cd[0][1] * cd[1][0];
+    let parity_flip = det_cd < 0.0;
+
     // Camera axes in ICRS (unnormalized)
-    // Camera +X pixel direction → (CD11, CD21) in tangent-plane
-    let cam_x_icrs_raw = e_xi * cd[0][0] + e_eta * cd[1][0];
+    // Observed +X pixel direction → (CD11, CD21) in tangent-plane. For a
+    // mirrored image the working (proper) frame's +X is the negation.
+    let cam_x_icrs_raw = if parity_flip {
+        -(e_xi * cd[0][0] + e_eta * cd[1][0])
+    } else {
+        e_xi * cd[0][0] + e_eta * cd[1][0]
+    };
     // Camera +Y pixel direction → (CD12, CD22) in tangent-plane
     let cam_y_icrs_raw = e_xi * cd[0][1] + e_eta * cd[1][1];
 
@@ -1082,10 +1096,6 @@ pub fn wcs_to_rotation(
     // ps_x = 1/f (true pinhole). Angular FOV = 2·atan(W/(2f)) = 2·atan(ps_x·W/2).
     let ps_x = cam_x_icrs_raw.norm(); // radians per pixel
     let fov = (2.0 * ((ps_x * image_width as f64) / 2.0).atan()) as f32;
-
-    // Parity from determinant of CD
-    let det_cd = cd[0][0] * cd[1][1] - cd[0][1] * cd[1][0];
-    let parity_flip = det_cd < 0.0;
 
     (rot, fov, parity_flip)
 }
@@ -1253,6 +1263,91 @@ mod tests {
 
         let bore_cam = rot * Vector3::from_array([0.0_f32, 1.0, 0.0]);
         assert!(bore_cam[2] > 0.99, "boresight z = {}", bore_cam[2]);
+    }
+
+    /// Angle of the relative rotation between two rotation matrices, radians.
+    fn rotation_angle_between(a: &Matrix3<f32>, b: &Matrix3<f32>) -> f64 {
+        let rel = *a * b.transpose();
+        let trace = (rel[(0, 0)] + rel[(1, 1)] + rel[(2, 2)]) as f64;
+        ((trace - 1.0) / 2.0).clamp(-1.0, 1.0).acos()
+    }
+
+    #[test]
+    fn test_rotation_from_theta_crval_always_proper() {
+        // Regression: the parity case used to return a reflection (det −1),
+        // corrupting the quaternion and residuals of every parity-flipped
+        // solve. The rotation describes the x-negated working frame, which is
+        // proper, so det must be +1 for all inputs.
+        for &theta in &[0.0_f64, 0.3, -0.5, 1.2, 3.0] {
+            let rot = rotation_from_theta_crval(theta, 1.1, 0.4);
+            assert!(
+                (rot.det() - 1.0).abs() < 1e-5,
+                "det = {} for theta = {}",
+                rot.det(),
+                theta
+            );
+        }
+    }
+
+    #[test]
+    fn test_parity_conventions_consistent() {
+        // End-to-end convention check for a mirrored image: the fit model
+        // (predict_tanplane on x-negated pixels), the final rotation
+        // (rotation_from_theta_crval), the exported CD matrix
+        // (cd_from_theta with parity), and wcs_to_rotation must all agree.
+        let crval_ra = 1.1_f64;
+        let crval_dec = 0.4_f64;
+        let theta = 0.3_f64; // roll of the x-negated working frame
+        let ps = 10.0_f64.to_radians() / 1000.0; // ~10° over 1000 px
+
+        let rot = rotation_from_theta_crval(theta, crval_ra, crval_dec);
+        let cos_t = theta.cos();
+        let sin_t = theta.sin();
+
+        // Stars synthesized at working-frame (x-negated) pixel coords.
+        for &(px, py) in &[(300.0_f64, -200.0_f64), (-450.0, 100.0), (50.0, 425.0)] {
+            // ICRS direction via the rotation: v = R^T · pixel_vector
+            let norm = (px * px * ps * ps + py * py * ps * ps + 1.0).sqrt();
+            let v_pix = Vector3::<f32>::from_array([
+                (px * ps / norm) as f32,
+                (py * ps / norm) as f32,
+                (1.0 / norm) as f32,
+            ]);
+            let v_icrs = rot.transpose() * v_pix;
+            let ra = (v_icrs[1] as f64).atan2(v_icrs[0] as f64);
+            let dec = (v_icrs[2] as f64).asin();
+
+            // Its TAN projection must equal the fit model's prediction.
+            let (xi_cat, eta_cat) = tan_project(ra, dec, crval_ra, crval_dec).unwrap();
+            let (xi_fit, eta_fit) = predict_tanplane(px, py, cos_t, sin_t, ps);
+            // f32 unit vectors limit agreement to ~1e-7 rad (~0.02″)
+            assert!(
+                (xi_cat - xi_fit).abs() < 1e-6 && (eta_cat - eta_fit).abs() < 1e-6,
+                "rotation/fit mismatch at ({px}, {py}): cat=({xi_cat:.3e}, {eta_cat:.3e}) fit=({xi_fit:.3e}, {eta_fit:.3e})"
+            );
+
+            // The CD matrix applies to OBSERVED pixels (x mirrored back).
+            let (x_obs, y_obs) = (-px, py);
+            let cd = cd_from_theta(theta, ps, true);
+            let xi_cd = cd[0][0] * x_obs + cd[0][1] * y_obs;
+            let eta_cd = cd[1][0] * x_obs + cd[1][1] * y_obs;
+            assert!(
+                (xi_cd - xi_fit).abs() < 1e-12 && (eta_cd - eta_fit).abs() < 1e-12,
+                "CD/fit mismatch at ({px}, {py})"
+            );
+        }
+
+        // wcs_to_rotation must recover the same proper rotation + parity flag
+        // from the exported CD matrix.
+        let cd = cd_from_theta(theta, ps, true);
+        let (rot_back, _fov, parity) = wcs_to_rotation(&cd, crval_ra, crval_dec, 1000);
+        assert!(parity, "det(CD) < 0 must report parity_flip");
+        assert!((rot_back.det() - 1.0).abs() < 1e-5);
+        let ang = rotation_angle_between(&rot, &rot_back);
+        assert!(
+            ang < 1e-6,
+            "wcs_to_rotation disagrees with rotation_from_theta_crval by {ang:.2e} rad"
+        );
     }
 
     #[test]
