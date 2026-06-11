@@ -187,6 +187,10 @@ class SolveResult:
     def __reduce__(self) -> tuple: ...
     @staticmethod
     def _from_pickle_bytes(data: bytes) -> "SolveResult": ...
+    def __bool__(self) -> bool:
+        """Always ``True`` — lets ``if result:`` distinguish success from a
+        (falsy) ``SolveFailure``."""
+        ...
 
     @property
     def rotation_matrix_icrs_to_camera(self) -> npt.NDArray[np.float64]:
@@ -305,6 +309,17 @@ class SolveResult:
         ...
 
     @property
+    def theta_deg(self) -> float:
+        """Fitted rotation angle in degrees (camera roll in tangent plane).
+
+        The angle from the tangent-plane ξ (East) axis to the camera +X axis,
+        measured counter-clockwise. When ``parity_flip`` is ``True``,
+        "camera +X" means the x-negated (mirror-corrected) axis — the same
+        frame the quaternion rotates into.
+        """
+        ...
+
+    @property
     def crval_ra_deg(self) -> float:
         """WCS reference point RA in degrees.
 
@@ -380,6 +395,44 @@ class SolveResult:
                 Array elements are NaN for points behind the camera.
                 Returns None for scalar input if the point is behind the camera.
         """
+        ...
+
+class SolveFailure:
+    """A failed plate-solve attempt: why it failed and how long it took.
+
+    Returned by ``SolverDatabase.solve_from_centroids`` when no solution was
+    found. Falsy, so ``if result:`` cleanly separates success from failure::
+
+        result = db.solve_from_centroids(centroids, ...)
+        if result:
+            print(result.ra_deg, result.dec_deg)
+        else:
+            print(f"solve failed: {result.status} after {result.solve_time_ms:.0f} ms")
+
+    Supports ``pickle`` serialization.
+    """
+
+    def __reduce__(self) -> tuple: ...
+    @staticmethod
+    def _from_pickle_bytes(data: bytes) -> "SolveFailure": ...
+    def __bool__(self) -> bool:
+        """Always ``False`` — lets ``if result:`` distinguish a (truthy)
+        ``SolveResult`` from a failure."""
+        ...
+
+    @property
+    def status(self) -> str:
+        """Why the solve produced no solution.
+
+        One of ``'no_match'`` (all pattern combinations exhausted),
+        ``'timeout'`` (``solve_timeout_ms`` reached), or ``'too_few'``
+        (fewer than 4 usable centroids).
+        """
+        ...
+
+    @property
+    def solve_time_ms(self) -> float:
+        """Wall-clock time spent before giving up, in milliseconds."""
         ...
 
 class CatalogStar:
@@ -627,7 +680,7 @@ class SolverDatabase:
         hint_uncertainty_deg: Optional[float] = None,
         hint_uncertainty_rad: Optional[float] = None,
         strict_hint: bool = False,
-    ) -> Optional[SolveResult]:
+    ) -> Union[SolveResult, SolveFailure]:
         """Solve for camera attitude given star centroids.
 
         Args:
@@ -652,6 +705,7 @@ class SolverDatabase:
             match_threshold: False-positive probability threshold.
             solve_timeout_ms: Timeout in milliseconds. None = no timeout.
             match_max_error: Maximum edge-ratio error. None = use database value.
+                Values below the database's pattern quantization error are clamped up to it.
             camera_model: A CameraModel specifying focal length, image
                 dimensions, optical center, distortion, and parity. When
                 provided it is the single source of camera geometry
@@ -693,7 +747,10 @@ class SolverDatabase:
                 ``attitude_hint`` is set.
 
         Returns:
-            A SolveResult on success, or None if no match was found.
+            A SolveResult on success, or a (falsy) SolveFailure carrying the
+            failure reason (``status``: ``'no_match'`` / ``'timeout'`` /
+            ``'too_few'``) and ``solve_time_ms``. Use ``if result:`` to
+            distinguish the two.
         """
         ...
 
@@ -842,10 +899,12 @@ class RadialDistortion:
     ``x_d = x · (1 + k1·r² + k2·r⁴ + k3·r⁶) + 2·p1·x·y + p2·(r² + 2·x²)``
     ``y_d = y · (1 + k1·r² + k2·r⁴ + k3·r⁶) + p1·(r² + 2·y²) + 2·p2·x·y``
 
-    Coordinates are in pixels relative to the optical center (image center
-    minus CRPIX). Tangential coefficients ``p1, p2`` default to 0 — set them
-    to model lens decentering, sensor tilt, or off-axis CCD placement.
-    Supports ``pickle`` serialization.
+    Coordinates are in pixels, origin at the image center; the model shifts
+    into its own ``center`` frame (the optical axis, ``(0, 0)`` by default)
+    internally. Tangential coefficients ``p1, p2`` default to 0 — set them
+    to model lens decentering or sensor tilt. On mosaic cameras (e.g. TESS)
+    the optical axis can sit far off the detector center — ``center``
+    carries that offset. Supports ``pickle`` serialization.
 
     Example::
 
@@ -881,6 +940,7 @@ class RadialDistortion:
         k3: float = 0.0,
         p1: float = 0.0,
         p2: float = 0.0,
+        center: tuple[float, float] = (0.0, 0.0),
     ) -> None: ...
     @property
     def k1(self) -> float:
@@ -905,6 +965,12 @@ class RadialDistortion:
     @property
     def p2(self) -> float:
         """Second tangential / decentering coefficient."""
+        ...
+
+    @property
+    def center(self) -> tuple[float, float]:
+        """Distortion center (optical axis) as ``(cx, cy)`` in pixels,
+        image-center-origin frame."""
         ...
 
     def distort(self, x: float, y: float) -> tuple[float, float]:

@@ -2,7 +2,96 @@
 
 ## Unreleased
 
+### Changed
+
+- **Radial calibration rewritten as a standard camera-intrinsics fit
+  (OpenCV-style).** `calibrate_camera(model = Radial)` now jointly fits the
+  optical-axis position `(cx, cy)`, a focal-scale factor `γ`, and the
+  Brown-Conrady coefficients `(k1, k2, k3, p1, p2)` — the same parameter
+  set as OpenCV's `calibrateCamera` (free principal point, free focal
+  length). Two structural problems in the old fit are gone:
+  - *No scale degree of freedom.* The fit was anchored to the focal length
+    implied by the median solve FOV — a whole-field average biased by the
+    very distortion being fit (≈0.8% on TESS, ~12 px at the field corner).
+    Brown-Conrady has no linear term, so the bias had to be mimicked by the
+    cubic+ terms, making results hypersensitive to the FOV estimate. The
+    fitted `γ` now absorbs it exactly and is folded into
+    `CameraModel::focal_length_px` (with the exact coefficient rescaling
+    `kᵢ → kᵢ/γ^2i`, `p → p/γ`).
+  - *Optical center pinned to the image center.* The old `(cx, cy)`
+    regularizer pulled the distortion center to `[0, 0]`, which is wrong on
+    mosaic cameras (TESS, Kepler, Rubin, …) where the optical axis lies far
+    off any single detector — near a CCD corner for TESS Camera 1 CCD 1.
+    The center is now free, with only a tiny tie-breaking prior for the
+    weak-distortion case where it is genuinely unidentifiable.
+
+  The fitter also normalizes coordinates internally (the Jacobian otherwise
+  spans ~20 orders of magnitude and LM fails at real-camera scales) and no
+  longer discards the fit when the LM iteration budget is reached. On the
+  TESS 10-image radial calibration this takes the pooled fit from 6.3 px
+  (or 3.0 px with 60% of points clipped, depending on the FOV estimate) to
+  1.8 px with 80% inliers, and post-calibration re-solves agree with the
+  FITS WCS to better than 90″ on all sectors.
+
+- **`RadialDistortion` carries its own distortion center.** New
+  `center: [f64; 2]` field (pixels, image-center-origin frame; default
+  `[0, 0]`) and `with_center()` constructor. The distortion center (optical
+  axis) is now distinct from `CameraModel::crpix` (the tangent-plane
+  projection origin): radial calibrations leave `crpix = [0, 0]` and store
+  the fitted optical-axis position in the model, so solve-time geometry
+  (FOV-radius catalog queries, pattern scales) is unaffected even when the
+  optical axis sits 1400 px off the image center. **Breaking:** saved
+  binary/pickled `RadialDistortion` (and containing `CameraModel`) blobs
+  from earlier versions do not load. Python: `RadialDistortion` gains a
+  `center=(cx, cy)` constructor argument and property.
+
+- **Calibrated `focal_length_px` is now tan-consistent.** Both calibrate
+  paths previously recorded `focal_length_px = image_width / fov_rad`
+  (small-angle) while fitting distortion against tan-projected ideal points
+  (`f = (w/2)/tan(fov/2)`), a ~0.3% inconsistency at TESS's 11.7° FOV. Both
+  now use the tan form, matching `CameraModel::from_fov` / `fov_rad()`.
+
+- **Multi-image calibration excludes parity-outlier solves.** Parity is a
+  physical property of the camera, so all images in a calibration set must
+  agree; a lone opposite-parity solve is a false (mirror-image) match whose
+  star correspondences would poison the pooled distortion fit. Images
+  disagreeing with the majority parity are now excluded (debug-logged), and
+  the median-FOV/parity consensus is computed over agreeing solves only.
+  (Seen on TESS sector 14, which falsely solves as a mirror image with 427
+  "matches" at rmse 275″.)
+
+### Fixed
+
+- **Parity-flipped solves no longer return a corrupt attitude.** For images
+  requiring a parity flip (`parity_flip = true`), the final rotation was
+  rebuilt from `(θ, CRVAL)` with a parity branch that produced a *reflection*
+  (det −1) instead of a rotation. `Quaternion::from_rotation_matrix` cannot
+  represent a reflection, so `qicrs2cam` was meaningless (a non-unit,
+  near-identity quaternion), and the recomputed residual statistics
+  (`rmse_rad`, `p90e_rad`, `max_err_rad`) were degrees-level garbage. The
+  exported `cd_matrix` encoded the roll with the wrong sign convention
+  (`ps·diag(−1,1)·R(θ)` instead of `ps·R(θ)·diag(−1,1)`). The bug was
+  invisible to the test suite because no test exercised an end-to-end
+  parity-flipped solve (the skyview tests pre-correct parity and the
+  synthetic fields are proper). Now: the rotation/quaternion always describe
+  the x-negated (proper) working frame — `Solution.parity_flip` records the
+  mirror, exactly as documented — `cd_from_theta` emits the matching CD
+  convention, and `wcs_to_rotation` returns the proper working-frame rotation
+  for `det(CD) < 0` inputs. `Solution::pixel_to_world` / `world_to_pixel`
+  were already consistent and are unchanged. Covered by new unit tests and an
+  end-to-end mirrored-field integration test (`test_parity_flipped_solve`).
+  Rust API note: `rotation_from_theta_crval` no longer takes a `parity_flip`
+  argument (the rotation does not depend on it).
+
 ### Breaking changes
+
+- **Python: `solve_from_centroids` returns a `SolveFailure` object instead of
+  `None` on failure.** The new object is *falsy* — `if result:` keeps working
+  — and carries `status` (`'no_match'` / `'timeout'` / `'too_few'`) and
+  `solve_time_ms`, which were previously discarded. Code using
+  `result is None` / `result is not None` must switch to truthiness checks
+  (`if not result:` / `if result:`). `SolveFailure` pickles like the other
+  public types.
 
 - **`SolveResult` is now `Result<Solution, SolveFailure>` (Rust).** The old
   struct-of-`Option`s is replaced by a `Solution` whose fields are all

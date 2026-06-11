@@ -54,12 +54,19 @@ pub struct DistortionFitResult {
     /// - `None` for [`Distortion::Polynomial`] fits — the polynomial
     ///   absorbs the center offset into its order-0 (constant) terms,
     ///   which `extract_crpix` later moves into [`CameraModel::crpix`].
-    /// - `Some([cx, cy])` for [`Distortion::Radial`] fits — the radial
-    ///   model has no constant term, so `(cx, cy)` is fit jointly via
-    ///   nonlinear LS and returned alongside the `(k1, k2, k3)`
-    ///   coefficients. Caller stores it in [`CameraModel::crpix`]
-    ///   directly.
+    /// - `None` for [`Distortion::Radial`] fits too — the jointly-fit
+    ///   optical-axis position is carried inside the model itself
+    ///   ([`RadialDistortion::center`]), NOT in `crpix`: on mosaic cameras
+    ///   the optical axis can sit far off the detector (a CCD corner on
+    ///   TESS), while `crpix` is the projection origin and must stay near
+    ///   the image center for the solver's geometry.
     pub crpix: Option<[f64; 2]>,
+    /// Correction factor for the anchor focal length (the focal length
+    /// implied by the solve FOV used to project the ideal points):
+    /// `f_true = focal_scale · f_anchor`. Always `1.0` for polynomial fits;
+    /// for radial fits this carries the jointly-fit linear scale term (the
+    /// Brown-Conrady model itself has no linear degree of freedom).
+    pub focal_scale: f64,
     /// RMS residual in pixels BEFORE distortion correction.
     pub rmse_before_px: f64,
     /// RMS residual in pixels AFTER distortion correction.
@@ -128,6 +135,7 @@ pub fn fit_radial_distortion(
         return DistortionFitResult {
             model: Distortion::None,
             crpix: None,
+            focal_scale: 1.0,
             rmse_before_px: 0.0,
             rmse_after_px: 0.0,
             n_inliers: 0,
@@ -138,29 +146,32 @@ pub fn fit_radial_distortion(
 
     let n = points.len();
     let fit = fit_radial_centered_sigma_clip(&points, config);
-    let model = RadialDistortion::with_tangential(fit.k1, fit.k2, fit.k3, fit.p1, fit.p2);
+    // Re-express in the scale-corrected frame (γ folded into the focal
+    // length via `focal_scale`). Predicted pixels are unchanged, so
+    // residuals are evaluated with the raw fitted params including γ.
+    let model = fit.rescaled_model();
 
     // Compute before/after RMSE on the SAME inlier set for a fair comparison.
-    // The "after" RMSE is computed against the centered Brown-Conrady model,
-    // so we subtract the fitted (cx, cy) before applying distort.
     let rmse_before =
         compute_corrected_rmse_centered(&points, &fit.mask, &Distortion::None, [0.0, 0.0]);
-    let rmse_after = compute_corrected_rmse_centered(
+    let residuals = intrinsics_residuals(
         &points,
-        &fit.mask,
-        &Distortion::Radial(model.clone()),
-        [fit.cx, fit.cy],
+        &[
+            fit.cx, fit.cy, fit.gamma, fit.k1, fit.k2, fit.k3, fit.p1, fit.p2,
+        ],
     );
+    let rmse_after = masked_rms(&residuals, &fit.mask);
     let n_inliers = fit.mask.iter().filter(|&&m| m).count();
 
     debug!(
-        "Brown-Conrady fit: cx={:.2}, cy={:.2}, k1={:.3e}, k2={:.3e}, k3={:.3e}, p1={:.3e}, p2={:.3e}, inliers={}/{}, RMSE {:.3} → {:.3} px",
-        fit.cx, fit.cy, fit.k1, fit.k2, fit.k3, fit.p1, fit.p2, n_inliers, n, rmse_before, rmse_after
+        "Brown-Conrady fit: cx={:.2}, cy={:.2}, gamma={:.6}, k1={:.3e}, k2={:.3e}, k3={:.3e}, p1={:.3e}, p2={:.3e}, inliers={}/{}, RMSE {:.3} → {:.3} px",
+        fit.cx, fit.cy, fit.gamma, fit.k1, fit.k2, fit.k3, fit.p1, fit.p2, n_inliers, n, rmse_before, rmse_after
     );
 
     DistortionFitResult {
         model: Distortion::Radial(model),
-        crpix: Some([fit.cx, fit.cy]),
+        crpix: None,
+        focal_scale: fit.gamma,
         rmse_before_px: rmse_before,
         rmse_after_px: rmse_after,
         n_inliers,
@@ -169,11 +180,20 @@ pub fn fit_radial_distortion(
     }
 }
 
-/// Result of a sigma-clipped Brown-Conrady fit (centered radial + tangential).
+/// Result of a sigma-clipped camera-intrinsics fit: optical center,
+/// focal-scale factor, and Brown-Conrady distortion (radial + tangential).
 pub(super) struct CenteredRadialFitResult {
     /// Optical-center offset in pixels, in the geometric (no-crpix) frame.
     pub cx: f64,
     pub cy: f64,
+    /// Focal-length correction factor: `f_true = gamma · f_anchor`, where
+    /// `f_anchor` is the focal length used to project the ideal points.
+    /// `f_anchor` derives from the solve FOV — a whole-field average biased
+    /// by the very distortion being fit (≈1% on TESS) — and Brown-Conrady
+    /// has no linear term, so without this degree of freedom the anchor
+    /// bias becomes a linear residual (tens of px at the field corner) that
+    /// the cubic+ terms can only mimic.
+    pub gamma: f64,
     pub k1: f64,
     pub k2: f64,
     pub k3: f64,
@@ -184,45 +204,92 @@ pub(super) struct CenteredRadialFitResult {
     pub iterations: u32,
 }
 
-/// Joint nonlinear LS fit of `(cx, cy, k1, k2, k3, p1, p2)` via
-/// Levenberg-Marquardt with MAD-based sigma-clipping. Reusable across
+impl CenteredRadialFitResult {
+    /// The fitted distortion re-expressed in the corrected ideal frame
+    /// (focal length × `gamma`): `kᵢ′ = kᵢ/γ^2i`, `p′ = p/γ`, carrying the
+    /// fitted optical-axis position as the model's own `center`. Up to a
+    /// small constant offset `(γ−1)·c` (absorbed by attitude at solve
+    /// time), predicted observed pixels are unchanged.
+    pub(super) fn rescaled_model(&self) -> RadialDistortion {
+        let g = self.gamma;
+        let g2 = g * g;
+        RadialDistortion::with_center(
+            self.cx,
+            self.cy,
+            self.k1 / g2,
+            self.k2 / (g2 * g2),
+            self.k3 / (g2 * g2 * g2),
+            self.p1 / g,
+            self.p2 / g,
+        )
+    }
+}
+
+/// Joint nonlinear LS fit of the standard camera-intrinsics model — optical
+/// center `(cx, cy)`, focal-scale factor `γ`, and Brown-Conrady distortion
+/// `(k1, k2, k3, p1, p2)` — via Levenberg-Marquardt with MAD-based
+/// sigma-clipping. This is the parameter set OpenCV's `calibrateCamera`
+/// fits (free principal point, free focal length, 5-coefficient
+/// Brown-Conrady), restricted to square pixels and no skew. Reusable across
 /// single-image and multi-image calibration paths.
 ///
-/// The forward model is the full Brown-Conrady (radial + tangential),
-/// centered on the fitted optical axis:
+/// The forward model, centered on the fitted optical axis:
 ///
 /// ```text
 ///     x_n = x_ideal − cx,   y_n = y_ideal − cy
 ///     r²  = x_n² + y_n²
-///     s   = k1·r² + k2·r⁴ + k3·r⁶
-///     x_obs − x_ideal = x_n · s + 2·p1·x_n·y_n + p2·(r² + 2·x_n²)
-///     y_obs − y_ideal = y_n · s + p1·(r² + 2·y_n²) + 2·p2·x_n·y_n
+///     rad = 1 + k1·r² + k2·r⁴ + k3·r⁶
+///     x_obs = cx + γ·(x_n·rad + 2·p1·x_n·y_n + p2·(r² + 2·x_n²))
+///     y_obs = cy + γ·(y_n·rad + p1·(r² + 2·y_n²) + 2·p2·x_n·y_n)
 /// ```
+///
+/// `(cx, cy)` is deliberately NOT pulled toward the image center: on
+/// multi-detector mosaics (TESS, Kepler, Rubin, …) the camera's optical
+/// axis lies far off any single detector's center — near a corner for a
+/// TESS CCD — and that is where the radial distortion is physically
+/// centered. Only a tiny tie-breaking prior on `(cx, cy, p1, p2)`
+/// (negligible against any real signal) picks the centered representative
+/// when the data cannot distinguish — e.g. a distortion-free pinhole,
+/// where the optical center is unidentifiable (a center shift `δc·k1` is
+/// first-order indistinguishable from a tangential `p2` term).
 ///
 /// LM is delegated to [`numeris::optim::least_squares_lm_dyn`]. The outer
 /// loop performs MAD-based sigma-clipping: after each LM convergence,
 /// re-mask inliers based on the residual distribution and re-call LM.
 ///
-/// Regularization on `(cx, cy)` is implemented by augmenting the residual
-/// vector with two extra rows `√μ·cx`, `√μ·cy` (Jacobian rows
-/// `[√μ, 0, …]`, `[0, √μ, 0, …]`). This adds `μ·(cx² + cy²)` to the cost,
-/// biasing `(cx, cy)` toward the geometric image center to break the
-/// near-degenerate ridge between the optical-axis offset and the
-/// tangential coefficients `(p1, p2)`.
-///
-/// Warm-starts `(k1, k2, k3)` from a non-centered linear fit (the existing
-/// [`fit_radial_ls`]) so LM begins near the right answer. `(cx, cy, p1, p2)`
-/// start at 0.
+/// Warm-starts `(k1, k2, k3)` from a non-centered linear fit
+/// ([`fit_radial_ls`]); `γ` starts at 1 and `(cx, cy, p1, p2)` at 0.
 pub(super) fn fit_radial_centered_sigma_clip(
     points: &[MatchedPoint],
     config: &DistortionFitConfig,
 ) -> CenteredRadialFitResult {
+    // Normalize coordinates so the field radius is ~1. Without this the
+    // Jacobian columns span ~20 orders of magnitude (the γ column is O(r),
+    // the k3 column O(r⁷)) and LM hard-fails or converges to wrong local
+    // minima at real-camera magnitudes. Dimensionless parameters: ĉ = c/L,
+    // k̂ᵢ = kᵢ·L^2i, p̂ = p·L; γ is already dimensionless.
+    let norm = points
+        .iter()
+        .map(|p| p.x_ideal.hypot(p.y_ideal))
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    let npoints: Vec<MatchedPoint> = points
+        .iter()
+        .map(|p| MatchedPoint {
+            x_obs: p.x_obs / norm,
+            y_obs: p.y_obs / norm,
+            x_ideal: p.x_ideal / norm,
+            y_ideal: p.y_ideal / norm,
+        })
+        .collect();
+
     // Warm-start `k`s from a quick non-centered linear fit.
-    let initial_mask = vec![true; points.len()];
-    let (k1_init, k2_init, k3_init) = fit_radial_ls(points, &initial_mask);
+    let initial_mask = vec![true; npoints.len()];
+    let (k1_init, k2_init, k3_init) = fit_radial_ls(&npoints, &initial_mask);
     let mut x = DynVector::<f64>::from_vec(vec![
         0.0,     // cx
         0.0,     // cy
+        1.0,     // gamma
         k1_init, // k1
         k2_init, // k2
         k3_init, // k3
@@ -235,12 +302,12 @@ pub(super) fn fit_radial_centered_sigma_clip(
     // Outer sigma-clip iterations
     for _outer in 0..config.max_iterations {
         let n_inliers = mask.iter().filter(|&&m| m).count();
-        if n_inliers < 7 {
+        if n_inliers < 8 {
             break;
         }
         let prev_x = x.clone();
 
-        match run_brown_conrady_lm(points, &mask, &x) {
+        match run_intrinsics_lm(&npoints, &mask, &x) {
             Ok((new_x, iters)) => {
                 x = new_x;
                 total_lm_iters += iters;
@@ -249,8 +316,7 @@ pub(super) fn fit_radial_centered_sigma_clip(
         }
 
         // Sigma-clip on residuals at current params.
-        let (cx, cy, k1, k2, k3, p1, p2) = (x[0], x[1], x[2], x[3], x[4], x[5], x[6]);
-        let residuals = centered_radial_residuals(points, cx, cy, k1, k2, k3, p1, p2);
+        let residuals = intrinsics_residuals(&npoints, x.as_slice());
         let inlier_resids: Vec<f64> = residuals
             .iter()
             .zip(&mask)
@@ -261,18 +327,18 @@ pub(super) fn fit_radial_centered_sigma_clip(
             break;
         }
         let sigma = mad_sigma(&inlier_resids);
-        if sigma < 1e-12 {
+        if sigma < 1e-12 / norm {
             break;
         }
         let threshold = config.sigma_clip * sigma;
         let new_mask: Vec<bool> = residuals.iter().map(|&r| r <= threshold).collect();
         let mask_changed = mask.iter().zip(&new_mask).any(|(&a, &b)| a != b);
         mask = new_mask;
-        let params_changed = (0..7).any(|i| (x[i] - prev_x[i]).abs() > 1e-12);
+        let params_changed = (0..8).any(|i| (x[i] - prev_x[i]).abs() > 1e-12);
         if !mask_changed && !params_changed {
             break;
         }
-        if mask.iter().filter(|&&m| m).count() < 7 {
+        if mask.iter().filter(|&&m| m).count() < 8 {
             break;
         }
     }
@@ -281,45 +347,79 @@ pub(super) fn fit_radial_centered_sigma_clip(
     // whose Euclidean residual is below `stage2_threshold_px` regardless of
     // sigma-clip rejection. Refit once if any new inliers join.
     if let Some(threshold_px) = config.stage2_threshold_px {
-        let (cx, cy, k1, k2, k3, p1, p2) = (x[0], x[1], x[2], x[3], x[4], x[5], x[6]);
-        let residuals = centered_radial_residuals(points, cx, cy, k1, k2, k3, p1, p2);
-        let mask_s2: Vec<bool> = residuals.iter().map(|&r| r <= threshold_px).collect();
+        let residuals = intrinsics_residuals(&npoints, x.as_slice());
+        let threshold = threshold_px / norm;
+        let mask_s2: Vec<bool> = residuals.iter().map(|&r| r <= threshold).collect();
         let n_recovered = mask_s2
             .iter()
             .zip(&mask)
             .filter(|(&s2, &s1)| s2 && !s1)
             .count();
-        if n_recovered > 0 && mask_s2.iter().filter(|&&m| m).count() >= 7 {
+        if n_recovered > 0 && mask_s2.iter().filter(|&&m| m).count() >= 8 {
             mask = mask_s2;
-            if let Ok((new_x, iters)) = run_brown_conrady_lm(points, &mask, &x) {
+            if let Ok((new_x, iters)) = run_intrinsics_lm(&npoints, &mask, &x) {
                 x = new_x;
                 total_lm_iters += iters;
             }
         }
     }
 
+    // Denormalize back to pixel units.
+    let n2 = norm * norm;
     CenteredRadialFitResult {
-        cx: x[0],
-        cy: x[1],
-        k1: x[2],
-        k2: x[3],
-        k3: x[4],
-        p1: x[5],
-        p2: x[6],
+        cx: x[0] * norm,
+        cy: x[1] * norm,
+        gamma: x[2],
+        k1: x[3] / n2,
+        k2: x[4] / (n2 * n2),
+        k3: x[5] / (n2 * n2 * n2),
+        p1: x[6] / norm,
+        p2: x[7] / norm,
         mask,
         iterations: total_lm_iters,
     }
 }
 
-/// Single Levenberg-Marquardt run on the centered Brown-Conrady model with
-/// `(cx, cy)` regularization, dispatched to
+/// Predicted observed position under the intrinsics model, for one point.
+/// `params` = `[cx, cy, gamma, k1, k2, k3, p1, p2]` (all in the same units
+/// as the point coordinates).
+fn intrinsics_predict(p: &MatchedPoint, params: &[f64]) -> (f64, f64) {
+    let (cx, cy, gamma) = (params[0], params[1], params[2]);
+    let (k1, k2, k3, p1, p2) = (params[3], params[4], params[5], params[6], params[7]);
+    let xn = p.x_ideal - cx;
+    let yn = p.y_ideal - cy;
+    let r2 = xn * xn + yn * yn;
+    let r4 = r2 * r2;
+    let r6 = r2 * r4;
+    let rad = 1.0 + k1 * r2 + k2 * r4 + k3 * r6;
+    let dx = xn * rad + 2.0 * p1 * xn * yn + p2 * (r2 + 2.0 * xn * xn);
+    let dy = yn * rad + p1 * (r2 + 2.0 * yn * yn) + 2.0 * p2 * xn * yn;
+    (cx + gamma * dx, cy + gamma * dy)
+}
+
+/// Per-point Euclidean residual under the intrinsics model.
+/// `params` as in [`intrinsics_predict`].
+pub(super) fn intrinsics_residuals(points: &[MatchedPoint], params: &[f64]) -> Vec<f64> {
+    points
+        .iter()
+        .map(|p| {
+            let (px, py) = intrinsics_predict(p, params);
+            (p.x_obs - px).hypot(p.y_obs - py)
+        })
+        .collect()
+}
+
+/// Single Levenberg-Marquardt run on the intrinsics model, dispatched to
 /// [`numeris::optim::least_squares_lm_dyn`].
 ///
-/// The residual vector has length `2·N_inliers + 2`: two rows per inlier
-/// point (x and y) plus two rows for the `(cx, cy)` regularization penalty.
-/// Returns `Err(())` if there aren't enough inliers or if LM fails (e.g.
-/// singular Jacobian even after damping).
-fn run_brown_conrady_lm(
+/// The residual vector has length `2·N_inliers + 4`: two rows per inlier
+/// point (x and y) plus four tie-breaking rows `√μ·(cx, cy, p1, p2)`. The
+/// tie-break weight is far below any real data term; it only selects the
+/// centered, radial-only representative when the data leaves the
+/// `(cx, cy) ↔ (p1, p2)` ridge exactly degenerate (see
+/// [`fit_radial_centered_sigma_clip`]). Returns `Err(())` if there aren't
+/// enough inliers or if LM fails.
+fn run_intrinsics_lm(
     points: &[MatchedPoint],
     mask: &[bool],
     x0: &DynVector<f64>,
@@ -329,56 +429,46 @@ fn run_brown_conrady_lm(
         .enumerate()
         .filter_map(|(i, &m)| if m { Some(i) } else { None })
         .collect();
-    if inlier_indices.len() < 7 {
+    if inlier_indices.len() < 8 {
         return Err(());
     }
-    // sqrt(μ) — see fit_radial_centered_sigma_clip docstring for rationale.
-    const SQRT_MU_CXY: f64 = 0.1; // μ = 1e-2
-    let m = 2 * inlier_indices.len() + 2;
+    // Tie-break weight √μ (normalized coordinates): cost μ·ĉ² ≤ 1e-8 even
+    // at ĉ ~ 1 — at least three orders below the smallest realistic data
+    // term, so it never fights real signal.
+    const SQRT_MU_TIE: f64 = 1e-4;
+    let m = 2 * inlier_indices.len() + 4;
 
     // Closures borrow the inlier index list and points. The residual
     // function returns a column vector of length m. The Jacobian returns
-    // an m×7 matrix.
+    // an m×8 matrix.
     let residual = |x: &DynVector<f64>| -> DynVector<f64> {
-        let cx = x[0];
-        let cy = x[1];
-        let k1 = x[2];
-        let k2 = x[3];
-        let k3 = x[4];
-        let p1 = x[5];
-        let p2 = x[6];
         let mut r = DynVector::<f64>::zeros(m);
         for (row_pair, &i) in inlier_indices.iter().enumerate() {
             let p = &points[i];
-            let xn = p.x_ideal - cx;
-            let yn = p.y_ideal - cy;
-            let r2 = xn * xn + yn * yn;
-            let r4 = r2 * r2;
-            let r6 = r2 * r4;
-            let s = k1 * r2 + k2 * r4 + k3 * r6;
-            let dx_t = 2.0 * p1 * xn * yn + p2 * (r2 + 2.0 * xn * xn);
-            let dy_t = p1 * (r2 + 2.0 * yn * yn) + 2.0 * p2 * xn * yn;
-            r[2 * row_pair] = (p.x_obs - p.x_ideal) - (xn * s + dx_t);
-            r[2 * row_pair + 1] = (p.y_obs - p.y_ideal) - (yn * s + dy_t);
+            let (px, py) = intrinsics_predict(p, x.as_slice());
+            r[2 * row_pair] = p.x_obs - px;
+            r[2 * row_pair + 1] = p.y_obs - py;
         }
-        // Regularization rows: cost contribution (√μ·cx)² = μ·cx².
-        r[m - 2] = SQRT_MU_CXY * cx;
-        r[m - 1] = SQRT_MU_CXY * cy;
+        // Tie-break rows: cost contribution (√μ·cx)² = μ·cx², etc.
+        r[m - 4] = SQRT_MU_TIE * x[0];
+        r[m - 3] = SQRT_MU_TIE * x[1];
+        r[m - 2] = SQRT_MU_TIE * x[6];
+        r[m - 1] = SQRT_MU_TIE * x[7];
         r
     };
 
     let jacobian = |x: &DynVector<f64>| -> DynMatrix<f64> {
         // Numeris LM uses the convention r(x) is the residual; gradient = Jᵀr.
-        // Our residual matches the previous hand-rolled LM (R = obs − predicted),
-        // so the Jacobian rows are ∂R/∂params (NOT negated).
+        // R = obs − predicted, so rows are ∂R/∂params = −∂predicted/∂params.
         let cx = x[0];
         let cy = x[1];
-        let k1 = x[2];
-        let k2 = x[3];
-        let k3 = x[4];
-        let p1 = x[5];
-        let p2 = x[6];
-        let mut j = DynMatrix::<f64>::zeros(m, 7);
+        let gamma = x[2];
+        let k1 = x[3];
+        let k2 = x[4];
+        let k3 = x[5];
+        let p1 = x[6];
+        let p2 = x[7];
+        let mut j = DynMatrix::<f64>::zeros(m, 8);
         for (row_pair, &i) in inlier_indices.iter().enumerate() {
             let p = &points[i];
             let xn = p.x_ideal - cx;
@@ -386,70 +476,73 @@ fn run_brown_conrady_lm(
             let r2 = xn * xn + yn * yn;
             let r4 = r2 * r2;
             let r6 = r2 * r4;
-            let s = k1 * r2 + k2 * r4 + k3 * r6;
-            let sp = k1 + 2.0 * k2 * r2 + 3.0 * k3 * r4;
+            let rad = 1.0 + k1 * r2 + k2 * r4 + k3 * r6;
+            let radp = k1 + 2.0 * k2 * r2 + 3.0 * k3 * r4; // d(rad)/d(r²)
+            let dx = xn * rad + 2.0 * p1 * xn * yn + p2 * (r2 + 2.0 * xn * xn);
+            let dy = yn * rad + p1 * (r2 + 2.0 * yn * yn) + 2.0 * p2 * xn * yn;
+            // ∂(distorted)/∂xn and cross terms, shared between rows.
+            let ddx_dxn = rad + 2.0 * xn * xn * radp + 2.0 * p1 * yn + 6.0 * p2 * xn;
+            let ddx_dyn = 2.0 * xn * yn * radp + 2.0 * p1 * xn + 2.0 * p2 * yn;
+            let ddy_dyn = rad + 2.0 * yn * yn * radp + 6.0 * p1 * yn + 2.0 * p2 * xn;
+            let ddy_dxn = ddx_dyn; // symmetric mixed term
             let row_x = 2 * row_pair;
             let row_y = row_x + 1;
-            // x equation
-            j[(row_x, 0)] = s + 2.0 * xn * xn * sp + 2.0 * p1 * yn + 6.0 * p2 * xn;
-            j[(row_x, 1)] = 2.0 * xn * yn * sp + 2.0 * p1 * xn + 2.0 * p2 * yn;
-            j[(row_x, 2)] = -xn * r2;
-            j[(row_x, 3)] = -xn * r4;
-            j[(row_x, 4)] = -xn * r6;
-            j[(row_x, 5)] = -2.0 * xn * yn;
-            j[(row_x, 6)] = -(r2 + 2.0 * xn * xn);
+            // x equation: R = x_obs − cx − γ·dx, with ∂xn/∂cx = −1.
+            j[(row_x, 0)] = -1.0 + gamma * ddx_dxn;
+            j[(row_x, 1)] = gamma * ddx_dyn;
+            j[(row_x, 2)] = -dx;
+            j[(row_x, 3)] = -gamma * xn * r2;
+            j[(row_x, 4)] = -gamma * xn * r4;
+            j[(row_x, 5)] = -gamma * xn * r6;
+            j[(row_x, 6)] = -gamma * 2.0 * xn * yn;
+            j[(row_x, 7)] = -gamma * (r2 + 2.0 * xn * xn);
             // y equation
-            j[(row_y, 0)] = 2.0 * xn * yn * sp + 2.0 * p1 * xn + 2.0 * p2 * yn;
-            j[(row_y, 1)] = s + 2.0 * yn * yn * sp + 6.0 * p1 * yn + 2.0 * p2 * xn;
-            j[(row_y, 2)] = -yn * r2;
-            j[(row_y, 3)] = -yn * r4;
-            j[(row_y, 4)] = -yn * r6;
-            j[(row_y, 5)] = -(r2 + 2.0 * yn * yn);
-            j[(row_y, 6)] = -2.0 * xn * yn;
+            j[(row_y, 0)] = gamma * ddy_dxn;
+            j[(row_y, 1)] = -1.0 + gamma * ddy_dyn;
+            j[(row_y, 2)] = -dy;
+            j[(row_y, 3)] = -gamma * yn * r2;
+            j[(row_y, 4)] = -gamma * yn * r4;
+            j[(row_y, 5)] = -gamma * yn * r6;
+            j[(row_y, 6)] = -gamma * (r2 + 2.0 * yn * yn);
+            j[(row_y, 7)] = -gamma * 2.0 * xn * yn;
         }
-        // Regularization rows: ∂(√μ·cx)/∂cx = √μ, all other entries 0.
-        j[(m - 2, 0)] = SQRT_MU_CXY;
-        j[(m - 1, 1)] = SQRT_MU_CXY;
+        // Tie-break rows: ∂(√μ·cx)/∂cx = √μ, etc.
+        j[(m - 4, 0)] = SQRT_MU_TIE;
+        j[(m - 3, 1)] = SQRT_MU_TIE;
+        j[(m - 2, 6)] = SQRT_MU_TIE;
+        j[(m - 1, 7)] = SQRT_MU_TIE;
         j
     };
 
+    // Coordinates are normalized (field radius ~1, residuals ~1e-4), so the
+    // relative tolerances are scale-free. The joint (cx, cy, γ, p1, p2) fit
+    // has a long shallow valley; give LM room to walk it — numeris returns
+    // a hard error (discarding the iterate) when max_iter is hit.
     let settings = LmSettings::<f64> {
-        max_iter: 50,
+        max_iter: 500,
+        f_tol: 1e-11,
+        x_tol: 1e-11,
         ..LmSettings::default()
     };
     let result = least_squares_lm_dyn(residual, jacobian, x0, &settings).map_err(|_| ())?;
     Ok((result.x, result.iterations as u32))
 }
 
-/// Per-point Euclidean residual under the current Brown-Conrady model
-/// (centered radial + tangential).
-#[allow(clippy::too_many_arguments)]
-fn centered_radial_residuals(
-    points: &[MatchedPoint],
-    cx: f64,
-    cy: f64,
-    k1: f64,
-    k2: f64,
-    k3: f64,
-    p1: f64,
-    p2: f64,
-) -> Vec<f64> {
-    points
-        .iter()
-        .map(|p| {
-            let xn = p.x_ideal - cx;
-            let yn = p.y_ideal - cy;
-            let r2 = xn * xn + yn * yn;
-            let r4 = r2 * r2;
-            let r6 = r2 * r4;
-            let s = k1 * r2 + k2 * r4 + k3 * r6;
-            let dx_t = 2.0 * p1 * xn * yn + p2 * (r2 + 2.0 * xn * xn);
-            let dy_t = p1 * (r2 + 2.0 * yn * yn) + 2.0 * p2 * xn * yn;
-            let rx = (p.x_obs - p.x_ideal) - (xn * s + dx_t);
-            let ry = (p.y_obs - p.y_ideal) - (yn * s + dy_t);
-            (rx * rx + ry * ry).sqrt()
-        })
-        .collect()
+/// Root-mean-square of the masked-in per-point residuals.
+pub(super) fn masked_rms(residuals: &[f64], mask: &[bool]) -> f64 {
+    let mut sum_sq = 0.0_f64;
+    let mut n = 0usize;
+    for (&r, &m) in residuals.iter().zip(mask) {
+        if m {
+            sum_sq += r * r;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        0.0
+    } else {
+        (sum_sq / n as f64).sqrt()
+    }
 }
 
 /// Like [`compute_corrected_rmse`] but applies an optional crpix shift
@@ -740,6 +833,7 @@ pub fn fit_polynomial_distortion(
         return DistortionFitResult {
             model: Distortion::None,
             crpix: None,
+            focal_scale: 1.0,
             rmse_before_px: 0.0,
             rmse_after_px: 0.0,
             n_inliers: 0,
@@ -762,6 +856,7 @@ pub fn fit_polynomial_distortion(
         return DistortionFitResult {
             model: Distortion::None,
             crpix: None,
+            focal_scale: 1.0,
             rmse_before_px: rmse_raw,
             rmse_after_px: rmse_raw,
             n_inliers: n,
@@ -795,6 +890,7 @@ pub fn fit_polynomial_distortion(
     DistortionFitResult {
         model: dist,
         crpix: None,
+        focal_scale: 1.0,
         rmse_before_px: rmse_before,
         rmse_after_px: rmse_after,
         n_inliers,
@@ -1057,5 +1153,137 @@ mod tests {
             true_k2,
         );
         assert!(k3.abs() < 1e-18, "k3: fitted={:.3e}, expected ~0", k3);
+    }
+
+    /// The joint fit must separate a pure focal-scale error (wrong anchor
+    /// focal length) from lens distortion: `gamma` recovers the scale and
+    /// the rescaled Brown-Conrady coefficients stay ~0.
+    #[test]
+    fn test_fit_radial_recovers_focal_scale() {
+        let true_gamma = 1.009; // ~1% focal-length error, as seen on TESS
+
+        let mut points = Vec::new();
+        for ix in -5..=5 {
+            for iy in -5..=5 {
+                let x_ideal = ix as f64 * 100.0;
+                let y_ideal = iy as f64 * 100.0;
+                points.push(MatchedPoint {
+                    x_obs: x_ideal * true_gamma,
+                    y_obs: y_ideal * true_gamma,
+                    x_ideal,
+                    y_ideal,
+                });
+            }
+        }
+
+        let config = DistortionFitConfig::default();
+        let fit = fit_radial_centered_sigma_clip(&points, &config);
+
+        assert!(
+            (fit.gamma - true_gamma).abs() < 1e-6,
+            "gamma: fitted={:.8}, true={:.8}",
+            fit.gamma,
+            true_gamma,
+        );
+        let model = fit.rescaled_model();
+        // Residual lens distortion in the rescaled model must be far below
+        // a centroid width well into the field.
+        let (xd, yd) = model.distort(500.0, 500.0);
+        assert!(
+            (xd - 500.0).abs() < 1e-3 && (yd - 500.0).abs() < 1e-3,
+            "rescaled model not ~identity: distort(500, 500) = ({xd}, {yd})",
+        );
+    }
+
+    /// Focal scale and genuine radial distortion fit jointly without
+    /// trading off.
+    #[test]
+    fn test_fit_radial_scale_and_distortion_jointly() {
+        let true_gamma = 0.995;
+        let true_k1 = -7e-9;
+        let true_distortion = RadialDistortion::new(true_k1, 0.0, 0.0);
+
+        let mut points = Vec::new();
+        for ix in -7..=7 {
+            for iy in -7..=7 {
+                let x_ideal = ix as f64 * 100.0;
+                let y_ideal = iy as f64 * 100.0;
+                let (xd, yd) = true_distortion.distort(x_ideal, y_ideal);
+                points.push(MatchedPoint {
+                    x_obs: xd * true_gamma,
+                    y_obs: yd * true_gamma,
+                    x_ideal,
+                    y_ideal,
+                });
+            }
+        }
+
+        let config = DistortionFitConfig::default();
+        let fit = fit_radial_centered_sigma_clip(&points, &config);
+
+        assert!(
+            (fit.gamma - true_gamma).abs() < 1e-5,
+            "gamma: fitted={:.8}, true={:.8}",
+            fit.gamma,
+            true_gamma,
+        );
+        assert!(
+            (fit.k1 - true_k1).abs() < 1e-11,
+            "k1: fitted={:.6e}, true={:.6e}",
+            fit.k1,
+            true_k1,
+        );
+    }
+
+    /// Mosaic-camera geometry: the optical axis (distortion center) sits
+    /// near a CCD corner, ~1.5 field-radii from the image center — the TESS
+    /// situation. The unregularized center must travel there, and the joint
+    /// fit must still recover scale and distortion.
+    #[test]
+    fn test_fit_radial_mosaic_corner_center() {
+        let true_gamma = 1.009;
+        let (true_cx, true_cy) = (-1100.0, -1080.0);
+        let true_d = RadialDistortion::with_tangential(-5e-9, 1e-15, -1e-21, 1e-7, -2e-7);
+
+        let mut points = Vec::new();
+        let mut k = 0u32;
+        for ix in -31..=31 {
+            for iy in -31..=31 {
+                let x_ideal = ix as f64 * 33.0 + (k % 17) as f64; // break grid symmetry
+                let y_ideal = iy as f64 * 33.0 + (k % 13) as f64;
+                k += 1;
+                let (dx, dy) = true_d.distort(x_ideal - true_cx, y_ideal - true_cy);
+                points.push(MatchedPoint {
+                    x_obs: true_cx + true_gamma * dx,
+                    y_obs: true_cy + true_gamma * dy,
+                    x_ideal,
+                    y_ideal,
+                });
+            }
+        }
+
+        let config = DistortionFitConfig::default();
+        let fit = fit_radial_centered_sigma_clip(&points, &config);
+
+        let resid = intrinsics_residuals(
+            &points,
+            &[
+                fit.cx, fit.cy, fit.gamma, fit.k1, fit.k2, fit.k3, fit.p1, fit.p2,
+            ],
+        );
+        let rms = masked_rms(&resid, &fit.mask);
+        assert!(rms < 0.01, "rms {rms:.4} px on noiseless synthetic data");
+        assert!(
+            (fit.gamma - true_gamma).abs() < 1e-4,
+            "gamma: fitted={:.8}, true={:.8}",
+            fit.gamma,
+            true_gamma,
+        );
+        assert!(
+            (fit.cx - true_cx).abs() < 20.0 && (fit.cy - true_cy).abs() < 20.0,
+            "center: fitted=({:.1}, {:.1}), true=({true_cx}, {true_cy})",
+            fit.cx,
+            fit.cy,
+        );
     }
 }
