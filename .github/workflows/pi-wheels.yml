@@ -1,0 +1,79 @@
+name: Pi wheels
+
+# Builds Cortex-A53-tuned aarch64 wheels (Raspberry Pi Zero 2 W and
+# similar) and attaches them to the GitHub release for the tag. These
+# complement the generic aarch64 wheels published to PyPI: same code,
+# but compiled with -C target-cpu=cortex-a53 for the Pi's in-order core.
+# Downstream consumers install them from the release URL.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to attach wheels to (blank = build only)"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    name: Build Cortex-A53 wheels
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pypa/cibuildwheel@v3.3
+        env:
+          CIBW_ARCHS: aarch64
+          CIBW_BUILD: "cp311-manylinux_aarch64 cp312-manylinux_aarch64 cp313-manylinux_aarch64"
+          # pyproject's [tool.cibuildwheel.linux] environment table would
+          # override this, so restate PATH alongside the tuning flags.
+          CIBW_ENVIRONMENT: >-
+            PATH="$HOME/.cargo/bin:$PATH"
+            RUSTFLAGS="-C target-cpu=cortex-a53"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pi-wheels
+          path: ./wheelhouse/*.whl
+          if-no-files-found: error
+
+  release:
+    name: Attach wheels to release
+    needs: build
+    runs-on: ubuntu-latest
+    if: >
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: resolve tag name
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: attach wheels
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          files: dist/*.whl
+          body: |
+            The attached aarch64 wheels are compiled with
+            `-C target-cpu=cortex-a53` for Raspberry Pi-class devices.
+            For generic installs use PyPI: `pip install tetra3rs`.
+          generate_release_notes: true
+          draft: false
+          # Hyphenated tags (branch/test builds) are prereleases: excluded
+          # from "latest", so consumers only get them when selected explicitly.
+          prerelease: ${{ contains(steps.tag.outputs.name, '-') }}
