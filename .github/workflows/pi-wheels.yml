@@ -21,7 +21,7 @@ jobs:
     name: Build Cortex-A53 wheels
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: pypa/cibuildwheel@v3.3
         env:
@@ -33,7 +33,7 @@ jobs:
             PATH="$HOME/.cargo/bin:$PATH"
             RUSTFLAGS="-C target-cpu=cortex-a53"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: pi-wheels
           path: ./wheelhouse/*.whl
@@ -49,7 +49,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -64,7 +64,7 @@ jobs:
           fi
 
       - name: attach wheels
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.name }}
           files: dist/*.whl
