@@ -14,33 +14,7 @@ Given a set of star centroids extracted from a camera image, tetra3rs identifies
 **Documentation:** For tutorials, concept guides, and Python API reference, see the [tetra3rs documentation](https://tetra3rs.dev/). For Rust API docs, see [docs.rs](https://docs.rs/tetra3).
 
 > [!IMPORTANT]
-> **Status: Alpha** — The core solver is based on well-vetted algorithms but has only been tested against a limited set of images. The API is not yet stable and may change between releases.  Having said that, I've made it work on both low-SNR images taken with a camera in my backyard and with high-star-density images from more-complex telescopes.
-
-> [!CAUTION]
-> **Database format change in 0.7.0 — older databases will not load.**
-> The solver database serialization format moved from rkyv to
-> [postcard](https://docs.rs/postcard) and the on-disk extension changed
-> from `.rkyv` to `.bin`. **Existing `.rkyv` files saved by 0.6.x or
-> earlier — both `SolverDatabase` and `CameraModel` — must be
-> regenerated.** Pickled `tetra3rs` objects from older wheels will also
-> fail to unpickle.
->
-> Regenerate solver databases with `SolverDatabase::generate_from_gaia(...)`
-> in Rust, or `tetra3rs.SolverDatabase.generate_from_gaia(...)` in Python.
-> The bundled [`gaia-catalog`](https://pypi.org/project/gaia-catalog/)
-> PyPI package handles this transparently for Python users — first solve
-> after upgrading regenerates the cached database automatically.
-
-> [!WARNING]
-> **Other 0.7.0 breaking changes.** The Rust `SolverDatabase::pattern_catalog`
-> field is now a flat `PatternCatalog` (the rkyv-era sharding workaround
-> was removed); `RadialDistortion` gained `p1, p2` tangential coefficients
-> (full Brown-Conrady); `CalibrateConfig::polynomial_order` was replaced
-> by `model: DistortionModelType`; the public Rust function
-> `extract_centroids(path, ...)` was removed in favor of
-> `extract_centroids_from_image(...)`. See [CHANGELOG.md](CHANGELOG.md)
-> for the full list.
-
+> **Status: Alpha** — The core solver is based on well-vetted algorithms and has been validated against both real low-SNR images taken with a camera in my backyard and high-star-density images from more-complex telescopes (plus synthetic SkyView and NASA TESS multi-sector data). The API is not yet stable and may change between releases. See [CHANGELOG.md](CHANGELOG.md) for breaking changes per release.
 
 ## Features
 
@@ -53,7 +27,7 @@ Given a set of star centroids extracted from a camera image, tetra3rs identifies
 - **Compact binary databases** — databases serialize with [postcard](https://docs.rs/postcard) in a portable, lightweight format with no offset-size limit, so wide-FOV-range multiscale databases of any size load cleanly
 - **Centroid extraction** — detect stars from in-memory pixel data with local background subtraction, connected-component labeling, and quadratic sub-pixel peak refinement. Accepts an already-decoded `image::DynamicImage` or a raw `&[f32]` pixel buffer (requires the `image` feature)
 - **Camera model** — unified intrinsics struct (focal length, optical center, parity, distortion) used throughout the pipeline
-- **Distortion calibration** — fit either a SIP polynomial or a Brown-Conrady radial `(k1, k2, k3)` distortion model from one or more solved images via `calibrate_camera`, with alternating per-image WCS refinement and global LS fit (the OpenCV / Zhang's-method shape for radial)
+- **Distortion calibration** — fit either a SIP polynomial or a standard camera-intrinsics model (free optical center, focal scale, and full Brown-Conrady `k1, k2, k3, p1, p2` — the same parameter set as OpenCV's `calibrateCamera`) from one or more solved images via `calibrate_camera`, with alternating per-image WCS refinement and global sigma-clipped LS fit. Handles mosaic cameras (e.g. TESS) where the optical axis sits far off the detector
 - **WCS output** — solve results include FITS-standard WCS fields (CD matrix, CRVAL) and pixel↔sky coordinate conversion methods
 - **Stellar aberration** — optional correction for the ~20" apparent shift in star positions caused by the observer's barycentric velocity, with a built-in convenience function for Earth's barycentric velocity
 
@@ -84,7 +58,7 @@ pip install .
 
 
 > [!NOTE]
-> All Python objects (`SolverDatabase`, `CameraModel`, `SolveResult`, `CalibrateResult`, `ExtractionResult`, `Centroid`, `RadialDistortion`, `PolynomialDistortion`) support `pickle` serialization via [postcard](https://docs.rs/postcard).
+> All Python objects (`SolverDatabase`, `CameraModel`, `SolveResult`, `SolveFailure`, `CalibrateResult`, `ExtractionResult`, `Centroid`, `RadialDistortion`, `PolynomialDistortion`) support `pickle` serialization via [postcard](https://docs.rs/postcard).
 
 ## Quick start
 

@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+## 0.8.0
+
+> **Note on serialized artifacts.** 0.8.0 changes the on-the-wire format of
+> several public types, so binary databases and pickles saved by 0.7.x do not
+> load: `SolveResult` (now `Result<Solution, SolveFailure>`) and any
+> `RadialDistortion` / `CameraModel` (new `RadialDistortion::center` field).
+> Regenerate databases and re-pickle results after upgrading.
+
+### Added
+
+- **Fast single-pass centroid extractor — an "adequate star tracker" path.**
+  `extract_centroids_fast` (Rust + Python) / `FastCentroidConfig` reads each
+  pixel once: a cheap subsampled pre-pass builds a coarse background grid, then
+  a single raster sweep thresholds against the interpolated background and
+  groups lit pixels into connected regions via run-length + union-find,
+  accumulating intensity-weighted moments inline and emitting one center-of-mass
+  per region (with an optional 3×3 parabola peak refine). No convolution and no
+  second pass, so it is memory-bandwidth-bound: **~4–5× faster** than the
+  connected-component path single-threaded on 2048² TESS frames (~26–32 ms vs
+  ~126 ms), with equal solve accuracy and ~0.1 px centroid agreement on bright
+  stars. It trades faint-star sensitivity and tight sub-pixel accuracy for
+  speed; `extract_centroids` / `extract_centroids_from_raw` stay the default and
+  the right choice for calibration and faint-star work. Returns the same
+  `ExtractionResult`, so it is a drop-in for `solve_from_centroids`.
+
 ### Changed
 
 - **Radial calibration rewritten as a standard camera-intrinsics fit
