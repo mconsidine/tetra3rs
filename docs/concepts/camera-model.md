@@ -9,7 +9,7 @@ The `CameraModel` encapsulates the mapping between pixel coordinates and tangent
 | `focal_length_px` | Focal length in pixels (= image_width / (2 × tan(FOV/2))) |
 | `image_width` | Image width in pixels |
 | `image_height` | Image height in pixels |
-| `crpix` | Optical center offset from image center `[x, y]` in pixels |
+| `crpix` | Projection-origin offset from the geometric image center `[x, y]` in pixels (default `[0, 0]`; *not* the distortion/optical center) |
 | `parity_flip` | Whether the image x-axis is mirrored |
 | `distortion` | Optional `RadialDistortion` or `PolynomialDistortion` model |
 

@@ -13,9 +13,10 @@ use numeris::Vector3;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::time::Instant;
 use tetra3::{
-    CalibrateConfig, CentroidExtractionConfig, DistortionModelType, GenerateDatabaseConfig,
-    SolveConfig, SolverDatabase,
+    extract_centroids_fast, CalibrateConfig, CentroidExtractionConfig, DistortionModelType,
+    FastCentroidConfig, GenerateDatabaseConfig, SolveConfig, SolverDatabase,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -401,8 +402,12 @@ fn test_tess_fits_solve() {
         // Compute true boresight from the WCS at the center of the science region.
         // The science region starts at column 44 in the full frame, so the center
         // pixel in full-frame coordinates is (44 + sci_width/2, sci_height/2).
-        let center_x = 44.0 + sci_width as f64 / 2.0;
-        let center_y = sci_height as f64 / 2.0;
+        // Geometric center of the trimmed science region in full-frame
+        // 0-indexed coords: region spans columns [44, 44+sci_width-1], rows
+        // [0, sci_height-1], so the center is (W-1)/2 — matching tetra3rs's
+        // centroid origin (issue #28).
+        let center_x = 44.0 + (sci_width - 1) as f64 / 2.0;
+        let center_y = (sci_height - 1) as f64 / 2.0;
         let (boresight_ra, boresight_dec) = pixel_to_radec(image_hdu, center_x, center_y);
         let true_boresight = radec_to_uvec(boresight_ra, boresight_dec);
 
@@ -543,6 +548,159 @@ fn test_tess_fits_solve() {
     );
     println!("══════════════════════════════════════════════════════════════");
     assert_eq!(failed, 0, "{} TESS solve tests failed", failed);
+}
+
+/// Benchmark: fast single-pass centroid path vs. the connected-component path
+/// on real TESS frames — speed, centroid-position agreement, end-to-end solve.
+///
+/// `#[ignore]` (timing/diagnostic, not a pass/fail gate). Run with:
+///   cargo test --test tess_solve_test --features image -- --ignored --nocapture bench_fast_vs_ccl
+/// Add `--features image,parallel` to time the multi-threaded blurs.
+#[test]
+#[ignore]
+fn bench_fast_vs_ccl_extraction() {
+    const REPS: u32 = 5;
+
+    for tc in TESS_TEST_CASES {
+        test_data::ensure_test_file(&format!("data/tess_test_images/{}", tc.filename));
+    }
+    let db = build_tess_database();
+
+    println!("\n══════════════════════════════════════════════════════════════");
+    println!("Fast single-pass vs. connected-component centroid extraction (best of {REPS})");
+    println!("══════════════════════════════════════════════════════════════");
+
+    for tc in TESS_TEST_CASES {
+        let fits_path = format!("data/tess_test_images/{}", tc.filename);
+        let hdus = read_fits_hdus(&fits_path);
+        let image_hdu = &hdus[1];
+        let naxis1 = match image_hdu.headers.get("NAXIS1") {
+            Some(FitsValue::Int(n)) => *n as u32,
+            _ => panic!("Missing NAXIS1"),
+        };
+        let naxis2 = match image_hdu.headers.get("NAXIS2") {
+            Some(FitsValue::Int(n)) => *n as u32,
+            _ => panic!("Missing NAXIS2"),
+        };
+        let pixels = read_f32_image(&fits_path, image_hdu);
+        let (trimmed, sci_width, sci_height) = trim_tess_science_region(&pixels, naxis1, naxis2);
+        let clean: Vec<f32> = trimmed
+            .iter()
+            .map(|&v| if v.is_finite() { v } else { 0.0 })
+            .collect();
+
+        // Geometric center of the trimmed science region in full-frame
+        // 0-indexed coords: region spans columns [44, 44+sci_width-1], rows
+        // [0, sci_height-1], so the center is (W-1)/2 — matching tetra3rs's
+        // centroid origin (issue #28).
+        let center_x = 44.0 + (sci_width - 1) as f64 / 2.0;
+        let center_y = (sci_height - 1) as f64 / 2.0;
+        let (b_ra, b_dec) = pixel_to_radec(image_hdu, center_x, center_y);
+        let true_boresight = radec_to_uvec(b_ra, b_dec);
+
+        let ccl_config = CentroidExtractionConfig {
+            sigma_threshold: 250.0,
+            min_pixels: 3,
+            max_pixels: 10000,
+            local_bg_block_size: Some(128),
+            max_elongation: Some(30.0),
+            ..Default::default()
+        };
+        // Single-pass detector: threshold in noise-σ above a coarse-grid
+        // background (independent of the ~250-DN raw threshold above).
+        let fast_config = FastCentroidConfig {
+            sigma_threshold: 8.0,
+            bg_grid: 128,
+            min_pixels: 3,
+            max_centroids: None,
+        };
+
+        let best = |f: &dyn Fn() -> usize| -> (f64, usize) {
+            let mut best_ms = f64::INFINITY;
+            let mut n = 0;
+            for _ in 0..REPS {
+                let t = Instant::now();
+                n = f();
+                best_ms = best_ms.min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            (best_ms, n)
+        };
+
+        let ccl = tetra3::extract_centroids_from_raw(&clean, sci_width, sci_height, &ccl_config)
+            .expect("ccl extract");
+        let fast = extract_centroids_fast(&clean, sci_width, sci_height, &fast_config)
+            .expect("fast extract");
+
+        let (ccl_ms, _) = best(&|| {
+            tetra3::extract_centroids_from_raw(&clean, sci_width, sci_height, &ccl_config)
+                .unwrap()
+                .centroids
+                .len()
+        });
+        let (fast_ms, _) = best(&|| {
+            extract_centroids_fast(&clean, sci_width, sci_height, &fast_config)
+                .unwrap()
+                .centroids
+                .len()
+        });
+
+        // Cross-match: nearest CCL centroid to each fast centroid, ≤ 2 px.
+        let mut deltas: Vec<f32> = Vec::new();
+        for f in &fast.centroids {
+            let mut best_d = f32::INFINITY;
+            for c in &ccl.centroids {
+                let d = ((f.x - c.x).powi(2) + (f.y - c.y).powi(2)).sqrt();
+                best_d = best_d.min(d);
+            }
+            if best_d <= 2.0 {
+                deltas.push(best_d);
+            }
+        }
+        deltas.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let (median_d, max_d) = if deltas.is_empty() {
+            (f32::NAN, f32::NAN)
+        } else {
+            (deltas[deltas.len() / 2], *deltas.last().unwrap())
+        };
+
+        let solve_config = SolveConfig {
+            fov_max_error_rad: Some((2.0_f32).to_radians()),
+            match_radius: 0.005,
+            match_threshold: 1e-5,
+            solve_timeout_ms: Some(60_000),
+            match_max_error: None,
+            ..SolveConfig::new((12.0_f32).to_radians(), sci_width, sci_height)
+        };
+        let boresight_err_arcmin = |cents: &[tetra3::Centroid]| -> Option<f32> {
+            let sol = db.solve_from_centroids(cents, &solve_config).ok()?;
+            let bs = sol.qicrs2cam.inverse() * Vector3::from_array([0.0, 0.0, 1.0]);
+            Some(angular_separation(&bs, &true_boresight).to_degrees() * 60.0)
+        };
+        let ccl_err = boresight_err_arcmin(&ccl.centroids);
+        let fast_err = boresight_err_arcmin(&fast.centroids);
+
+        println!("\n{} ({}×{})", tc.filename, sci_width, sci_height);
+        println!(
+            "  CCL : {:6.1} ms   {:4} centroids   solve {}",
+            ccl_ms,
+            ccl.centroids.len(),
+            ccl_err.map_or("FAIL".into(), |e| format!("{e:.2}' err")),
+        );
+        println!(
+            "  Fast: {:6.1} ms   {:4} centroids   solve {}",
+            fast_ms,
+            fast.centroids.len(),
+            fast_err.map_or("FAIL".into(), |e| format!("{e:.2}' err")),
+        );
+        println!(
+            "  speedup {:.2}×   |   {} matched ≤2px: median Δ {:.3} px, max {:.3} px",
+            ccl_ms / fast_ms,
+            deltas.len(),
+            median_d,
+            max_d,
+        );
+    }
+    println!("══════════════════════════════════════════════════════════════");
 }
 
 /// Test the polynomial distortion fitting pipeline on TESS images.
@@ -695,8 +853,8 @@ fn test_tess_distortion_fit_and_center_accuracy() {
         let (solved_ra, solved_dec) = solution_dist.pixel_to_world(0.0, 0.0);
 
         // Center of science region in full-frame 0-indexed coordinates
-        let center_x_ff = 44.0 + sci_width as f64 / 2.0;
-        let center_y_ff = sci_height as f64 / 2.0;
+        let center_x_ff = 44.0 + (sci_width - 1) as f64 / 2.0;
+        let center_y_ff = (sci_height - 1) as f64 / 2.0;
         let (wcs_ra, wcs_dec) = pixel_to_radec(image_hdu, center_x_ff, center_y_ff);
 
         let sep_arcmin = angular_separation(
@@ -1027,8 +1185,8 @@ fn test_tess_multi_image_calibration() {
 
         let (solved_ra, solved_dec) = solution.pixel_to_world(0.0, 0.0);
 
-        let center_x_ff = 44.0 + img.sci_width as f64 / 2.0;
-        let center_y_ff = img.sci_height as f64 / 2.0;
+        let center_x_ff = 44.0 + (img.sci_width - 1) as f64 / 2.0;
+        let center_y_ff = (img.sci_height - 1) as f64 / 2.0;
         let (wcs_ra, wcs_dec) = pixel_to_radec(&hdu_for_wcs, center_x_ff, center_y_ff);
 
         let sep_arcsec = angular_separation(

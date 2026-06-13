@@ -121,6 +121,18 @@ impl PySolverDatabase {
 
     /// Solve for camera attitude given star centroids.
     ///
+    /// Runs **lost-in-space** (pattern-hash search) by default, or **tracking**
+    /// (direct correspondence from a prior estimate) when ``attitude_hint`` is
+    /// given — with automatic fallback to lost-in-space. Arguments group by
+    /// which mode reads them; arguments for one mode are ignored in the other:
+    ///
+    /// * **Both modes:** ``camera_model`` / ``fov_estimate_*`` / ``image_*``,
+    ///   ``match_radius``, ``match_threshold``, ``solve_timeout_ms``,
+    ///   ``observer_velocity_km_s``.
+    /// * **Lost-in-space only:** ``fov_max_error``, ``match_max_error``.
+    /// * **Tracking only** (ignored unless ``attitude_hint`` is set):
+    ///   ``attitude_hint``, ``hint_uncertainty_*``, ``strict_hint``.
+    ///
     /// Args:
     ///     centroids: Either a list of Centroid objects (from extract_centroids),
     ///         or an Nx2/Nx3 numpy array of centroid positions in pixels.

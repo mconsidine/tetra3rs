@@ -683,6 +683,18 @@ class SolverDatabase:
     ) -> Union[SolveResult, SolveFailure]:
         """Solve for camera attitude given star centroids.
 
+        Runs **lost-in-space** (pattern-hash search) by default, or **tracking**
+        (direct correspondence from a prior estimate) when ``attitude_hint`` is
+        given — with automatic fallback to lost-in-space. The arguments group by
+        which mode reads them; arguments for one mode are ignored in the other:
+
+        * **Both modes:** ``camera_model`` / ``fov_estimate_*`` / ``image_*``,
+          ``match_radius``, ``match_threshold``, ``solve_timeout_ms``,
+          ``observer_velocity_km_s``.
+        * **Lost-in-space only:** ``fov_max_error_*``, ``match_max_error``.
+        * **Tracking only** (ignored unless ``attitude_hint`` is set):
+          ``attitude_hint``, ``hint_uncertainty_*``, ``strict_hint``.
+
         Args:
             centroids: Either a list of Centroid objects (from extract_centroids),
                 or an Nx2/Nx3 numpy array of centroid positions in pixels.
@@ -701,11 +713,13 @@ class SolverDatabase:
             fov_max_error_deg: Maximum FOV error in degrees. None = no limit.
             fov_max_error_rad: Maximum FOV error in radians. None = no limit.
                 At most one of fov_max_error_deg or fov_max_error_rad can be provided.
+                Lost-in-space only — tracking takes its scale from the hint.
             match_radius: Match distance as fraction of FOV.
             match_threshold: False-positive probability threshold.
             solve_timeout_ms: Timeout in milliseconds. None = no timeout.
             match_max_error: Maximum edge-ratio error. None = use database value.
                 Values below the database's pattern quantization error are clamped up to it.
+                Lost-in-space only — tracking does not use the pattern hash.
             camera_model: A CameraModel specifying focal length, image
                 dimensions, optical center, distortion, and parity. When
                 provided it is the single source of camera geometry
@@ -1115,6 +1129,38 @@ def extract_centroids(
             (in pixels) before thresholding. Boosts point-source SNR; used
             only to form the detection mask so photometry is unaffected.
             Consider lowering sigma_threshold when enabled. None = disabled.
+
+    Returns:
+        ExtractionResult with centroids and image statistics.
+    """
+    ...
+
+def extract_centroids_fast(
+    image: npt.NDArray,
+    sigma_threshold: float = 5.0,
+    bg_grid: int = 64,
+    min_pixels: int = 2,
+    max_centroids: Optional[int] = None,
+) -> ExtractionResult:
+    """Fast single-pass centroid extraction — the "adequate star tracker" path.
+
+    Reads each pixel once (coarse-grid background + run-length connected-
+    component moments), so it is several times faster than
+    :func:`extract_centroids` — at the cost of faint-star sensitivity and
+    sub-pixel accuracy (~0.1 px on bright stars). Use :func:`extract_centroids`
+    for calibration or faint-star work. Returns the same ``ExtractionResult``,
+    so it is a drop-in for ``solve_from_centroids``.
+
+    Args:
+        image: 2D numpy array (height x width) of pixel values.
+            Supported dtypes: float64, float32, uint16, int16, uint8.
+        sigma_threshold: Detection threshold in noise sigmas above the local
+            background.
+        bg_grid: Coarse background-grid block size in pixels (tracks gradients
+            such as vignetting / Milky Way).
+        min_pixels: Minimum pixels in a region; rejects hot pixels.
+        max_centroids: Maximum number of centroids to return, brightest first.
+            None = all.
 
     Returns:
         ExtractionResult with centroids and image statistics.

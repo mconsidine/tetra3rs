@@ -107,10 +107,12 @@ class TestTessMultiImageCalibration:
             # Compare center pixel against FITS WCS
             solved_ra, solved_dec = result.pixel_to_world(0.0, 0.0)
 
-            # FITS WCS reference: center of the 2048x2048 science region
-            # in full-frame coords is (44 + 1024, 1024)
+            # FITS WCS reference: geometric center of the 2048x2048 science
+            # region (pixel-center origin (W-1)/2, issue #28) in full-frame
+            # 0-indexed coords is (44 + 1023.5, 1023.5) — matching the origin of
+            # pixel_to_world(0, 0) above.
             wcs_ra, wcs_dec = fits_pixel_to_radec(
-                headers, 44.0 + sci_size / 2.0, sci_size / 2.0
+                headers, 44.0 + (sci_size - 1) / 2.0, (sci_size - 1) / 2.0
             )
             sep = angular_sep_deg(solved_ra, solved_dec, wcs_ra, wcs_dec) * 3600
 
@@ -257,8 +259,9 @@ class TestTessMultiImageCalibration:
         for result, headers, sector in zip(results, all_headers, sectors):
             rmse = result.rmse_arcsec
             solved_ra, solved_dec = result.pixel_to_world(0.0, 0.0)
+            # Geometric center (W-1)/2 (issue #28), matching pixel_to_world(0, 0).
             wcs_ra, wcs_dec = fits_pixel_to_radec(
-                headers, 44.0 + sci_size / 2.0, sci_size / 2.0
+                headers, 44.0 + (sci_size - 1) / 2.0, (sci_size - 1) / 2.0
             )
             sep = angular_sep_deg(solved_ra, solved_dec, wcs_ra, wcs_dec) * 3600
             print(

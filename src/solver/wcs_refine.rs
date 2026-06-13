@@ -122,30 +122,6 @@ pub fn cd_from_theta(theta: f64, pixel_scale: f64, parity_flip: bool) -> [[f64; 
     }
 }
 
-/// Decompose a CD matrix into rotation angle, pixel scale (x and y), and parity.
-///
-/// Returns `(theta_rad, scale_x, scale_y, parity_flip)`.
-#[cfg(test)]
-pub fn decompose_cd(cd: &[[f64; 2]; 2]) -> (f64, f64, f64, bool) {
-    let det = cd[0][0] * cd[1][1] - cd[0][1] * cd[1][0];
-    let parity_flip = det < 0.0;
-
-    // Scale = norm of each column
-    let scale_x = (cd[0][0] * cd[0][0] + cd[1][0] * cd[1][0]).sqrt();
-    let scale_y = (cd[0][1] * cd[0][1] + cd[1][1] * cd[1][1]).sqrt();
-
-    // Rotation angle from the first column (observed +X direction).
-    // For no parity: CD11 = ps*cos θ,  CD21 = ps*sin θ
-    // For parity:    CD11 = -ps*cos θ, CD21 = -ps*sin θ  (CD = ps·R(θ)·diag(−1,1))
-    let theta = if parity_flip {
-        (-cd[1][0]).atan2(-cd[0][0])
-    } else {
-        cd[1][0].atan2(cd[0][0])
-    };
-
-    (theta, scale_x, scale_y, parity_flip)
-}
-
 // ── 3×3 linear solve ────────────────────────────────────────────────────────
 
 /// Solve a 3×3 linear system `Ax = b` via Gaussian elimination with partial pivoting.
@@ -1198,16 +1174,21 @@ mod tests {
         let ps = 1.7e-5;
         let cd = cd_from_theta(theta, ps, false);
 
-        // det should be positive
+        // det positive (proper rotation), and CD == ps·R(θ) element-wise.
         let det = cd[0][0] * cd[1][1] - cd[0][1] * cd[1][0];
         assert!(det > 0.0);
-
-        // Decompose should recover theta and scale
-        let (t, sx, sy, parity) = decompose_cd(&cd);
-        assert!(!parity);
-        assert!((t - theta).abs() < 1e-12, "theta: {:.6} vs {:.6}", t, theta);
-        assert!((sx - ps).abs() < 1e-18, "scale_x: {:.6e} vs {:.6e}", sx, ps);
-        assert!((sy - ps).abs() < 1e-18, "scale_y: {:.6e} vs {:.6e}", sy, ps);
+        let (c, s) = (theta.cos(), theta.sin());
+        let expected = [[ps * c, -ps * s], [ps * s, ps * c]];
+        for i in 0..2 {
+            for j in 0..2 {
+                assert!(
+                    (cd[i][j] - expected[i][j]).abs() < 1e-18,
+                    "CD[{i}][{j}]: {:.6e} vs {:.6e}",
+                    cd[i][j],
+                    expected[i][j]
+                );
+            }
+        }
     }
 
     #[test]
@@ -1216,15 +1197,21 @@ mod tests {
         let ps = 2.0e-5;
         let cd = cd_from_theta(theta, ps, true);
 
-        // det should be negative
+        // det negative (mirror), and CD == ps·R(θ)·diag(−1, 1) element-wise.
         let det = cd[0][0] * cd[1][1] - cd[0][1] * cd[1][0];
         assert!(det < 0.0);
-
-        let (t, sx, sy, parity) = decompose_cd(&cd);
-        assert!(parity);
-        assert!((t - theta).abs() < 1e-12);
-        assert!((sx - ps).abs() < 1e-18);
-        assert!((sy - ps).abs() < 1e-18);
+        let (c, s) = (theta.cos(), theta.sin());
+        let expected = [[-ps * c, -ps * s], [-ps * s, ps * c]];
+        for i in 0..2 {
+            for j in 0..2 {
+                assert!(
+                    (cd[i][j] - expected[i][j]).abs() < 1e-18,
+                    "CD[{i}][{j}]: {:.6e} vs {:.6e}",
+                    cd[i][j],
+                    expected[i][j]
+                );
+            }
+        }
     }
 
     #[test]
@@ -1348,17 +1335,5 @@ mod tests {
             ang < 1e-6,
             "wcs_to_rotation disagrees with rotation_from_theta_crval by {ang:.2e} rad"
         );
-    }
-
-    #[test]
-    fn test_decompose_cd_identity_like() {
-        let ps = 1.5e-5;
-        // No rotation, no parity
-        let cd = [[ps, 0.0], [0.0, ps]];
-        let (theta, sx, sy, parity) = decompose_cd(&cd);
-        assert!(!parity);
-        assert!(theta.abs() < 1e-12);
-        assert!((sx - ps).abs() < 1e-18);
-        assert!((sy - ps).abs() < 1e-18);
     }
 }

@@ -2,7 +2,7 @@ use numpy::PyReadonlyArray2;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
-use tetra3::centroid_extraction::CentroidExtractionConfig;
+use tetra3::centroid_extraction::{CentroidExtractionConfig, FastCentroidConfig};
 
 use crate::centroid::PyCentroid;
 
@@ -243,6 +243,78 @@ pub(crate) fn extract_centroids(
 
     let result =
         tetra3::centroid_extraction::extract_centroids_from_raw(&pixels, width, height, &config)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+    let py_centroids: Vec<PyCentroid> = result
+        .centroids
+        .into_iter()
+        .map(|c| PyCentroid { inner: c })
+        .collect();
+
+    Ok(PyExtractionResult {
+        centroids: py_centroids,
+        image_width: width,
+        image_height: height,
+        background_mean: result.background_mean as f64,
+        background_sigma: result.background_sigma as f64,
+        threshold: result.threshold as f64,
+        num_blobs_raw: result.num_blobs_raw,
+    })
+}
+
+/// Fast single-pass centroid extraction — the "adequate star tracker" path.
+///
+/// Reads each pixel once: a cheap subsampled pre-pass builds a coarse
+/// background grid, then a single raster sweep thresholds against the
+/// interpolated background and groups lit pixels into connected regions
+/// (run-length + union-find), emitting one center-of-mass per region. No
+/// convolution and no second pass, so it is several times faster than
+/// :func:`extract_centroids` — at the cost of faint-star sensitivity and
+/// sub-pixel accuracy (~0.1 px on bright stars). Use :func:`extract_centroids`
+/// for calibration or faint-star work.
+///
+/// Returns the same ``ExtractionResult`` as :func:`extract_centroids`, so it
+/// is a drop-in for ``solve_from_centroids``.
+///
+/// Args:
+///     image: 2D numpy array (height x width) of pixel values.
+///         Supported dtypes: float64, float32, uint16, int16, uint8.
+///     sigma_threshold: Detection threshold in noise sigmas above the local
+///         background. Default 5.0.
+///     bg_grid: Coarse background-grid block size in pixels. Gradients
+///         (vignetting, Milky Way) are tracked via this grid. Default 64.
+///     min_pixels: Minimum pixels in a region (rejects hot pixels). Default 2.
+///     max_centroids: Maximum number of centroids to return, brightest first.
+///         None = all. A few dozen is plenty for solving / tracking.
+///
+/// Returns:
+///     ExtractionResult with centroids and image statistics.
+#[pyfunction]
+#[pyo3(signature = (
+    image,
+    sigma_threshold = 5.0,
+    bg_grid = 64,
+    min_pixels = 2,
+    max_centroids = None,
+))]
+pub(crate) fn extract_centroids_fast(
+    image: &Bound<'_, pyo3::PyAny>,
+    sigma_threshold: f32,
+    bg_grid: u32,
+    min_pixels: usize,
+    max_centroids: Option<usize>,
+) -> PyResult<PyExtractionResult> {
+    let (pixels, width, height) = image_to_f32(image)?;
+
+    let config = FastCentroidConfig {
+        sigma_threshold,
+        bg_grid,
+        min_pixels,
+        max_centroids,
+    };
+
+    let result =
+        tetra3::centroid_extraction::extract_centroids_fast(&pixels, width, height, &config)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
     let py_centroids: Vec<PyCentroid> = result

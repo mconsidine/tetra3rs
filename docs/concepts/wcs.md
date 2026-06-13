@@ -9,7 +9,7 @@ Every successful solve produces FITS-standard World Coordinate System (WCS) fiel
 | `cd_matrix` | 2×2 CD matrix (tangent-plane radians per pixel) |
 | `crval_ra_deg` | RA of the WCS reference point (degrees) |
 | `crval_dec_deg` | Dec of the WCS reference point (degrees) |
-| `crpix` | Optical center offset from image center `[x, y]` (pixels) |
+| `crpix` | Projection-origin offset from the geometric image center `[x, y]` (pixels; default `[0, 0]`) |
 
 The WCS uses a **gnomonic (TAN) projection** centered at `(CRVAL_RA, CRVAL_DEC)`.
 
@@ -21,7 +21,7 @@ $$
 \begin{pmatrix} \xi \\ \eta \end{pmatrix} = \mathbf{CD} \cdot \begin{pmatrix} \Delta x \\ \Delta y \end{pmatrix}
 $$
 
-where $\xi$ and $\eta$ are gnomonic tangent-plane coordinates in radians, and $(\Delta x, \Delta y)$ are pixel offsets from the optical center.
+where $\xi$ and $\eta$ are gnomonic tangent-plane coordinates in radians, and $(\Delta x, \Delta y)$ are pixel offsets from the projection origin (`crpix`, i.e. the geometric image center by default).
 
 The CD matrix encodes pixel scale, rotation, and any skew. For a camera with uniform pixel scale and no skew, the CD matrix elements give:
 
