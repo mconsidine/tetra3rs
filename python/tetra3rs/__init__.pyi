@@ -1121,6 +1121,38 @@ def extract_centroids(
     """
     ...
 
+def extract_centroids_fast(
+    image: npt.NDArray,
+    sigma_threshold: float = 5.0,
+    bg_grid: int = 64,
+    min_pixels: int = 2,
+    max_centroids: Optional[int] = None,
+) -> ExtractionResult:
+    """Fast single-pass centroid extraction — the "adequate star tracker" path.
+
+    Reads each pixel once (coarse-grid background + run-length connected-
+    component moments), so it is several times faster than
+    :func:`extract_centroids` — at the cost of faint-star sensitivity and
+    sub-pixel accuracy (~0.1 px on bright stars). Use :func:`extract_centroids`
+    for calibration or faint-star work. Returns the same ``ExtractionResult``,
+    so it is a drop-in for ``solve_from_centroids``.
+
+    Args:
+        image: 2D numpy array (height x width) of pixel values.
+            Supported dtypes: float64, float32, uint16, int16, uint8.
+        sigma_threshold: Detection threshold in noise sigmas above the local
+            background.
+        bg_grid: Coarse background-grid block size in pixels (tracks gradients
+            such as vignetting / Milky Way).
+        min_pixels: Minimum pixels in a region; rejects hot pixels.
+        max_centroids: Maximum number of centroids to return, brightest first.
+            None = all.
+
+    Returns:
+        ExtractionResult with centroids and image statistics.
+    """
+    ...
+
 def undistort_centroids(
     centroids: list[Centroid],
     distortion: Union[RadialDistortion, PolynomialDistortion],

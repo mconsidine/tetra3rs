@@ -11,16 +11,22 @@
 //!
 //! Requires the `image` feature to be enabled.
 //!
-//! Two entry points are provided:
+//! Entry points:
 //! - [`extract_centroids_from_image`] for an already-decoded
 //!   [`image::DynamicImage`]. The caller is responsible for decoding the
 //!   file (using whichever `image` feature flags suit their needs).
 //! - [`extract_centroids_from_raw`] for raw grayscale `f32` pixel data —
 //!   useful for FITS, camera SDK output, or any other non-standard source.
+//! - [`extract_centroids_fast`] is a single-pass "adequate star tracker"
+//!   alternative: it reads each pixel once (coarse-grid background +
+//!   run-length connected-component moments) for markedly lower latency, at
+//!   the cost of faint-star sensitivity and sub-pixel accuracy. The two
+//!   functions above stay the default and the right choice for calibration.
 //!
 //! With the `parallel` feature, the dominant local-background stage and the
-//! full-image element-wise maps run multi-threaded via rayon; results are
-//! bit-identical to the sequential build.
+//! full-image element-wise maps of the connected-component path run
+//! multi-threaded via rayon; results are bit-identical to the sequential
+//! build. (The fast single-pass path is sequential.)
 //!
 //! # Example
 //!
@@ -306,6 +312,416 @@ pub fn extract_centroids_from_raw(
         )));
     }
     extract_from_gray(pixels, width, height, config)
+}
+
+// ─── Fast single-pass star-tracker path ─────────────────────────────────────
+
+/// Configuration for [`extract_centroids_fast`].
+///
+/// Deliberately small — the four knobs a single-pass detector needs. None of
+/// the connected-component path's quality filters (block-interpolated
+/// background, elongation, per-blob annulus background, sub-pixel agreement
+/// gates) appear, because this path trades them away for speed.
+#[derive(Debug, Clone)]
+pub struct FastCentroidConfig {
+    /// Detection threshold in noise sigmas above the local background. A pixel
+    /// is "lit" when `value > bg(x, y) + sigma_threshold · σ`. Default: 5.0
+    pub sigma_threshold: f32,
+
+    /// Coarse background-grid block size in pixels. The background is estimated
+    /// once on a `bg_grid`-spaced grid (from a subsampled pre-pass, ~1/64 the
+    /// pixels) and bilinearly interpolated during the main sweep, so gradients
+    /// (vignetting, Milky Way) are handled without a full-image background
+    /// stage. Larger blocks are cheaper but follow gradients more coarsely.
+    /// Default: 64
+    pub bg_grid: u32,
+
+    /// Minimum pixels in a lit region to count as a star — rejects single hot
+    /// pixels and cosmic-ray specks. Default: 2
+    pub min_pixels: usize,
+
+    /// Maximum number of centroids to return, brightest first. `None` returns
+    /// all detections. For plate solving / tracking a few dozen is plenty.
+    /// Default: None
+    pub max_centroids: Option<usize>,
+}
+
+impl Default for FastCentroidConfig {
+    fn default() -> Self {
+        Self {
+            sigma_threshold: 5.0,
+            bg_grid: 64,
+            min_pixels: 2,
+            max_centroids: None,
+        }
+    }
+}
+
+/// Per-region moment accumulator for the single-pass detector. One per pixel
+/// **run**; runs that connect across rows are merged by union-find at the end.
+#[derive(Clone, Copy)]
+struct Region {
+    parent: u32,
+    sum_w: f64,  // Σ (value − bg), the background-subtracted flux
+    sum_wx: f64, // Σ x·(value − bg)
+    sum_wy: f64, // Σ y·(value − bg)
+    npix: u32,
+    peak_val: f32,
+    peak_x: u32,
+    peak_y: u32,
+}
+
+/// Fast single-pass centroid extraction — the "adequate star tracker" path.
+///
+/// An alternative to [`extract_centroids_from_raw`] that reads each pixel
+/// **once**: a cheap subsampled pre-pass builds a coarse background grid, then
+/// a single raster sweep thresholds against the bilinearly-interpolated
+/// background, groups lit pixels into connected regions via run-length +
+/// union-find (accumulating intensity-weighted moments inline), and emits a
+/// center-of-mass per region. No convolution, no full-image background buffer,
+/// no second pass — so it is memory-bandwidth-bound rather than compute-bound,
+/// and markedly faster than the connected-component path (which stays the
+/// default and the right choice for calibration / faint-star work).
+///
+/// # Trade-offs
+///
+/// - No matched filter, so faint-star sensitivity is lower — sized for the
+///   brightest stars a tracker locks onto, not deep detection.
+/// - Center-of-mass is threshold-clipped: sub-pixel accuracy is ~0.1 px for
+///   bright stars, degrading for faint ones. A 3×3 parabola refine on the peak
+///   ([`quadratic_peak_offset`]) sharpens it when the region is large enough
+///   and the fit agrees with the CoM, matching the CCL path's gate.
+/// - A global noise σ is used (adequate when read/shot noise is roughly
+///   uniform even where the background level is not).
+///
+/// Returns the same [`CentroidExtractionResult`] as the CCL path (centroids in
+/// image-center-origin coordinates, brightest first), so it is a drop-in for
+/// [`SolverDatabase::solve_from_centroids`](crate::SolverDatabase::solve_from_centroids).
+/// `background_mean` is the median of the coarse grid, `background_sigma` the
+/// global noise σ, `threshold` a representative `bg_mean + k·σ`, and
+/// `num_blobs_raw` the region count before the `min_pixels` filter.
+pub fn extract_centroids_fast(
+    pixels: &[f32],
+    width: u32,
+    height: u32,
+    config: &FastCentroidConfig,
+) -> Result<CentroidExtractionResult> {
+    let w = width as usize;
+    let h = height as usize;
+    let expected = w * h;
+    if pixels.len() != expected {
+        return Err(Error::InvalidInput(format!(
+            "Pixel data length ({}) does not match width*height ({}x{}={})",
+            pixels.len(),
+            width,
+            height,
+            expected,
+        )));
+    }
+    if !(config.sigma_threshold.is_finite() && config.sigma_threshold > 0.0) {
+        return Err(Error::InvalidInput(format!(
+            "sigma_threshold must be finite and positive, got {}",
+            config.sigma_threshold
+        )));
+    }
+    if config.bg_grid == 0 {
+        return Err(Error::InvalidInput("bg_grid must be >= 1".into()));
+    }
+    if w < 2 || h < 2 {
+        return Err(Error::InvalidInput("image must be at least 2x2".into()));
+    }
+
+    // ── Pre-pass: coarse background grid + global noise σ (subsampled) ──
+    let block = config.bg_grid as usize;
+    let (bg_grid, nx, ny, sigma) = coarse_background(pixels, w, h, block);
+    let k = config.sigma_threshold;
+
+    // ── Single raster sweep: run-length detection + union-find moments ──
+    let mut regions: Vec<Region> = Vec::new();
+    // Runs of the previous / current row: (col_start, col_end_inclusive, label).
+    let mut prev: Vec<(u32, u32, u32)> = Vec::new();
+    let mut cur: Vec<(u32, u32, u32)> = Vec::new();
+
+    for r in 0..h {
+        cur.clear();
+        let row = r * w;
+        let mut active: Option<(u32, Region)> = None; // (start_col, accumulator)
+
+        for c in 0..w {
+            let bg = bilinear_grid(&bg_grid, nx, ny, block, c, r);
+            let p = pixels[row + c];
+            let lit = p.is_finite() && p > bg + k * sigma;
+
+            if lit {
+                let weight = (p - bg).max(0.0) as f64;
+                // Start a new run only when one isn't already open (building the
+                // Region eagerly every lit pixel would be wasteful).
+                if active.is_none() {
+                    active = Some((
+                        c as u32,
+                        Region {
+                            parent: 0, // set when finalized
+                            sum_w: 0.0,
+                            sum_wx: 0.0,
+                            sum_wy: 0.0,
+                            npix: 0,
+                            peak_val: f32::NEG_INFINITY,
+                            peak_x: c as u32,
+                            peak_y: r as u32,
+                        },
+                    ));
+                }
+                let reg = &mut active.as_mut().unwrap().1;
+                reg.sum_w += weight;
+                reg.sum_wx += weight * c as f64;
+                reg.sum_wy += weight * r as f64;
+                reg.npix += 1;
+                if p > reg.peak_val {
+                    reg.peak_val = p;
+                    reg.peak_x = c as u32;
+                    reg.peak_y = r as u32;
+                }
+            } else if let Some((start, mut reg)) = active.take() {
+                let label = regions.len() as u32;
+                reg.parent = label;
+                regions.push(reg);
+                cur.push((start, c as u32 - 1, label));
+            }
+        }
+        if let Some((start, mut reg)) = active.take() {
+            let label = regions.len() as u32;
+            reg.parent = label;
+            regions.push(reg);
+            cur.push((start, w as u32 - 1, label));
+        }
+
+        // Merge current-row runs with 8-connected previous-row runs. Both lists
+        // are column-sorted, so a two-pointer sweep finds all overlaps.
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < cur.len() && j < prev.len() {
+            let (cs, ce, cl) = cur[i];
+            let (ps, pe, pl) = prev[j];
+            if ce + 1 < ps {
+                i += 1; // current run ends left of (and not adjacent to) prev
+            } else if pe + 1 < cs {
+                j += 1; // prev run ends left of current
+            } else {
+                union(&mut regions, cl, pl);
+                if ce < pe {
+                    i += 1;
+                } else {
+                    j += 1;
+                }
+            }
+        }
+
+        std::mem::swap(&mut prev, &mut cur);
+    }
+
+    // ── Resolve union-find: fold each region into its root ──
+    let n_labels = regions.len();
+    for lab in 0..n_labels {
+        let root = find(&mut regions, lab as u32) as usize;
+        if root != lab {
+            let (sw, swx, swy, np, pv, px, py) = {
+                let c = &regions[lab];
+                (
+                    c.sum_w, c.sum_wx, c.sum_wy, c.npix, c.peak_val, c.peak_x, c.peak_y,
+                )
+            };
+            let rt = &mut regions[root];
+            rt.sum_w += sw;
+            rt.sum_wx += swx;
+            rt.sum_wy += swy;
+            rt.npix += np;
+            if pv > rt.peak_val {
+                rt.peak_val = pv;
+                rt.peak_x = px;
+                rt.peak_y = py;
+            }
+        }
+    }
+
+    // ── Emit one centroid per root region ──
+    let cx = width as f32 / 2.0;
+    let cy = height as f32 / 2.0;
+    let mut centroids: Vec<Centroid> = Vec::new();
+    let mut num_blobs_raw = 0usize;
+    for lab in 0..n_labels {
+        if find(&mut regions, lab as u32) as usize != lab {
+            continue; // not a root
+        }
+        num_blobs_raw += 1;
+        let reg = regions[lab];
+        if (reg.npix as usize) < config.min_pixels || reg.sum_w <= 0.0 {
+            continue;
+        }
+        let mut fx = reg.sum_wx / reg.sum_w;
+        let mut fy = reg.sum_wy / reg.sum_w;
+
+        // Optional 3×3 parabola refine on the raw image at the peak, gated to
+        // agree with the CoM within 0.5 px (mirrors the CCL path).
+        let (pc, pr) = (reg.peak_x as usize, reg.peak_y as usize);
+        if reg.npix >= 5 && pc >= 1 && pr >= 1 && pc + 1 < w && pr + 1 < h {
+            let bg = bilinear_grid(&bg_grid, nx, ny, block, pc, pr) as f64;
+            let v = |dy: isize, dx: isize| -> f64 {
+                let rr = (pr as isize + dy) as usize;
+                let cc = (pc as isize + dx) as usize;
+                pixels[rr * w + cc] as f64 - bg
+            };
+            if let Some((x_off, y_off)) = quadratic_peak_offset(v) {
+                let (qx, qy) = (pc as f64 + x_off, pr as f64 + y_off);
+                if (qx - fx).powi(2) + (qy - fy).powi(2) < 0.25 {
+                    fx = qx;
+                    fy = qy;
+                }
+            }
+        }
+
+        centroids.push(Centroid {
+            x: fx as f32 - cx,
+            y: fy as f32 - cy,
+            mass: Some(reg.sum_w as f32),
+            cov: None,
+        });
+    }
+
+    centroids.sort_by(|a, b| {
+        b.mass
+            .unwrap_or(0.0)
+            .partial_cmp(&a.mass.unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if let Some(max) = config.max_centroids {
+        centroids.truncate(max);
+    }
+
+    let bg_mean = {
+        let mut g = bg_grid.clone();
+        let m = g.len() / 2;
+        let (_, nth, _) = g.select_nth_unstable_by(m, |a, b| a.partial_cmp(b).unwrap());
+        *nth
+    };
+
+    Ok(CentroidExtractionResult {
+        centroids,
+        image_width: width,
+        image_height: height,
+        background_mean: bg_mean,
+        background_sigma: sigma,
+        threshold: bg_mean + k * sigma,
+        num_blobs_raw,
+    })
+}
+
+/// Union-find root with path halving over the region accumulators.
+fn find(regions: &mut [Region], mut x: u32) -> u32 {
+    while regions[x as usize].parent != x {
+        let parent = regions[x as usize].parent;
+        regions[x as usize].parent = regions[parent as usize].parent; // halve
+        x = regions[x as usize].parent;
+    }
+    x
+}
+
+/// Link the roots of two region labels.
+fn union(regions: &mut [Region], a: u32, b: u32) {
+    let ra = find(regions, a);
+    let rb = find(regions, b);
+    if ra != rb {
+        regions[ra as usize].parent = rb;
+    }
+}
+
+/// Coarse background grid + global noise σ from a subsampled pre-pass.
+///
+/// The image is divided into `block × block` cells; each cell's median is taken
+/// from a strided subsample (~1/64 of the pixels for the default block), giving
+/// an `nx × ny` background grid. The global noise σ is the RMS of the
+/// below-median residuals across the subsample (the half-normal estimate,
+/// robust to stars which only push the distribution upward).
+///
+/// Returns `(grid, nx, ny, sigma)` with `grid` row-major `nx`-wide.
+fn coarse_background(
+    pixels: &[f32],
+    w: usize,
+    h: usize,
+    block: usize,
+) -> (Vec<f32>, usize, usize, f32) {
+    let nx = w.div_ceil(block);
+    let ny = h.div_ceil(block);
+    let stride = (block / 8).max(1);
+    let mut grid = vec![0.0_f32; nx * ny];
+    let mut sq_sum = 0.0_f64;
+    let mut sq_n = 0usize;
+    let mut samples: Vec<f32> = Vec::with_capacity((block / stride + 1).pow(2));
+
+    for by in 0..ny {
+        let y0 = by * block;
+        let y1 = (y0 + block).min(h);
+        for bx in 0..nx {
+            let x0 = bx * block;
+            let x1 = (x0 + block).min(w);
+            samples.clear();
+            let mut y = y0;
+            while y < y1 {
+                let row = y * w;
+                let mut x = x0;
+                while x < x1 {
+                    let v = pixels[row + x];
+                    if v.is_finite() {
+                        samples.push(v);
+                    }
+                    x += stride;
+                }
+                y += stride;
+            }
+            let median = if samples.is_empty() {
+                0.0
+            } else {
+                let m = samples.len() / 2;
+                let (_, nth, _) =
+                    samples.select_nth_unstable_by(m, |a, b| a.partial_cmp(b).unwrap());
+                *nth
+            };
+            grid[by * nx + bx] = median;
+            // Below-median residuals → robust noise (uncontaminated by stars).
+            for &v in samples.iter() {
+                if v <= median {
+                    let d = (v - median) as f64;
+                    sq_sum += d * d;
+                    sq_n += 1;
+                }
+            }
+        }
+    }
+
+    let sigma = if sq_n > 0 {
+        (sq_sum / sq_n as f64).sqrt() as f32
+    } else {
+        0.0
+    };
+    (grid, nx, ny, sigma)
+}
+
+/// Bilinear interpolation of a coarse background grid at pixel `(x, y)`.
+///
+/// Grid samples sit at block centers (`block/2 + bx·block`); positions outside
+/// the centers clamp to the nearest edge cell.
+fn bilinear_grid(grid: &[f32], nx: usize, ny: usize, block: usize, x: usize, y: usize) -> f32 {
+    let half = block as f32 / 2.0;
+    let fx = (x as f32 - half) / block as f32;
+    let fy = (y as f32 - half) / block as f32;
+    let bx0 = (fx.floor().max(0.0) as usize).min(nx - 1);
+    let by0 = (fy.floor().max(0.0) as usize).min(ny - 1);
+    let bx1 = (bx0 + 1).min(nx - 1);
+    let by1 = (by0 + 1).min(ny - 1);
+    let tx = (fx - bx0 as f32).clamp(0.0, 1.0);
+    let ty = (fy - by0 as f32).clamp(0.0, 1.0);
+    let g = |bx: usize, by: usize| grid[by * nx + bx];
+    let top = g(bx0, by0) * (1.0 - tx) + g(bx1, by0) * tx;
+    let bot = g(bx0, by1) * (1.0 - tx) + g(bx1, by1) * tx;
+    top * (1.0 - ty) + bot * ty
 }
 
 // ─── Internal helpers ──────────────────────────────────────────────────────
@@ -637,6 +1053,36 @@ fn estimate_background(
     (median, sigma)
 }
 
+/// Sub-pixel peak offset from a 2-D quadratic fit to a 3×3 neighborhood.
+///
+/// `v(dy, dx)` samples the (background-subtracted) surface at the peak pixel
+/// plus integer offset `(dy, dx)`, `dx`/`dy` ∈ {−1, 0, 1}. Fits a bivariate
+/// quadratic and returns the vertex offset `(x_off, y_off)` from the peak
+/// pixel, or `None` when the fit is degenerate (near-flat Hessian) or
+/// extrapolates beyond half a pixel (an unreliable peak — the caller should
+/// fall back to the integer peak / center-of-mass). Shared by the
+/// connected-component path ([`compute_blob_centroids`]) and the fast
+/// DoG path ([`extract_centroids_fast`]).
+fn quadratic_peak_offset(v: impl Fn(isize, isize) -> f64) -> Option<(f64, f64)> {
+    let b = (v(0, 1) - v(0, -1)) / 2.0;
+    let c_coeff = (v(1, 0) - v(-1, 0)) / 2.0;
+    let d = (v(0, 1) + v(0, -1) - 2.0 * v(0, 0)) / 2.0;
+    let f = (v(1, 0) + v(-1, 0) - 2.0 * v(0, 0)) / 2.0;
+    let e = (v(1, 1) - v(1, -1) - v(-1, 1) + v(-1, -1)) / 4.0;
+
+    let denom = 4.0 * d * f - e * e;
+    if denom.abs() <= 1e-10 {
+        return None;
+    }
+    let x_off = (e * c_coeff - 2.0 * f * b) / denom;
+    let y_off = (e * b - 2.0 * d * c_coeff) / denom;
+    if x_off.abs() <= 0.5 && y_off.abs() <= 0.5 {
+        Some((x_off, y_off))
+    } else {
+        None
+    }
+}
+
 /// Raw pixel-coordinate centroid with mass and covariance.
 struct RawCentroid {
     x_px: f32,
@@ -859,28 +1305,15 @@ fn compute_blob_centroids(
                     gray[r * w + c] as f64 - effective_bg
                 };
 
-                let b = (v(0, 1) - v(0, -1)) / 2.0;
-                let c_coeff = (v(1, 0) - v(-1, 0)) / 2.0;
-                let d = (v(0, 1) + v(0, -1) - 2.0 * v(0, 0)) / 2.0;
-                let f = (v(1, 0) + v(-1, 0) - 2.0 * v(0, 0)) / 2.0;
-                let e = (v(1, 1) - v(1, -1) - v(-1, 1) + v(-1, -1)) / 4.0;
-
-                let denom = 4.0 * d * f - e * e;
-                if denom.abs() > 1e-10 {
-                    let x_off = (e * c_coeff - 2.0 * f * b) / denom;
-                    let y_off = (e * b - 2.0 * d * c_coeff) / denom;
-
-                    // Only apply if offset is within half a pixel
-                    if x_off.abs() <= 0.5 && y_off.abs() <= 0.5 {
-                        let qx = pc as f64 + x_off;
-                        let qy = pr as f64 + y_off;
-                        // Only use quadratic when it agrees with CoM (within 0.5 px).
-                        // For asymmetric or blended blobs, CoM is more reliable.
-                        let dist_sq = (qx - xbar) * (qx - xbar) + (qy - ybar) * (qy - ybar);
-                        if dist_sq < 0.25 {
-                            final_x = qx;
-                            final_y = qy;
-                        }
+                if let Some((x_off, y_off)) = quadratic_peak_offset(v) {
+                    let qx = pc as f64 + x_off;
+                    let qy = pr as f64 + y_off;
+                    // Only use quadratic when it agrees with CoM (within 0.5 px).
+                    // For asymmetric or blended blobs, CoM is more reliable.
+                    let dist_sq = (qx - xbar) * (qx - xbar) + (qy - ybar) * (qy - ybar);
+                    if dist_sq < 0.25 {
+                        final_x = qx;
+                        final_y = qy;
                     }
                 }
             }
@@ -943,6 +1376,132 @@ mod tests {
         assert!(c.x.abs() < 1.0, "Expected x near 0, got {}", c.x);
         assert!(c.y.abs() < 1.0, "Expected y near 0, got {}", c.y);
         assert!(c.mass.unwrap() > 0.0);
+    }
+
+    /// Helper: render Gaussian stars on a background with an optional gradient
+    /// and deterministic (seedless) per-pixel noise of amplitude `noise`.
+    fn render_stars(
+        width: u32,
+        height: u32,
+        bg: f32,
+        gradient: f32,
+        noise: f32,
+        sigma_px: f32,
+        stars: &[(f32, f32, f32)],
+    ) -> Vec<f32> {
+        let (w, h) = (width as usize, height as usize);
+        let mut pixels = vec![0.0_f32; w * h];
+        for row in 0..h {
+            for col in 0..w {
+                // Large-scale gradient the coarse-grid background must reject,
+                // plus a cheap deterministic dither so the noise σ is nonzero.
+                let dither = (((row * w + col) as u32).wrapping_mul(2_654_435_761) >> 8) as f32
+                    / 16_777_216.0
+                    - 0.5;
+                pixels[row * w + col] = bg + gradient * (col as f32 / w as f32) + noise * dither;
+            }
+        }
+        for &(sx, sy, brightness) in stars {
+            for row in 0..h {
+                for col in 0..w {
+                    let dx = col as f32 - sx;
+                    let dy = row as f32 - sy;
+                    let r2 = dx * dx + dy * dy;
+                    pixels[row * w + col] += brightness * (-r2 / (2.0 * sigma_px * sigma_px)).exp();
+                }
+            }
+        }
+        pixels
+    }
+
+    #[test]
+    fn test_fast_extract_recovers_stars_over_gradient() {
+        let (width, height) = (128u32, 128u32);
+        let sigma_px = 1.6_f32;
+        // Sub-pixel true positions; a strong left-to-right gradient the
+        // coarse-grid background must track, plus realistic noise.
+        let stars = [
+            (30.3, 30.0, 900.0),
+            (90.0, 50.7, 1300.0),
+            (60.5, 100.2, 600.0),
+        ];
+        let pixels = render_stars(width, height, 50.0, 400.0, 8.0, sigma_px, &stars);
+
+        let config = FastCentroidConfig {
+            sigma_threshold: 5.0,
+            bg_grid: 32,
+            ..Default::default()
+        };
+        let result = extract_centroids_fast(&pixels, width, height, &config).unwrap();
+        assert_eq!(
+            result.centroids.len(),
+            3,
+            "expected 3 stars, got {}",
+            result.centroids.len()
+        );
+        // Brightest-first ordering.
+        assert!(result.centroids[0].mass.unwrap() >= result.centroids[1].mass.unwrap());
+
+        // Each true star must have a detection within ~0.6 px. The single-pass
+        // path is a ~0.5-px-class centroider by design (threshold-clipped CoM +
+        // parabola refine) — plenty for solving, not for tight astrometry.
+        let cx = width as f32 / 2.0;
+        let cy = height as f32 / 2.0;
+        for &(sx, sy, _) in &stars {
+            let (tx, ty) = (sx - cx, sy - cy);
+            let best = result
+                .centroids
+                .iter()
+                .map(|c| ((c.x - tx).powi(2) + (c.y - ty).powi(2)).sqrt())
+                .fold(f32::INFINITY, f32::min);
+            assert!(
+                best < 0.6,
+                "star ({sx}, {sy}) nearest detection {best:.3} px away"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fast_extract_merges_touching_pixels_and_caps() {
+        let (width, height) = (128u32, 128u32);
+        // Two stars 1 px apart form one connected region (correct for a blended
+        // pair); a far star is its own region → 2 total.
+        let stars = [
+            (64.0, 64.0, 1000.0),
+            (65.0, 64.0, 950.0),
+            (20.0, 20.0, 800.0),
+        ];
+        let pixels = render_stars(width, height, 30.0, 0.0, 6.0, 1.5, &stars);
+
+        let config = FastCentroidConfig {
+            sigma_threshold: 5.0,
+            max_centroids: Some(5),
+            ..Default::default()
+        };
+        let result = extract_centroids_fast(&pixels, width, height, &config).unwrap();
+        assert_eq!(
+            result.centroids.len(),
+            2,
+            "blended pair should merge to 1 + 1 separate = 2, got {}",
+            result.centroids.len()
+        );
+    }
+
+    #[test]
+    fn test_fast_extract_rejects_bad_params() {
+        let pixels = vec![0.0_f32; 64 * 64];
+        let bad_sigma = FastCentroidConfig {
+            sigma_threshold: 0.0,
+            ..Default::default()
+        };
+        assert!(extract_centroids_fast(&pixels, 64, 64, &bad_sigma).is_err());
+        let bad_grid = FastCentroidConfig {
+            bg_grid: 0,
+            ..Default::default()
+        };
+        assert!(extract_centroids_fast(&pixels, 64, 64, &bad_grid).is_err());
+        // Length mismatch.
+        assert!(extract_centroids_fast(&pixels, 64, 63, &FastCentroidConfig::default()).is_err());
     }
 
     #[test]

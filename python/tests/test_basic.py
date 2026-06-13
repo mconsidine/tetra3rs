@@ -34,7 +34,11 @@ class TestImport:
             assert hasattr(tetra3rs, name), f"Missing: {name}"
 
     def test_all_functions_exist(self):
-        for name in ["earth_barycentric_velocity", "extract_centroids"]:
+        for name in [
+            "earth_barycentric_velocity",
+            "extract_centroids",
+            "extract_centroids_fast",
+        ]:
             assert callable(getattr(tetra3rs, name)), f"Not callable: {name}"
 
 
@@ -390,6 +394,48 @@ class TestExtractCentroids:
         image[32, 32] = 10000  # bright pixel
 
         result = tetra3rs.extract_centroids(image, sigma_threshold=3.0)
+        result2 = pickle.loads(pickle.dumps(result))
+        assert result2.image_width == result.image_width
+        assert len(result2.centroids) == len(result.centroids)
+
+    def test_fast_gaussian_spots(self):
+        """The single-pass fast path recovers spots over a gradient."""
+        h, w = 512, 512
+        # Background with a left-to-right gradient + noise.
+        gradient = np.linspace(50, 250, w, dtype=np.float32)[None, :]
+        image = (np.random.normal(0, 5, (h, w)) + gradient).astype(np.float32)
+
+        spots = [(100, 200), (300, 150), (250, 400), (50, 50), (450, 300)]
+        for cy, cx in spots:
+            yy, xx = np.mgrid[cy - 10 : cy + 11, cx - 10 : cx + 11]
+            yy = np.clip(yy, 0, h - 1)
+            xx = np.clip(xx, 0, w - 1)
+            g = 5000 * np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * 2.0**2))
+            image[yy, xx] += g.astype(np.float32)
+
+        result = tetra3rs.extract_centroids_fast(
+            image, sigma_threshold=5.0, bg_grid=64, max_centroids=20
+        )
+        assert isinstance(result, tetra3rs.ExtractionResult)
+        assert result.image_width == w and result.image_height == h
+        assert result.background_sigma > 0
+        assert len(result.centroids) >= 3
+
+        # Brightest of the 5 injected spots should be recovered to ~1 px.
+        found = [(c.x + w / 2, c.y + h / 2) for c in result.centroids]
+        for cy, cx in spots:
+            nearest = min(((fx - cx) ** 2 + (fy - cy) ** 2) ** 0.5 for fx, fy in found)
+            assert nearest < 1.0, f"spot ({cx},{cy}) nearest detection {nearest:.2f} px"
+
+    def test_fast_result_pickle_and_drop_in(self):
+        """Fast path returns a pickleable ExtractionResult with usable centroids."""
+        h, w = 64, 64
+        image = np.random.normal(100, 5, (h, w)).astype(np.float32)
+        image[32, 32] = 10000
+        image[31, 32] = 8000  # 2-pixel region so min_pixels=2 keeps it
+
+        result = tetra3rs.extract_centroids_fast(image, sigma_threshold=4.0)
+        assert len(result.centroids) >= 1
         result2 = pickle.loads(pickle.dumps(result))
         assert result2.image_width == result.image_width
         assert len(result2.centroids) == len(result.centroids)
