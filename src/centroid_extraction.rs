@@ -543,8 +543,9 @@ pub fn extract_centroids_fast(
     }
 
     // ── Emit one centroid per root region ──
-    let cx = width as f32 / 2.0;
-    let cy = height as f32 / 2.0;
+    // Origin at the geometric image center (W-1)/2, (H-1)/2 (see the CCL path).
+    let cx = (width - 1) as f32 / 2.0;
+    let cy = (height - 1) as f32 / 2.0;
     let mut centroids: Vec<Centroid> = Vec::new();
     let mut num_blobs_raw = 0usize;
     for lab in 0..n_labels {
@@ -815,9 +816,12 @@ fn extract_from_gray(
     let num_blobs_raw = raw_centroids.len();
 
     // ── Step 5: convert to centered pixel coordinates ──
-    // Origin at image center, +X right, +Y down
-    let cx = width as f32 / 2.0;
-    let cy = height as f32 / 2.0;
+    // Origin at the geometric image center, (W-1)/2 and (H-1)/2 (pixel centers
+    // are at integer indices, so for even dimensions this is the intersection
+    // of the four central pixels — matching the FITS / astropy / OpenCV
+    // convention). +X right, +Y down.
+    let cx = (width - 1) as f32 / 2.0;
+    let cy = (height - 1) as f32 / 2.0;
 
     let mut centroids: Vec<Centroid> = raw_centroids
         .into_iter()
@@ -1445,8 +1449,8 @@ mod tests {
         // Each true star must have a detection within ~0.6 px. The single-pass
         // path is a ~0.5-px-class centroider by design (threshold-clipped CoM +
         // parabola refine) — plenty for solving, not for tight astrometry.
-        let cx = width as f32 / 2.0;
-        let cy = height as f32 / 2.0;
+        let cx = (width - 1) as f32 / 2.0;
+        let cy = (height - 1) as f32 / 2.0;
         for &(sx, sy, _) in &stars {
             let (tx, ty) = (sx - cx, sy - cy);
             let best = result
@@ -1623,8 +1627,8 @@ mod tests {
 
         // Centroid is in centered coords (origin at image center)
         let c = &result.centroids[0];
-        let cx = width as f32 / 2.0;
-        let cy = height as f32 / 2.0;
+        let cx = (width - 1) as f32 / 2.0;
+        let cy = (height - 1) as f32 / 2.0;
         let abs_x = c.x + cx;
         let abs_y = c.y + cy;
 
@@ -1682,8 +1686,8 @@ mod tests {
         );
 
         // Find the centroid closest to our true position
-        let cx = width as f32 / 2.0;
-        let cy = height as f32 / 2.0;
+        let cx = (width - 1) as f32 / 2.0;
+        let cy = (height - 1) as f32 / 2.0;
         let best = result
             .centroids
             .iter()

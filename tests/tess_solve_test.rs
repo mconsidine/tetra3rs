@@ -402,8 +402,12 @@ fn test_tess_fits_solve() {
         // Compute true boresight from the WCS at the center of the science region.
         // The science region starts at column 44 in the full frame, so the center
         // pixel in full-frame coordinates is (44 + sci_width/2, sci_height/2).
-        let center_x = 44.0 + sci_width as f64 / 2.0;
-        let center_y = sci_height as f64 / 2.0;
+        // Geometric center of the trimmed science region in full-frame
+        // 0-indexed coords: region spans columns [44, 44+sci_width-1], rows
+        // [0, sci_height-1], so the center is (W-1)/2 — matching tetra3rs's
+        // centroid origin (issue #28).
+        let center_x = 44.0 + (sci_width - 1) as f64 / 2.0;
+        let center_y = (sci_height - 1) as f64 / 2.0;
         let (boresight_ra, boresight_dec) = pixel_to_radec(image_hdu, center_x, center_y);
         let true_boresight = radec_to_uvec(boresight_ra, boresight_dec);
 
@@ -585,8 +589,12 @@ fn bench_fast_vs_ccl_extraction() {
             .map(|&v| if v.is_finite() { v } else { 0.0 })
             .collect();
 
-        let center_x = 44.0 + sci_width as f64 / 2.0;
-        let center_y = sci_height as f64 / 2.0;
+        // Geometric center of the trimmed science region in full-frame
+        // 0-indexed coords: region spans columns [44, 44+sci_width-1], rows
+        // [0, sci_height-1], so the center is (W-1)/2 — matching tetra3rs's
+        // centroid origin (issue #28).
+        let center_x = 44.0 + (sci_width - 1) as f64 / 2.0;
+        let center_y = (sci_height - 1) as f64 / 2.0;
         let (b_ra, b_dec) = pixel_to_radec(image_hdu, center_x, center_y);
         let true_boresight = radec_to_uvec(b_ra, b_dec);
 
@@ -845,8 +853,8 @@ fn test_tess_distortion_fit_and_center_accuracy() {
         let (solved_ra, solved_dec) = solution_dist.pixel_to_world(0.0, 0.0);
 
         // Center of science region in full-frame 0-indexed coordinates
-        let center_x_ff = 44.0 + sci_width as f64 / 2.0;
-        let center_y_ff = sci_height as f64 / 2.0;
+        let center_x_ff = 44.0 + (sci_width - 1) as f64 / 2.0;
+        let center_y_ff = (sci_height - 1) as f64 / 2.0;
         let (wcs_ra, wcs_dec) = pixel_to_radec(image_hdu, center_x_ff, center_y_ff);
 
         let sep_arcmin = angular_separation(
@@ -1177,8 +1185,8 @@ fn test_tess_multi_image_calibration() {
 
         let (solved_ra, solved_dec) = solution.pixel_to_world(0.0, 0.0);
 
-        let center_x_ff = 44.0 + img.sci_width as f64 / 2.0;
-        let center_y_ff = img.sci_height as f64 / 2.0;
+        let center_x_ff = 44.0 + (img.sci_width - 1) as f64 / 2.0;
+        let center_y_ff = (img.sci_height - 1) as f64 / 2.0;
         let (wcs_ra, wcs_dec) = pixel_to_radec(&hdu_for_wcs, center_x_ff, center_y_ff);
 
         let sep_arcsec = angular_separation(

@@ -2,6 +2,15 @@
 
 tetra3rs includes a complete centroid extraction pipeline that detects stars in an image and computes sub-pixel positions with uncertainty estimates. The pipeline is designed to be robust across a range of conditions — from low-SNR ground-based images to crowded spacecraft fields.
 
+!!! tip "Two extractors"
+    This page describes the default **connected-component pipeline**
+    (`extract_centroids` / `extract_centroids_from_raw`), which prioritizes
+    fidelity. For latency-critical use (e.g. frame-rate tracking on embedded
+    hardware) there is also a **fast single-pass extractor**
+    (`extract_centroids_fast`), ~4–5× faster at lower fidelity — see
+    [Fast single-pass extraction](#fast-single-pass-extraction-extract_centroids_fast)
+    below.
+
 ## Pipeline Overview
 
 ```
@@ -139,11 +148,13 @@ Otherwise, the center-of-mass position is kept. This fallback ensures robustness
 
 ## 7. Output
 
-Centroids are converted to **image-center origin** coordinates:
+Centroids are converted to **geometric-image-center origin** coordinates
+(pixel centers at integer indices, so the center is `(W−1)/2`, `(H−1)/2` —
+matching FITS / astropy / OpenCV; see [Coordinate Conventions](coordinates.md)):
 
 $$
-x_{\text{out}} = x_{\text{px}} - \frac{W}{2}, \qquad
-y_{\text{out}} = y_{\text{px}} - \frac{H}{2}
+x_{\text{out}} = x_{\text{px}} - \frac{W-1}{2}, \qquad
+y_{\text{out}} = y_{\text{px}} - \frac{H-1}{2}
 $$
 
 where $W$ and $H$ are the image dimensions. The coordinate convention is +X right, +Y down — the same as the camera frame used by the solver. See [Coordinate Conventions](coordinates.md) for details.
@@ -173,7 +184,69 @@ typical fields — is left sequential, as is connected-component labeling (step
 
 Build with `cargo build --release --features image,parallel`.
 
-## Configuration Reference
+## Fast single-pass extraction (`extract_centroids_fast`)
+
+The pipeline above prioritizes fidelity — local-background interpolation, an
+optional matched filter, full connected-component analysis, per-blob annulus
+backgrounds, and shape/elongation gating. For latency-critical applications
+(frame-rate tracking, embedded star trackers) tetra3rs offers an alternative
+that reads each pixel **once**: `extract_centroids_fast`
+(`FastCentroidConfig` in Rust). It is an *additive* alternative — the
+connected-component path stays the default and the right choice for
+calibration and faint-star work.
+
+### Algorithm
+
+1. **Coarse background pre-pass.** A subsampled grid (~1/64 of the pixels)
+   gives a `bg_grid`-spaced background grid and a global noise σ. Cheap, and
+   still tracks large-scale gradients (vignetting, Milky Way).
+2. **Single raster sweep.** Each pixel is thresholded against the bilinearly
+   interpolated background (`> bg + sigma_threshold·σ`). Lit pixels are grouped
+   into connected regions on the fly via **run-length + union-find**, with
+   intensity-weighted moments accumulated inline. One center-of-mass is emitted
+   per region, with the same 3×3 quadratic peak refinement as the main pipeline
+   (gated to agree with the CoM).
+
+No convolution and no second pass, so the cost is dominated by a single memory
+read rather than compute.
+
+### Speed and accuracy
+
+On 2048×2048 TESS frames, single-threaded: **~26–32 ms vs ~126 ms** for the
+connected-component path — **~4–5× faster** — with equal end-to-end solve
+accuracy and ~**0.1 px** centroid agreement on bright stars.
+
+The trade-offs are deliberate:
+
+- **No matched filter**, so faint-star sensitivity is lower — sized for the
+  brightest stars a tracker locks onto, not deep detection.
+- **Center-of-mass is threshold-clipped**: sub-pixel accuracy is ~0.1 px on
+  bright stars, degrading for faint ones. Use the connected-component path
+  for calibration / tight astrometry.
+- A **global noise σ** is used (adequate when read/shot noise is roughly
+  uniform even where the background *level* varies).
+
+It returns the same `ExtractionResult` (center-origin coordinates, brightest
+first), so it is a drop-in for `solve_from_centroids`.
+
+### Configuration
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `sigma_threshold` | 5.0 | Detection threshold in noise σ above the local background |
+| `bg_grid` | 64 | Coarse background-grid block size (pixels) |
+| `min_pixels` | 2 | Minimum pixels in a region (rejects hot pixels) |
+| `max_centroids` | None | Maximum centroids to return, brightest first (None = all) |
+
+```python
+result = tetra3rs.extract_centroids_fast(image, sigma_threshold=5.0, max_centroids=30)
+solution = db.solve_from_centroids(result.centroids, camera_model=cam)
+```
+
+## Configuration Reference (connected-component pipeline)
+
+These parameters configure the default `extract_centroids` pipeline (the fast
+path's knobs are listed [above](#configuration)).
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|

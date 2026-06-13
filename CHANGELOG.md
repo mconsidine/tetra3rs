@@ -29,6 +29,21 @@
 
 ### Changed
 
+- **Centroid origin moved to the geometric image center `(W−1)/2`, `(H−1)/2`
+  (was `W/2`, `H/2`).** Pixel centers sit at integer indices, so the geometric
+  center — the intersection of the four central pixels for even dimensions, the
+  middle pixel for odd — is at `(W−1)/2`, a half-pixel left of and above the old
+  origin. This matches the FITS / astropy / astrometry.net / OpenCV convention,
+  removing a ~½-pixel (~130–250″ on a wide-field camera) bias when comparing
+  tetra3rs solutions against those tools or feeding them a `crpix` derived from
+  one. The old origin was internally consistent, so tetra3rs-only solves were
+  not biased; returned centroid coordinates and the boresight now shift by half
+  a pixel toward the geometric center. Applies to `extract_centroids`,
+  `extract_centroids_fast`, and any caller-supplied centroids (which should now
+  use the `(W−1)/2` origin). The docs' coordinate page now also states
+  explicitly that the solved attitude is the direction at the **center pixel**,
+  not the optical/distortion axis. (Issue #28.)
+
 - **Radial calibration rewritten as a standard camera-intrinsics fit
   (OpenCV-style).** `calibrate_camera(model = Radial)` now jointly fits the
   optical-axis position `(cx, cy)`, a focal-scale factor `γ`, and the
