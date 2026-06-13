@@ -300,7 +300,35 @@ impl Default for GenerateDatabaseConfig {
 // ── Configuration for plate solving ─────────────────────────────────────────
 
 /// Parameters controlling the plate-solve attempt.
+///
+/// One config serves both solve modes. `solve_from_centroids` runs
+/// **lost-in-space** (pattern-hash search) unless an [`attitude_hint`] is set,
+/// in which case it runs **tracking** (direct correspondence from the hint)
+/// with automatic fallback to lost-in-space. The fields are grouped by which
+/// mode reads them — fields marked for one mode are ignored in the other:
+///
+/// - **Camera geometry** ([`camera_model`]) and **matching/verification**
+///   ([`match_radius`], [`match_threshold`], [`solve_timeout_ms`]) apply to
+///   both modes.
+/// - **Lost-in-space** ([`fov_max_error_rad`], [`match_max_error`]) tune the
+///   pattern search; ignored in tracking.
+/// - **Tracking** ([`attitude_hint`], [`hint_uncertainty_rad`],
+///   [`strict_hint`]) are inert unless `attitude_hint` is set.
+/// - **Stellar aberration** ([`observer_velocity_km_s`]) applies to both
+///   modes.
+///
+/// [`camera_model`]: SolveConfig::camera_model
+/// [`match_radius`]: SolveConfig::match_radius
+/// [`match_threshold`]: SolveConfig::match_threshold
+/// [`solve_timeout_ms`]: SolveConfig::solve_timeout_ms
+/// [`fov_max_error_rad`]: SolveConfig::fov_max_error_rad
+/// [`match_max_error`]: SolveConfig::match_max_error
+/// [`attitude_hint`]: SolveConfig::attitude_hint
+/// [`hint_uncertainty_rad`]: SolveConfig::hint_uncertainty_rad
+/// [`strict_hint`]: SolveConfig::strict_hint
+/// [`observer_velocity_km_s`]: SolveConfig::observer_velocity_km_s
 pub struct SolveConfig {
+    // ── Camera geometry (both modes) ──
     /// Camera intrinsics model — the single source of camera geometry.
     ///
     /// The model's focal length and image width define the solver's FOV
@@ -311,34 +339,32 @@ pub struct SolveConfig {
     /// FOV estimate is known, or pass a calibrated model from a previous
     /// solve / [`crate::calibrate_camera`] run.
     pub camera_model: CameraModel,
-    /// Maximum acceptable FOV error in radians. None = no FOV filtering.
-    ///
-    /// When set, the solver sweeps FOV values across
-    /// `fov_estimate ± fov_max_error` and rejects pattern matches implying a
-    /// FOV outside the range.
-    pub fov_max_error_rad: Option<f32>,
+
+    // ── Matching & verification (both modes) ──
     /// Maximum match distance as a fraction of the FOV. Default 0.01.
     pub match_radius: f32,
     /// False-positive probability threshold. Default 1e-5.
     pub match_threshold: f64,
     /// Timeout in milliseconds. None = no timeout. Default 5000.
     pub solve_timeout_ms: Option<u64>,
+
+    // ── Lost-in-space pattern search (ignored in tracking mode) ──
+    /// Maximum acceptable FOV error in radians. None = no FOV filtering.
+    ///
+    /// When set, the solver sweeps FOV values across
+    /// `fov_estimate ± fov_max_error` and rejects pattern matches implying a
+    /// FOV outside the range. *Lost-in-space only* — tracking takes its scale
+    /// from the hint and camera model.
+    pub fov_max_error_rad: Option<f32>,
     /// Maximum edge-ratio error for matching. None = use database value.
     ///
     /// Values below the database's `pattern_max_error` are clamped up to it —
     /// patterns were quantized at that tolerance during generation, so a
-    /// tighter match tolerance cannot be honored.
+    /// tighter match tolerance cannot be honored. *Lost-in-space only* —
+    /// tracking does not use the pattern hash.
     pub match_max_error: Option<f32>,
-    /// Observer's barycentric velocity in km/s (ICRS/GCRF Cartesian).
-    ///
-    /// When set, catalog star positions are aberration-corrected to apparent
-    /// positions before matching and refinement, removing the ~20" systematic
-    /// bias from Earth's orbital velocity.
-    ///
-    /// For ground-based or Earth-orbiting observers, this is dominated by
-    /// Earth's orbital velocity (~30 km/s). Default: `None` (no correction).
-    pub observer_velocity_km_s: Option<[f64; 3]>,
 
+    // ── Tracking (ignored unless `attitude_hint` is set) ──
     /// Optional attitude hint for tracking-mode solving.
     ///
     /// When set, the solver first attempts a fast direct-correspondence solve
@@ -355,7 +381,9 @@ pub struct SolveConfig {
     /// Tracking mode can succeed with as few as 3 matched stars (LIS needs 4)
     /// and is robust against pattern-hash failures from low-SNR or sparse
     /// fields. The main robustness assumption is that the hint is within
-    /// [`SolveConfig::hint_uncertainty_rad`] of the true attitude.
+    /// [`SolveConfig::hint_uncertainty_rad`] of the true attitude. Setting this
+    /// is what switches `solve_from_centroids` into tracking mode; `None`
+    /// (default) runs lost-in-space.
     pub attitude_hint: Option<Quaternion>,
 
     /// Angular uncertainty (radians) of [`SolveConfig::attitude_hint`].
@@ -374,6 +402,17 @@ pub struct SolveConfig {
     /// "fell back to LIS and succeeded with a different attitude than expected."
     /// Ignored unless `attitude_hint` is set. Default: `false`.
     pub strict_hint: bool,
+
+    // ── Stellar aberration (both modes) ──
+    /// Observer's barycentric velocity in km/s (ICRS/GCRF Cartesian).
+    ///
+    /// When set, catalog star positions are aberration-corrected to apparent
+    /// positions before matching and refinement, removing the ~20" systematic
+    /// bias from Earth's orbital velocity.
+    ///
+    /// For ground-based or Earth-orbiting observers, this is dominated by
+    /// Earth's orbital velocity (~30 km/s). Default: `None` (no correction).
+    pub observer_velocity_km_s: Option<[f64; 3]>,
 }
 
 impl Default for SolveConfig {

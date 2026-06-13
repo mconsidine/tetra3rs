@@ -683,6 +683,18 @@ class SolverDatabase:
     ) -> Union[SolveResult, SolveFailure]:
         """Solve for camera attitude given star centroids.
 
+        Runs **lost-in-space** (pattern-hash search) by default, or **tracking**
+        (direct correspondence from a prior estimate) when ``attitude_hint`` is
+        given — with automatic fallback to lost-in-space. The arguments group by
+        which mode reads them; arguments for one mode are ignored in the other:
+
+        * **Both modes:** ``camera_model`` / ``fov_estimate_*`` / ``image_*``,
+          ``match_radius``, ``match_threshold``, ``solve_timeout_ms``,
+          ``observer_velocity_km_s``.
+        * **Lost-in-space only:** ``fov_max_error_*``, ``match_max_error``.
+        * **Tracking only** (ignored unless ``attitude_hint`` is set):
+          ``attitude_hint``, ``hint_uncertainty_*``, ``strict_hint``.
+
         Args:
             centroids: Either a list of Centroid objects (from extract_centroids),
                 or an Nx2/Nx3 numpy array of centroid positions in pixels.
@@ -701,11 +713,13 @@ class SolverDatabase:
             fov_max_error_deg: Maximum FOV error in degrees. None = no limit.
             fov_max_error_rad: Maximum FOV error in radians. None = no limit.
                 At most one of fov_max_error_deg or fov_max_error_rad can be provided.
+                Lost-in-space only — tracking takes its scale from the hint.
             match_radius: Match distance as fraction of FOV.
             match_threshold: False-positive probability threshold.
             solve_timeout_ms: Timeout in milliseconds. None = no timeout.
             match_max_error: Maximum edge-ratio error. None = use database value.
                 Values below the database's pattern quantization error are clamped up to it.
+                Lost-in-space only — tracking does not use the pattern hash.
             camera_model: A CameraModel specifying focal length, image
                 dimensions, optical center, distortion, and parity. When
                 provided it is the single source of camera geometry
