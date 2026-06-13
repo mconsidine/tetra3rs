@@ -5,6 +5,12 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# One in-flight release per tag. Re-pushing a tag (force-move) cancels the
+# superseded run so it can't race the new one to PyPI.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: Python tests
@@ -53,21 +59,20 @@ jobs:
         run: pytest python/tests/ -v
 
   build-wheels:
-    name: Build wheels (${{ matrix.os }})
+    name: Build wheel (${{ matrix.os }} ${{ matrix.python }})
     needs: [test]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # Cross-product of OS × Python version: one job builds exactly one
+      # wheel, so all 20 build concurrently instead of cibuildwheel looping
+      # the Python versions serially (re-compiling the Rust ext each time).
+      # Arch comes from CIBW_ARCHS=auto (the runner's native arch); the
+      # unwanted auto extras (win32, i686, musllinux) are skipped in
+      # pyproject.toml.
       matrix:
-        include:
-          - os: ubuntu-latest
-            cibw_archs: x86_64
-          - os: ubuntu-24.04-arm
-            cibw_archs: aarch64
-          - os: macos-14
-            cibw_archs: arm64
-          - os: windows-latest
-            cibw_archs: AMD64
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
+        python: [cp310, cp311, cp312, cp313, cp314]
     steps:
       - uses: actions/checkout@v4
 
@@ -76,11 +81,14 @@ jobs:
 
       - uses: pypa/cibuildwheel@v3.3
         env:
-          CIBW_ARCHS: ${{ matrix.cibw_archs }}
+          # Build only this job's Python version (overrides pyproject `build`).
+          CIBW_BUILD: ${{ matrix.python }}-*
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}-${{ matrix.cibw_archs }}
+          # Per-(os, python) artifact name — must be unique or the parallel
+          # uploads collide. `publish` re-merges via merge-multiple.
+          name: wheels-${{ matrix.os }}-${{ matrix.python }}
           path: ./wheelhouse/*.whl
 
   build-sdist:
