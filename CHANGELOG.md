@@ -37,6 +37,22 @@
   removed. `GaiaStar::{pmra, pmdec}` are now `f32` (were always-`Some`
   `Option`s). Unused `HipparcosStar` uncertainty/parallax/`v_i` fields dropped.
 
+### Performance
+
+- **Faster no-match / wrong-FOV solves.** The FOV sweep step doubled to
+  `4·match_radius·fov` — measurements show verification tolerates the full
+  match radius of midpoint scale error, so half the sweep values cover the
+  same `fov_max_error` with identical solve rates. No-match fields drop
+  28.6 → 12.8 ms and a 15%-wrong FOV estimate 40.8 → 21.1 ms on the profiling
+  harness (10° FOV, ±2°).
+- **Faster refinement (~14% off easy-solve latency).** Phase-D re-association
+  projects catalog stars with a per-iteration rotation matrix instead of
+  per-star TAN trig (mathematically identical), and prunes its cached cone
+  list to stars that can still match while the cache is valid.
+- Candidate-key enumeration skips key tuples that violate the catalog's
+  ascending-ratio invariant (they can never hit); bounds the worst case for
+  wide `match_max_error` settings.
+
 ### Fixed
 
 - **Robustness sweep** — hardened panics, OOM, and silent-garbage paths
