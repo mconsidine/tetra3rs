@@ -282,6 +282,10 @@ fn accumulate_normal_equations(
 ///
 /// `px = (1/ps)·(cos θ · ξ + sin θ · η)`
 /// `py = (1/ps)·(-sin θ · ξ + cos θ · η)`
+///
+/// Retained for tests; Phase-D re-association projects with the camera rows
+/// from [`camera_rows_f64`] instead (identical math, no per-star trig).
+#[cfg(test)]
 #[inline]
 fn predict_pixel(xi: f64, eta: f64, cos_t: f64, sin_t: f64, inv_ps: f64) -> (f64, f64) {
     let px = inv_ps * (cos_t * xi + sin_t * eta);
@@ -548,15 +552,26 @@ pub fn wcs_refine(
         .fold(0.0f64, f64::max);
     let search_radius = (ps * max_cent_dist_px * 1.5).max(match_radius_rad as f64 * 2.0);
 
-    // Phase-D re-association cache: the boresight barely moves between outer
-    // iterations, so we query the catalog cone once (padded by REQUERY_MARGIN)
-    // and reuse the star set + its precomputed `StarRaDec` until the boresight
-    // drifts past the margin. The cached set is a superset of any single
-    // iteration's query, and the extra (annulus) stars project well outside the
-    // image so they never enter the greedy matcher — results are unchanged.
+    // Phase-D re-association cache: the fit barely moves between outer
+    // iterations, so we query the catalog cone once (padded by the margin) and
+    // reuse the star set until the fit drifts past the margin. The cached set
+    // is a superset of any single iteration's query, and the extra (annulus)
+    // stars project well outside the image so they never enter the greedy
+    // matcher — results are unchanged.
+    //
+    // After the fresh-query projection pass the cached list is also *pruned*:
+    // a star whose prediction lands beyond `prune_r` plus the drift allowances
+    // below cannot re-enter the matcher while the cache is valid (boresight
+    // drift ≤ `requery_margin` shifts predictions by ≤ ~margin_px, a θ drift
+    // within its own bound by ≤ margin_px again), so dropping it is
+    // behavior-preserving and shrinks every subsequent projection pass.
+    //
+    // Cache key is therefore (boresight, θ): re-query when either drifts past
+    // its margin. θ matters only because of pruning — a rotation δθ moves a
+    // prediction at pixel radius r by r·δθ.
     let requery_margin = match_radius_rad as f64 * 2.0;
     let requery_cos = requery_margin.cos();
-    let mut reassoc_cache: Option<(Vector3<f64>, Vec<usize>, Vec<StarRaDec>)> = None;
+    let mut reassoc_cache: Option<(Vector3<f64>, f64, Vec<usize>)> = None;
 
     // Phase-D scratch reused across outer iterations: the projected-pixel list
     // and the greedy-matcher's working buffers. Cleared + refilled each pass, so
@@ -662,9 +677,6 @@ pub fn wcs_refine(
         // extra confirming iteration. `n_rejected` keeps the existing
         // clip-driven behavior.
         {
-            let cos_t = theta.cos();
-            let sin_t = theta.sin();
-
             // Pixel radius for matching
             let radius_px = match_radius_rad as f64 / ps;
 
@@ -675,6 +687,25 @@ pub fn wcs_refine(
                 radius_px
             };
 
+            // Matching cut: a star predicted farther than (max centroid radius
+            // + match radius) from the optical center cannot fall within
+            // `radius_px` of any centroid (triangle inequality) — it could
+            // never match, so it is not pushed to the matcher.
+            let prune_r = max_cent_dist_px + radius_px;
+            let prune_r2 = prune_r * prune_r;
+            // Cache-prune cut: prediction drift while the cache stays valid is
+            // bounded by ~margin_px per drift source (boresight and θ, each
+            // re-queried past its own margin below), plus one extra margin_px
+            // of slack for the gnomonic stretch of off-axis stars. A star
+            // beyond `keep_r` on the fresh pass stays beyond `prune_r` until
+            // the next re-query.
+            let margin_px = requery_margin / ps;
+            let keep_r = prune_r + 3.0 * margin_px;
+            let keep_r2 = keep_r * keep_r;
+            // θ re-query bound: δθ moves a prediction at radius r by r·δθ, so
+            // budget one margin_px at the pruning cut radius.
+            let theta_margin = margin_px / keep_r;
+
             // Current boresight in ICRS.
             let boresight = Vector3::from_array([
                 crval_dec.cos() * crval_ra.cos(),
@@ -683,11 +714,11 @@ pub fn wcs_refine(
             ]);
 
             // (Re)query the catalog cone only when the cache is empty or the
-            // boresight has drifted past the padding margin. Cache the star set
-            // and its precomputed `StarRaDec` (atan2/asin done once, not per
-            // outer iteration).
+            // fit has drifted past a margin.
             let need_query = match &reassoc_cache {
-                Some((qb, _, _)) => qb.dot(&boresight) < requery_cos,
+                Some((qb, qtheta, _)) => {
+                    qb.dot(&boresight) < requery_cos || (theta - qtheta).abs() > theta_margin
+                }
                 None => true,
             };
             if need_query {
@@ -707,35 +738,40 @@ pub fn wcs_refine(
                     profiling::count(buckets::WCS_REASSOC_CALL, 1);
                     profiling::count(buckets::WCS_REASSOC_STARS, idx.len() as u64);
                 }
-                let radec: Vec<StarRaDec> =
-                    idx.iter().map(|&i| star_radec(&star_vectors[i])).collect();
-                reassoc_cache = Some((boresight, idx, radec));
+                reassoc_cache = Some((boresight, theta, idx));
             }
-            let (_, nearby_indices, nearby_radec) = reassoc_cache.as_ref().unwrap();
+            let (_, _, nearby_indices) = reassoc_cache.as_mut().unwrap();
 
-            // Project each cached catalog star to pixel coords via TAN + inverse
-            // rotation, reusing the cached `StarRaDec`. Drop stars whose
-            // predicted pixel lands farther than (max centroid radius + match
-            // radius) from the optical center: by the triangle inequality such a
-            // star cannot fall within `radius_px` of any centroid, so it could
-            // never match — pruning it here shrinks the matching loop without
-            // changing the result. (The cone query is padded ~1.5× the frame, so
-            // a large fraction of cached stars project off-frame.)
-            let prune_r = max_cent_dist_px + radius_px;
-            let prune_r2 = prune_r * prune_r;
-            let sin_dec0 = crval_dec.sin();
-            let cos_dec0 = crval_dec.cos();
+            // Project each cached catalog star to pixel coords with the camera
+            // rows built once from the current fit — identical math to the TAN
+            // projection (`z` is the same denominator, same behind-plane cut)
+            // with no per-star transcendentals. On the fresh-query pass, prune
+            // the cached list to `keep_r` (see above).
+            let [row_x, row_y, row_z] = camera_rows_f64(theta, crval_ra, crval_dec);
             timed!(buckets::WCS_REASSOC_PROJECT, {
                 predicted.clear();
-                for (k, &cat_idx) in nearby_indices.iter().enumerate() {
-                    if let Some((xi, eta)) =
-                        tan_project_pre(&nearby_radec[k], crval_ra, sin_dec0, cos_dec0)
-                    {
-                        let (pred_x, pred_y) = predict_pixel(xi, eta, cos_t, sin_t, inv_ps);
-                        if pred_x * pred_x + pred_y * pred_y <= prune_r2 {
-                            predicted.push((cat_idx, pred_x, pred_y));
-                        }
+                let mut kept = 0usize;
+                for k in 0..nearby_indices.len() {
+                    let cat_idx = nearby_indices[k];
+                    let sv = &star_vectors[cat_idx];
+                    let v = [sv[0] as f64, sv[1] as f64, sv[2] as f64];
+                    let z = row_z[0] * v[0] + row_z[1] * v[1] + row_z[2] * v[2];
+                    if z <= 1e-12 {
+                        continue; // behind or on the tangent plane
                     }
+                    let pred_x = inv_ps * (row_x[0] * v[0] + row_x[1] * v[1] + row_x[2] * v[2]) / z;
+                    let pred_y = inv_ps * (row_y[0] * v[0] + row_y[1] * v[1] + row_y[2] * v[2]) / z;
+                    let r2 = pred_x * pred_x + pred_y * pred_y;
+                    if r2 <= prune_r2 {
+                        predicted.push((cat_idx, pred_x, pred_y));
+                    }
+                    if need_query && r2 <= keep_r2 {
+                        nearby_indices[kept] = cat_idx;
+                        kept += 1;
+                    }
+                }
+                if need_query {
+                    nearby_indices.truncate(kept);
                 }
             });
 
@@ -910,6 +946,29 @@ pub fn wcs_refine(
 /// `wcs_to_rotation(&cd_from_theta(theta, ps, parity), …)` — the pixel scale
 /// cancels in the normalization, so it is not needed.
 pub fn rotation_from_theta_crval(theta: f64, crval_ra: f64, crval_dec: f64) -> Matrix3<f32> {
+    let [cam_x, cam_y, boresight] = camera_rows_f64(theta, crval_ra, crval_dec);
+
+    // Rows are camera axes expressed in ICRS: camera_vec = R * icrs_vec
+    Matrix3::new([
+        [cam_x[0] as f32, cam_x[1] as f32, cam_x[2] as f32],
+        [cam_y[0] as f32, cam_y[1] as f32, cam_y[2] as f32],
+        [
+            boresight[0] as f32,
+            boresight[1] as f32,
+            boresight[2] as f32,
+        ],
+    ])
+}
+
+/// Camera axes (rows of the ICRS→camera rotation) in f64 for the constrained
+/// fit `(θ, CRVAL)`: `[cam_x, cam_y, boresight]`.
+///
+/// Shared by [`rotation_from_theta_crval`] and Phase-D re-association, which
+/// projects catalog stars with these rows directly: for a star unit vector v,
+/// `z = v·boresight` equals the TAN-projection denominator, and
+/// `(v·cam_x)/z, (v·cam_y)/z` equal `predict_pixel(tan_project(v))·ps` — the
+/// same math without per-star transcendentals.
+fn camera_rows_f64(theta: f64, crval_ra: f64, crval_dec: f64) -> [[f64; 3]; 3] {
     let sin_a = crval_ra.sin();
     let cos_a = crval_ra.cos();
     let sin_d = crval_dec.sin();
@@ -925,16 +984,11 @@ pub fn rotation_from_theta_crval(theta: f64, crval_ra: f64, crval_dec: f64) -> M
     let cam_x = (e_xi * cos_t + e_eta * sin_t).normalize();
     let cam_y = (e_xi * -sin_t + e_eta * cos_t).normalize();
 
-    // Rows are camera axes expressed in ICRS: camera_vec = R * icrs_vec
-    Matrix3::new([
-        [cam_x[0] as f32, cam_x[1] as f32, cam_x[2] as f32],
-        [cam_y[0] as f32, cam_y[1] as f32, cam_y[2] as f32],
-        [
-            boresight[0] as f32,
-            boresight[1] as f32,
-            boresight[2] as f32,
-        ],
-    ])
+    [
+        [cam_x[0], cam_x[1], cam_x[2]],
+        [cam_y[0], cam_y[1], cam_y[2]],
+        [boresight[0], boresight[1], boresight[2]],
+    ]
 }
 
 // ── Derive rotation from WCS ────────────────────────────────────────────────
