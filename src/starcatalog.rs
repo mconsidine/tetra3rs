@@ -285,7 +285,8 @@ fn wrap_angle(theta_rad: f32) -> f32 {
     theta_rad.rem_euclid(TAU)
 }
 
-fn radec_to_uvec(ra_rad: f32, dec_rad: f32) -> Vector3<f32> {
+/// ICRS unit vector from (RA, Dec) in radians. Also used by [`Star::uvec`].
+pub(crate) fn radec_to_uvec(ra_rad: f32, dec_rad: f32) -> Vector3<f32> {
     let (sin_ra, cos_ra) = ra_rad.sin_cos();
     let (sin_dec, cos_dec) = dec_rad.sin_cos();
     Vector3::from_array([cos_dec * cos_ra, cos_dec * sin_ra, sin_dec])

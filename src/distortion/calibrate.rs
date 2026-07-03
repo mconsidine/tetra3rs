@@ -19,12 +19,12 @@ use crate::distortion::fit::{
     fit_polynomial_distortion, fit_radial_distortion, DistortionFitConfig,
 };
 use crate::solver::wcs_refine;
-use crate::solver::{SolveResult, SolverDatabase};
+use crate::solver::{focal_length_from_fov, pixel_scale_from_fov, SolveResult, SolverDatabase};
 
 use super::fit::{
     build_id_lookup, compute_corrected_rmse, fit_polynomial_sigma_clip,
-    fit_radial_centered_sigma_clip, intrinsics_residuals, masked_rms, project_to_matched_point,
-    MatchedPoint, MIN_RADIAL_POINTS,
+    fit_radial_centered_sigma_clip, intrinsics_residuals, masked_rms, matched_pairs,
+    project_to_matched_point, MatchedPoint, MIN_RADIAL_POINTS,
 };
 use super::polynomial::{num_coeffs, PolynomialDistortion};
 use super::Distortion;
@@ -69,6 +69,18 @@ impl Default for CalibrateConfig {
             max_iterations: 20,
             sigma_clip: 3.0,
             convergence_threshold_px: 0.01,
+        }
+    }
+}
+
+impl From<&CalibrateConfig> for DistortionFitConfig {
+    /// The fitter settings a calibration run passes down: the calibration's
+    /// sigma-clip parameters plus the default stage-2 recovery threshold.
+    fn from(config: &CalibrateConfig) -> Self {
+        Self {
+            sigma_clip: config.sigma_clip,
+            max_iterations: config.max_iterations,
+            ..Default::default()
         }
     }
 }
@@ -213,11 +225,7 @@ fn single_image_calibrate(
     image_height: u32,
     config: &CalibrateConfig,
 ) -> crate::Result<CalibrateResult> {
-    let fit_config = DistortionFitConfig {
-        sigma_clip: config.sigma_clip,
-        max_iterations: config.max_iterations,
-        stage2_threshold_px: Some(5.0),
-    };
+    let fit_config = DistortionFitConfig::from(config);
 
     let fit_result = match config.model {
         DistortionModelType::Polynomial { order } => fit_polynomial_distortion(
@@ -246,7 +254,7 @@ fn single_image_calibrate(
     // Anchor focal length implied by the solve FOV (tan-consistent with the
     // ideal-point projection inside the fitters), corrected by the
     // jointly-fit linear scale term (1.0 for polynomial fits).
-    let f_anchor = (image_width as f64 / 2.0) / (fov_rad as f64 / 2.0).tan();
+    let f_anchor = focal_length_from_fov(image_width, fov_rad as f64);
     let focal_length_px = f_anchor * fit_result.focal_scale;
 
     // Polynomial: extract crpix from the polynomial's order-0 terms.
@@ -334,10 +342,7 @@ fn multi_image_calibrate(
     // only an anchor: radial fits jointly fit a linear scale correction
     // that gets folded in below (the final focal length no longer depends
     // on the median FOV estimate).
-    let mut global_pixel_scale = {
-        let f = (image_width as f64 / 2.0) / (median_fov as f64 / 2.0).tan();
-        1.0 / f
-    };
+    let mut global_pixel_scale = pixel_scale_from_fov(image_width, median_fov as f64);
     let parity_sign: f64 = if parity_flip { -1.0 } else { 1.0 };
 
     debug!(
@@ -360,15 +365,16 @@ fn multi_image_calibrate(
     let mut last_rmse = f64::MAX;
     let mut last_rmse_before = 0.0_f64;
 
-    let fit_config = DistortionFitConfig {
-        sigma_clip: config.sigma_clip,
-        max_iterations: config.max_iterations,
-        stage2_threshold_px: Some(5.0),
-    };
+    let fit_config = DistortionFitConfig::from(config);
 
-    // Precompute per-image data that doesn't change across iterations
-    struct ImageData {
-        sr_idx: usize,
+    // Precompute per-image data that doesn't change across iterations.
+    // Holding the &Solution (rather than an index back into solve_results)
+    // makes "image_data only contains successful solves" structural.
+    struct ImageData<'a> {
+        /// Index in the caller's input slices — used only for log messages.
+        idx: usize,
+        sol: &'a crate::solver::Solution,
+        centroids: &'a [Centroid],
         rotation: Matrix3<f32>,
         fov_rad: f32,
     }
@@ -387,7 +393,9 @@ fn multi_image_calibrate(
             continue;
         }
         image_data.push(ImageData {
-            sr_idx: idx,
+            idx,
+            sol,
+            centroids: centroids[idx],
             rotation: sol.qicrs2cam.to_rotation_matrix(),
             fov_rad: sol.fov_rad,
         });
@@ -401,8 +409,8 @@ fn multi_image_calibrate(
     for outer in 0..3 {
         // ── Phase 1: Per-image attitude refinement ──
         // For each image, undistort centroids with current model, then refine attitude.
-        struct RefinedImage {
-            sr_idx: usize,
+        struct RefinedImage<'a> {
+            centroids: &'a [Centroid],
             matches: Vec<(usize, usize)>, // (centroid_idx_in_full_array, catalog_star_idx)
             crval_ra: f64,
             crval_dec: f64,
@@ -412,10 +420,7 @@ fn multi_image_calibrate(
         let mut refined_images: Vec<RefinedImage> = Vec::new();
 
         for img in &image_data {
-            let Ok(sr) = solve_results[img.sr_idx] else {
-                continue; // image_data only contains successful solves
-            };
-            let cents = centroids[img.sr_idx];
+            let cents = img.centroids;
 
             // Per-image true pinhole pixel scale (1/f) from angular FOV,
             // with the cumulative linear scale correction from prior radial
@@ -423,7 +428,7 @@ fn multi_image_calibrate(
             // this the per-image refines would fight the corrected global
             // frame and the alternation drifts instead of converging.
             let per_image_ps = {
-                let f = (image_width as f64 / 2.0) / (img.fov_rad as f64 / 2.0).tan();
+                let f = focal_length_from_fov(image_width, img.fov_rad as f64);
                 1.0 / (f * scale_correction)
             };
 
@@ -438,18 +443,10 @@ fn multi_image_calibrate(
                 })
                 .collect();
 
-            // Build initial matches from SolveResult
-            // matched_centroid_indices are indices into the original centroid array
-            let mut initial_matches: Vec<(usize, usize)> = Vec::new();
-            for (match_idx, &cat_id) in sr.matched_catalog_ids.iter().enumerate() {
-                let cent_idx = sr.matched_centroid_indices[match_idx];
-                if cent_idx >= cents.len() {
-                    continue;
-                }
-                if let Some(&star_idx) = id_to_idx.get(&cat_id) {
-                    initial_matches.push((cent_idx, star_idx));
-                }
-            }
+            // Build initial matches from the solution's matched pairs
+            // (centroid indices are into the original centroid array).
+            let initial_matches: Vec<(usize, usize)> =
+                matched_pairs(img.sol, cents.len(), &id_to_idx).collect();
 
             if initial_matches.len() < 4 {
                 continue;
@@ -476,7 +473,7 @@ fn multi_image_calibrate(
                 debug!(
                     "  multi-cal outer {}: image {} wcs_refine returned only {} matches, skipping",
                     outer,
-                    img.sr_idx,
+                    img.idx,
                     wcs_result.matches.len()
                 );
                 continue;
@@ -485,13 +482,13 @@ fn multi_image_calibrate(
             debug!(
                 "  multi-cal outer {}: image {} refined: {} matches, RMSE={:.2}\"",
                 outer,
-                img.sr_idx,
+                img.idx,
                 wcs_result.matches.len(),
                 wcs_result.rmse_rad.to_degrees() * 3600.0,
             );
 
             refined_images.push(RefinedImage {
-                sr_idx: img.sr_idx,
+                centroids: cents,
                 matches: wcs_result.matches,
                 crval_ra: wcs_result.crval_rad[0],
                 crval_dec: wcs_result.crval_rad[1],
@@ -508,7 +505,7 @@ fn multi_image_calibrate(
         let mut all_points: Vec<MatchedPoint> = Vec::new();
 
         for ref_img in &refined_images {
-            let cents = centroids[ref_img.sr_idx];
+            let cents = ref_img.centroids;
 
             // Derive rotation matrix from refined WCS
             let (rot, _fov, _parity) = wcs_refine::wcs_to_rotation(
