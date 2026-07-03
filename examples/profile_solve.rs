@@ -132,26 +132,37 @@ fn main() {
         1.0 / f
     };
 
+    // T3_FOV_BIAS=x biases the solver's FOV estimate by a fractional amount
+    // (e.g. 0.15 → solver is told the FOV is 15% larger than truth) while the
+    // centroids are still generated at the true FOV. Exercises the FOV sweep.
+    let fov_bias: f32 = std::env::var("T3_FOV_BIAS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+
     let solve_config = SolveConfig {
         fov_max_error_rad: Some(2.0_f32.to_radians()),
         match_radius: 0.01,
         match_threshold: 1e-5,
         solve_timeout_ms: Some(10_000),
         match_max_error: None,
-        ..SolveConfig::new(fov_rad, image_width, image_width)
+        ..SolveConfig::new(fov_rad * (1.0 + fov_bias), image_width, image_width)
     };
 
     // Scenario knobs (env vars):
     //   T3_SPURIOUS=K  append K uniform-random false centroids to each field
     //   T3_RANDOM=1    each field is ENTIRELY random centroids (forces no-match:
     //                  full combination enumeration × full FOV sweep)
+    //   T3_FOV_BIAS=x  bias the solver's FOV estimate by fraction x (see below)
     let spurious: usize = std::env::var("T3_SPURIOUS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     let random_only = std::env::var("T3_RANDOM").is_ok();
     let half_w_px = half_fov / pixel_scale; // image half-extent in pixels
-    eprintln!("Scenario: random_only={random_only}, spurious_per_field={spurious}");
+    eprintln!(
+        "Scenario: random_only={random_only}, spurious_per_field={spurious}, fov_bias={fov_bias}"
+    );
 
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     let add_spurious = |c: &mut Vec<Centroid>, rng: &mut Rng, k: usize| {

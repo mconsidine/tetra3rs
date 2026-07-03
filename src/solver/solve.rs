@@ -856,11 +856,18 @@ fn build_fov_sweep(fov_estimate: f32, fov_max_error: Option<f32>, match_radius: 
 
     if let Some(max_error) = fov_max_error {
         if max_error > 0.0 {
-            // Step = 2 * match_radius * fov_estimate.
-            // At the midpoint between steps, a star at the FOV edge has position
-            // error ≈ (step/2)/(fov) * (fov/2) = step/4. With step = 2*mr*fov,
-            // that's mr*fov/2, well within the match_radius_rad = mr*fov.
-            let step = (2.0 * match_radius * fov_estimate).max(0.001_f32.to_radians());
+            // Step = 4 * match_radius * fov_estimate.
+            // At the midpoint between steps the relative scale error is
+            // step/(2·fov) = 2·mr. A star at the field edge then has position
+            // error ≈ 2·mr · (fov/2) = mr·fov — right at the verification
+            // match radius (match_radius_rad = mr·fov) — and every star
+            // inboard of the edge proportionally less, so verification still
+            // matches most of the field. Measured on the profile harness
+            // (10° FOV, mr = 0.01, `T3_FOV_BIAS`): a 2% scale error solves
+            // 100% of fields and 3% solves 99%, so the 2·mr = 2% midpoint
+            // keeps full solve rate while halving the sweep length (the sweep
+            // multiplies no-match / wrong-FOV latency).
+            let step = (4.0 * match_radius * fov_estimate).max(0.001_f32.to_radians());
             let mut offset = step;
             while offset <= max_error {
                 values.push(fov_estimate + offset);
