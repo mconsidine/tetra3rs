@@ -295,6 +295,14 @@ pub(crate) fn extract_centroids(
 ///     saturation_level: Pixel value at or above which the sensor is
 ///         saturated; such regions skip sub-pixel peak refinement and keep
 ///         the center-of-mass position. None = disabled.
+///     max_pixels: Maximum region size in pixels — without it a satellite
+///         trail or horizon glow becomes the *brightest* centroid handed to
+///         the solver. Default 10000.
+///     max_elongation: Maximum elongation ratio (major/minor axis) from
+///         intensity-weighted second moments — rejects streaks too small for
+///         max_pixels. Off by default: moment-based elongation is noisy for
+///         regions of a few pixels; enable (3.0-5.0) with min_pixels raised
+///         to ~5+. None = disabled.
 ///
 /// Returns:
 ///     ExtractionResult with centroids and image statistics.
@@ -307,6 +315,8 @@ pub(crate) fn extract_centroids(
     max_centroids = None,
     max_sharpness = Some(0.9),
     saturation_level = None,
+    max_pixels = 10000,
+    max_elongation = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_centroids_fast(
@@ -317,6 +327,8 @@ pub(crate) fn extract_centroids_fast(
     max_centroids: Option<usize>,
     max_sharpness: Option<f32>,
     saturation_level: Option<f32>,
+    max_pixels: usize,
+    max_elongation: Option<f32>,
 ) -> PyResult<PyExtractionResult> {
     let (pixels, width, height) = image_to_f32(image)?;
 
@@ -327,6 +339,8 @@ pub(crate) fn extract_centroids_fast(
         max_centroids,
         max_sharpness,
         saturation_level,
+        max_pixels,
+        max_elongation,
     };
 
     let result =

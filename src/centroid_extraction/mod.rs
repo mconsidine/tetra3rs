@@ -305,12 +305,34 @@ fn check_pixel_len(len: usize, width: u32, height: u32) -> Result<()> {
     Ok(())
 }
 
+/// Elongation ratio (major/minor axis) of a blob from its intensity-weighted
+/// central second moments: `√(λ_max/λ_min)` of the 2×2 covariance
+/// `[[cxx, cxy], [cxy, cyy]]`. `λ_min` is floored so degenerate (collinear)
+/// blobs come out very elongated rather than dividing by zero — the correct
+/// verdict for a 1-pixel-wide streak. Shared by both extraction paths.
+fn elongation_from_cov(cxx: f64, cyy: f64, cxy: f64) -> f32 {
+    let trace = cxx + cyy;
+    let det = cxx * cyy - cxy * cxy;
+    let disc = (trace * trace - 4.0 * det).max(0.0).sqrt();
+    let lambda_max = (trace + disc) / 2.0;
+    let lambda_min = (trace - disc).max(1e-12) / 2.0;
+    (lambda_max / lambda_min).sqrt() as f32
+}
+
 /// 3×3 parabola sub-pixel refinement at the integer peak `(pc, pr)`, gated the
 /// same way in both extraction paths: the blob must have ≥ 5 pixels, the peak
 /// must not touch the border of the `(w, h)` image, and the fitted position
 /// must agree with the center-of-mass estimate `(com_x, com_y)` within 0.5 px
 /// (for asymmetric or blended blobs the CoM is more reliable). Returns the
 /// refined position, or `None` to keep the CoM.
+///
+/// When all nine background-subtracted samples are positive, the parabola is
+/// fit to **log intensity**: a Gaussian PSF is exactly quadratic in
+/// `ln(v)` (`ln(A·e^{−r²/2σ²}) = ln A − r²/2σ²`), which removes most of the
+/// linear fit's S-curve bias (~0.05–0.1 px at quarter-pixel peak phases —
+/// the classic star-tracker refinement). Blobs with a non-positive sample in
+/// the window (faint stars whose wings dip below the local background) keep
+/// the linear fit, preserving the previous behavior there.
 fn accepted_peak_refine(
     npix: usize,
     (pc, pr): (usize, usize),
@@ -321,7 +343,24 @@ fn accepted_peak_refine(
     if npix < 5 || pc < 1 || pr < 1 || pc + 1 >= w || pr + 1 >= h {
         return None;
     }
-    let (x_off, y_off) = quadratic_peak_offset(v)?;
+    let mut vals = [[0.0_f64; 3]; 3];
+    let mut all_positive = true;
+    for dy in -1..=1_isize {
+        for dx in -1..=1_isize {
+            let val = v(dy, dx);
+            vals[(dy + 1) as usize][(dx + 1) as usize] = val;
+            all_positive &= val > 0.0;
+        }
+    }
+    if all_positive {
+        for row in vals.iter_mut() {
+            for val in row.iter_mut() {
+                *val = val.ln();
+            }
+        }
+    }
+    let (x_off, y_off) =
+        quadratic_peak_offset(|dy, dx| vals[(dy + 1) as usize][(dx + 1) as usize])?;
     let qx = pc as f64 + x_off;
     let qy = pr as f64 + y_off;
     let dist_sq = (qx - com_x) * (qx - com_x) + (qy - com_y) * (qy - com_y);
@@ -518,6 +557,99 @@ mod tests {
         assert!(c.x.abs() < 1.0, "Expected x near 0, got {}", c.x);
         assert!(c.y.abs() < 1.0, "Expected y near 0, got {}", c.y);
         assert!(c.mass.unwrap() > 0.0);
+    }
+
+    #[test]
+    fn test_fast_path_rejects_trails_and_giant_regions() {
+        // A giant bright disc (> max_pixels) and a thin streak must not
+        // outrank the real star in the fast path's brightest-first output.
+        // bg_grid is set to the frame size so the coarse background cannot
+        // absorb the disc (at default grid sizes, structure larger than a
+        // block is background-subtracted away before the filters see it).
+        let (width, height) = (256u32, 256u32);
+        let mut pixels = render_stars(
+            width,
+            height,
+            100.0,
+            0.0,
+            4.0,
+            1.5,
+            &[(190.0, 190.0, 800.0)],
+        );
+        // Flat disc, radius 60 → ~11.3k px, over the default max_pixels.
+        for row in 0..height as usize {
+            for col in 0..width as usize {
+                let (dx, dy) = (col as f32 - 80.0, row as f32 - 80.0);
+                if dx * dx + dy * dy < 60.0 * 60.0 {
+                    pixels[row * 256 + col] += 500.0;
+                }
+            }
+        }
+        // Thin bright streak (a trail segment): 60 px long, 1 px tall,
+        // clear of both the disc and the star.
+        for col in 20..80 {
+            pixels[230 * 256 + col] += 500.0;
+        }
+
+        let base = FastCentroidConfig {
+            sigma_threshold: 5.0,
+            bg_grid: 256,
+            ..Default::default()
+        };
+        // Default max_pixels rejects the disc; the streak needs elongation.
+        let res = extract_centroids_fast(&pixels, width, height, &base).unwrap();
+        assert_eq!(res.centroids.len(), 2, "star + streak expected");
+        assert!(
+            res.centroids
+                .iter()
+                .all(|c| (c.x - (80.0 - 127.5)).abs() > 10.0),
+            "disc should be rejected by max_pixels"
+        );
+
+        let gated = FastCentroidConfig {
+            max_elongation: Some(3.0),
+            min_pixels: 5,
+            ..base
+        };
+        let res = extract_centroids_fast(&pixels, width, height, &gated).unwrap();
+        assert_eq!(res.centroids.len(), 1, "only the real star should survive");
+        assert!(
+            (res.centroids[0].x - (190.0 - 127.5)).abs() < 1.0
+                && (res.centroids[0].y - (190.0 - 127.5)).abs() < 1.0
+        );
+        assert!(res.centroids[0].cov.is_some(), "fast path now reports cov");
+    }
+
+    #[test]
+    fn test_log_parabola_subpixel_accuracy() {
+        // A Gaussian PSF is exactly quadratic in log intensity, so the
+        // refined position of a bright, point-sampled Gaussian star must be
+        // accurate at every sub-pixel phase — including the quarter-pixel
+        // phases where the linear-intensity parabola's S-curve bias peaks
+        // (~0.03-0.06 px at this PSF width, which would fail this bound).
+        let (width, height) = (64u32, 64u32);
+        for &(px, py) in &[
+            (30.0_f32, 31.0_f32),
+            (30.25, 31.25),
+            (30.5, 31.4),
+            (29.75, 30.6),
+        ] {
+            let pixels = render_stars(width, height, 100.0, 0.0, 2.0, 1.3, &[(px, py, 5000.0)]);
+            let cfg = CentroidExtractionConfig {
+                sigma_threshold: 5.0,
+                local_bg_block_size: None,
+                matched_filter_sigma: None,
+                ..Default::default()
+            };
+            let res = extract_centroids_from_raw(&pixels, width, height, &cfg).unwrap();
+            assert_eq!(res.centroids.len(), 1, "phase ({px}, {py})");
+            let c = &res.centroids[0];
+            let (ex, ey) = (c.x - (px - 31.5), c.y - (py - 31.5));
+            assert!(
+                ex.abs() < 0.02 && ey.abs() < 0.02,
+                "phase ({px}, {py}): error ({ex:.4}, {ey:.4}) px"
+            );
+        }
     }
 
     #[test]

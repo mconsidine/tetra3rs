@@ -4,8 +4,8 @@
 //! [`extract_centroids_fast`].
 
 use super::{
-    accepted_peak_refine, check_pixel_len, midpoint_f32, peak_sharpness, sort_and_truncate_by_mass,
-    CentroidExtractionResult,
+    accepted_peak_refine, check_pixel_len, elongation_from_cov, midpoint_f32, peak_sharpness,
+    sort_and_truncate_by_mass, CentroidExtractionResult,
 };
 use crate::centroid::Centroid;
 use crate::error::{Error, Result};
@@ -57,6 +57,22 @@ pub struct FastCentroidConfig {
     /// maximum), keeping the center-of-mass position.
     /// Default: None (disabled)
     pub saturation_level: Option<f32>,
+
+    /// Maximum pixels in a region. Results are brightest-first, so without a
+    /// cap a satellite trail, aircraft streak, or horizon glow becomes the
+    /// *top* centroid handed to the solver. Real stars never approach the
+    /// default; only raise it for deliberately defocused optics.
+    /// Default: 10000
+    pub max_pixels: usize,
+
+    /// Maximum elongation ratio (major/minor axis from intensity-weighted
+    /// second moments) — rejects streaks and trails too small for
+    /// `max_pixels`. Off by default: moment-based elongation is noisy for
+    /// regions of only a few pixels (this path's `min_pixels` default is 2),
+    /// so enable it (e.g. 3.0-5.0) when trails are expected and `min_pixels`
+    /// is raised enough (≳5) for the moments to be meaningful.
+    /// Default: None (disabled)
+    pub max_elongation: Option<f32>,
 }
 
 impl Default for FastCentroidConfig {
@@ -68,6 +84,8 @@ impl Default for FastCentroidConfig {
             max_centroids: None,
             max_sharpness: Some(0.9),
             saturation_level: None,
+            max_pixels: 10000,
+            max_elongation: None,
         }
     }
 }
@@ -77,9 +95,12 @@ impl Default for FastCentroidConfig {
 #[derive(Clone, Copy)]
 struct Region {
     parent: u32,
-    sum_w: f64,  // Σ (value − bg), the background-subtracted flux
-    sum_wx: f64, // Σ x·(value − bg)
-    sum_wy: f64, // Σ y·(value − bg)
+    sum_w: f64,   // Σ (value − bg), the background-subtracted flux
+    sum_wx: f64,  // Σ x·(value − bg)
+    sum_wy: f64,  // Σ y·(value − bg)
+    sum_wxx: f64, // Σ x²·(value − bg)
+    sum_wyy: f64, // Σ y²·(value − bg)
+    sum_wxy: f64, // Σ x·y·(value − bg)
     npix: u32,
     peak_val: f32,
     peak_x: u32,
@@ -170,6 +191,9 @@ pub fn extract_centroids_fast(
                             sum_w: 0.0,
                             sum_wx: 0.0,
                             sum_wy: 0.0,
+                            sum_wxx: 0.0,
+                            sum_wyy: 0.0,
+                            sum_wxy: 0.0,
                             npix: 0,
                             peak_val: f32::NEG_INFINITY,
                             peak_x: c as u32,
@@ -178,9 +202,13 @@ pub fn extract_centroids_fast(
                     ));
                 }
                 let reg = &mut active.as_mut().unwrap().1;
+                let (cf, rf) = (c as f64, r as f64);
                 reg.sum_w += weight;
-                reg.sum_wx += weight * c as f64;
-                reg.sum_wy += weight * r as f64;
+                reg.sum_wx += weight * cf;
+                reg.sum_wy += weight * rf;
+                reg.sum_wxx += weight * cf * cf;
+                reg.sum_wyy += weight * rf * rf;
+                reg.sum_wxy += weight * cf * rf;
                 reg.npix += 1;
                 if p > reg.peak_val {
                     reg.peak_val = p;
@@ -229,17 +257,16 @@ pub fn extract_centroids_fast(
     for lab in 0..n_labels {
         let root = find(&mut regions, lab as u32) as usize;
         if root != lab {
-            let (sw, swx, swy, np, pv, px, py) = {
-                let c = &regions[lab];
-                (
-                    c.sum_w, c.sum_wx, c.sum_wy, c.npix, c.peak_val, c.peak_x, c.peak_y,
-                )
-            };
+            let child = regions[lab];
             let rt = &mut regions[root];
-            rt.sum_w += sw;
-            rt.sum_wx += swx;
-            rt.sum_wy += swy;
-            rt.npix += np;
+            rt.sum_w += child.sum_w;
+            rt.sum_wx += child.sum_wx;
+            rt.sum_wy += child.sum_wy;
+            rt.sum_wxx += child.sum_wxx;
+            rt.sum_wyy += child.sum_wyy;
+            rt.sum_wxy += child.sum_wxy;
+            rt.npix += child.npix;
+            let (pv, px, py) = (child.peak_val, child.peak_x, child.peak_y);
             if pv > rt.peak_val {
                 rt.peak_val = pv;
                 rt.peak_x = px;
@@ -260,11 +287,25 @@ pub fn extract_centroids_fast(
         }
         num_blobs_raw += 1;
         let reg = regions[lab];
-        if (reg.npix as usize) < config.min_pixels || reg.sum_w <= 0.0 {
+        if (reg.npix as usize) < config.min_pixels
+            || (reg.npix as usize) > config.max_pixels
+            || reg.sum_w <= 0.0
+        {
             continue;
         }
         let mut fx = reg.sum_wx / reg.sum_w;
         let mut fy = reg.sum_wy / reg.sum_w;
+
+        // Intensity-weighted central second moments — the same statistic the
+        // CCL path reports as `cov` and judges elongation on.
+        let cxx = reg.sum_wxx / reg.sum_w - fx * fx;
+        let cyy = reg.sum_wyy / reg.sum_w - fy * fy;
+        let cxy = reg.sum_wxy / reg.sum_w - fx * fy;
+        if let Some(max_elong) = config.max_elongation {
+            if elongation_from_cov(cxx, cyy, cxy) > max_elong {
+                continue;
+            }
+        }
 
         let (pc, pr) = (reg.peak_x as usize, reg.peak_y as usize);
         let bg = bilinear_grid(&bg_grid, nx, ny, block, pc, pr) as f64;
@@ -300,7 +341,10 @@ pub fn extract_centroids_fast(
             x: fx as f32 - cx,
             y: fy as f32 - cy,
             mass: Some(reg.sum_w as f32),
-            cov: None,
+            cov: Some(crate::Matrix2::new([
+                [cxx as f32, cxy as f32],
+                [cxy as f32, cyy as f32],
+            ])),
         });
     }
 

@@ -12,8 +12,8 @@ use numeris::imageproc::{
 use numeris::DynMatrix;
 
 use super::{
-    accepted_peak_refine, median_f32, midpoint_f32, peak_sharpness, sort_and_truncate_by_mass,
-    CentroidExtractionConfig, CentroidExtractionResult,
+    accepted_peak_refine, elongation_from_cov, median_f32, midpoint_f32, peak_sharpness,
+    sort_and_truncate_by_mass, CentroidExtractionConfig, CentroidExtractionResult,
 };
 use crate::centroid::Centroid;
 use crate::error::{Error, Result};
@@ -576,13 +576,7 @@ fn compute_blob_centroids(
                 let cxx = sum_xx / sum_i - dx_bar * dx_bar;
                 let cyy = sum_yy / sum_i - dy_bar * dy_bar;
                 let cxy = sum_xy / sum_i - dx_bar * dy_bar;
-                let trace = cxx + cyy;
-                let det = cxx * cyy - cxy * cxy;
-                let disc = (trace * trace - 4.0 * det).max(0.0).sqrt();
-                let lambda_max = (trace + disc) / 2.0;
-                let lambda_min = (trace - disc).max(1e-12) / 2.0;
-                let elongation = (lambda_max / lambda_min).sqrt() as f32;
-                if elongation > max_elong {
+                if elongation_from_cov(cxx, cyy, cxy) > max_elong {
                     return None;
                 }
             }

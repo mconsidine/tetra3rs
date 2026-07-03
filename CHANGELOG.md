@@ -18,6 +18,27 @@
   the zero-clamped background-subtracted image, rectifying negative noise
   into a positive DC offset that silently loosened the effective threshold.
 
+### Changed — sub-pixel peak refinement fits log intensity
+
+The 3×3 parabola refinement (both extraction paths) now fits **log**
+intensity when all nine background-subtracted samples are positive: a
+Gaussian PSF is exactly quadratic in `ln(v)`, which removes the linear fit's
+S-curve bias (~0.05–0.1 px at quarter-pixel peak phases). Blobs with
+non-positive samples in the window keep the linear fit. Measured on the TESS
+10-image multi-sector calibration: pooled fit residual 0.132 → 0.077 px
+(−42%) and typical per-sector solve RMSE 2.5–2.9″ → 1.0–1.7″.
+
+### Added — fast-path trail/streak rejection and covariance
+
+`FastCentroidConfig` gains `max_pixels` (default 10000 — without it a
+satellite trail or bloomed region becomes the *brightest* centroid handed to
+the solver) and `max_elongation` (opt-in; moment-based elongation is noisy
+for few-pixel regions). The fast path now accumulates intensity-weighted
+second moments inline (merged through union-find), so it also populates
+`Centroid.cov` like the CCL path. Note the coarse background grid already
+absorbs structure larger than a block (~64 px) before these filters see it;
+`max_pixels` matters for sharp bloomed regions, `max_elongation` for trails.
+
 ### Added — extraction quality gates
 
 - **`max_sharpness`** (both extraction configs): DAOFIND-style hot-pixel /

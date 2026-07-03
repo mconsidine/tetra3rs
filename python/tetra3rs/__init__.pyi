@@ -1133,6 +1133,8 @@ def extract_centroids_fast(
     max_centroids: Optional[int] = None,
     max_sharpness: Optional[float] = 0.9,
     saturation_level: Optional[float] = None,
+    max_pixels: int = 10000,
+    max_elongation: Optional[float] = None,
 ) -> ExtractionResult:
     """Fast single-pass centroid extraction — the "adequate star tracker" path.
 
@@ -1161,6 +1163,13 @@ def extract_centroids_fast(
         saturation_level: Pixel value at or above which the sensor is
             saturated; such regions skip sub-pixel peak refinement and keep
             the center-of-mass position. None = disabled.
+        max_pixels: Maximum region size in pixels — without it a satellite
+            trail or horizon glow becomes the *brightest* centroid handed to
+            the solver.
+        max_elongation: Maximum elongation ratio (major/minor axis) from
+            intensity-weighted second moments — rejects streaks too small
+            for max_pixels. Off by default (noisy for few-pixel regions);
+            enable (3.0-5.0) with min_pixels raised to ~5+. None = disabled.
 
     Returns:
         ExtractionResult with centroids and image statistics.
