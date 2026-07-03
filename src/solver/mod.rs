@@ -530,8 +530,10 @@ impl SolveConfig {
     /// Pixel scale in radians per pixel (horizontal): `1 / focal_length_px`.
     ///
     /// Returns `0.0` when the camera model is the unconfigured
-    /// `Default::default()` placeholder (zero image width).
-    pub fn pixel_scale(&self) -> f32 {
+    /// `Default::default()` placeholder (zero image width). Crate-internal: the
+    /// `0.0`-means-unconfigured sentinel is an implementation detail (Python
+    /// exposes pixel scale via `CameraModel.pixel_scale`).
+    pub(crate) fn pixel_scale(&self) -> f32 {
         if self.camera_model.image_width > 0 && self.camera_model.focal_length_px > 0.0 {
             self.camera_model.pixel_scale() as f32
         } else {

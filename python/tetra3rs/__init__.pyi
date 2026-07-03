@@ -1012,21 +1012,22 @@ class PolynomialDistortion:
         scale: float,
         a_coeffs: list[float],
         b_coeffs: list[float],
-        ap_coeffs: list[float],
-        bp_coeffs: list[float],
+        ap_coeffs: Optional[list[float]] = None,
+        bp_coeffs: Optional[list[float]] = None,
     ) -> None:
-        """Create a polynomial distortion model from coefficient arrays.
+        """Create a polynomial distortion model from forward coefficient arrays.
 
-        Each coefficient array must have exactly (order+1)(order+2)/2 elements,
-        covering all terms from p+q=0 (constant offset) through p+q=order.
+        a_coeffs and b_coeffs must each have exactly (order+1)(order+2)/2
+        elements, covering all terms from p+q=0 (constant offset) through
+        p+q=order.
 
         Args:
             order: Polynomial order (2–6 typical).
             scale: Normalization scale (typically image_width / 2).
             a_coeffs: Forward A coefficients (x correction, ideal → distorted).
             b_coeffs: Forward B coefficients (y correction, ideal → distorted).
-            ap_coeffs: Inverse AP coefficients (x correction, distorted → ideal).
-            bp_coeffs: Inverse BP coefficients (y correction, distorted → ideal).
+            ap_coeffs: Deprecated and ignored — the model inverts numerically.
+            bp_coeffs: Deprecated and ignored. See ap_coeffs.
         """
         ...
 

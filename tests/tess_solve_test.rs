@@ -824,7 +824,8 @@ fn test_tess_distortion_fit_and_center_accuracy() {
                 model: DistortionModelType::Polynomial { order: 4 },
                 ..CalibrateConfig::default()
             },
-        );
+        )
+        .expect("calibration should succeed");
         println!(
             "  Calibration: RMSE {:.3} -> {:.3} px, {} inliers, {} outliers",
             cal_result.rmse_before_px,
@@ -1142,7 +1143,8 @@ fn test_tess_multi_image_calibration() {
                 },
                 ..CalibrateConfig::default()
             },
-        );
+        )
+        .expect("calibration should succeed");
 
         println!(
             "    Calibration: RMSE {:.3} -> {:.3} px, {} inliers, {} outliers",

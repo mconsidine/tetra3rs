@@ -6,8 +6,11 @@ pub struct GaiaStar {
     pub ra_deg: f32,
     pub dec_deg: f32,
     pub phot_g_mean_mag: f32,
-    pub pmra: Option<f32>,
-    pub pmdec: Option<f32>,
+    /// Proper motion in RA (mas/yr, as μα·cos δ). The binary format encodes
+    /// missing proper motion as 0.0, so this is never optional.
+    pub pmra: f32,
+    /// Proper motion in Dec (mas/yr).
+    pub pmdec: f32,
 }
 
 /// Load a Gaia catalog from the binary format.
@@ -75,8 +78,8 @@ pub fn load_gaia_binary<P: AsRef<Path>>(path: P) -> Result<Vec<GaiaStar>> {
             ra_deg: ra as f32,
             dec_deg: dec as f32,
             phot_g_mean_mag: mag,
-            pmra: Some(pmra),
-            pmdec: Some(pmdec),
+            pmra,
+            pmdec,
         });
     }
 

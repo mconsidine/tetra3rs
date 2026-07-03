@@ -453,7 +453,7 @@ impl PySolverDatabase {
     /// Returns:
     ///     CatalogStar at that index.
     fn get_star(&self, index: usize) -> PyResult<PyCatalogStar> {
-        let stars = &self.inner.star_catalog.stars;
+        let stars = self.inner.star_catalog.stars();
         if index >= stars.len() {
             return Err(pyo3::exceptions::PyIndexError::new_err(format!(
                 "star index {} out of range (catalog has {} stars)",
@@ -479,7 +479,7 @@ impl PySolverDatabase {
             .iter()
             .position(|&id| id == catalog_id)
             .map(|idx| PyCatalogStar {
-                inner: self.inner.star_catalog.stars[idx].clone(),
+                inner: self.inner.star_catalog.stars()[idx].clone(),
             })
     }
 
@@ -504,7 +504,7 @@ impl PySolverDatabase {
         indices
             .into_iter()
             .map(|idx| PyCatalogStar {
-                inner: self.inner.star_catalog.stars[idx].clone(),
+                inner: self.inner.star_catalog.stars()[idx].clone(),
             })
             .collect()
     }
@@ -612,7 +612,8 @@ impl PySolverDatabase {
             img_width,
             img_height,
             &config,
-        );
+        )
+        .map_err(crate::helpers::map_tetra3_err)?;
 
         Ok(PyCalibrateResult {
             camera_model: PyCameraModel {

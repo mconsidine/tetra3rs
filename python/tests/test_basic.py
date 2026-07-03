@@ -326,6 +326,19 @@ class TestPolynomialDistortion:
         assert d2.scale == d.scale
         np.testing.assert_array_equal(d2.a_coeffs, d.a_coeffs)
 
+    def test_construct_without_inverse_coeffs(self):
+        """ap/bp are optional — the model inverts numerically."""
+        n = 6
+        a = np.zeros(n, dtype=np.float64)
+        a[3] = 0.01
+        b = np.zeros(n, dtype=np.float64)
+        d = tetra3rs.PolynomialDistortion(order=2, scale=1024.0, a_coeffs=a, b_coeffs=b)
+        # Forward → inverse should still round-trip via Newton iteration.
+        xd, yd = d.distort(120.0, -80.0)
+        xu, yu = d.undistort(xd, yd)
+        assert abs(xu - 120.0) < 1e-6
+        assert abs(yu + 80.0) < 1e-6
+
 
 # ---------------------------------------------------------------------------
 # earth_barycentric_velocity

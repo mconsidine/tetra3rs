@@ -32,7 +32,7 @@ impl Star {
 /// the cos(dec) divisor becomes numerically unstable, following the same
 /// convention as tetra3/cedar-solve.
 #[cfg(feature = "hipparcos")]
-pub fn star_from_hipparcos(
+pub(crate) fn star_from_hipparcos(
     star: &crate::catalogs::hipparcos::HipparcosStar,
     epoch_year: Option<f64>,
 ) -> Star {
@@ -78,7 +78,10 @@ pub fn star_from_hipparcos(
 ///
 /// The source_id is stored directly as `i64` — negative values indicate Hipparcos
 /// gap-fill stars from the merged catalog.
-pub fn star_from_gaia(star: &crate::catalogs::gaia::GaiaStar, epoch_year: Option<f64>) -> Star {
+pub(crate) fn star_from_gaia(
+    star: &crate::catalogs::gaia::GaiaStar,
+    epoch_year: Option<f64>,
+) -> Star {
     // Gaia DR3 reference epoch is J2016.0
     const GAIA_EPOCH_YEAR: f64 = 2016.0;
     // Gaia proper motions are in mas/yr, same conversion factor
@@ -91,14 +94,13 @@ pub fn star_from_gaia(star: &crate::catalogs::gaia::GaiaStar, epoch_year: Option
         let dt_years = target_year - GAIA_EPOCH_YEAR;
         let cos_dec = dec_rad.cos();
 
-        let (mu_ra, mu_dec) = match (star.pmra, star.pmdec) {
-            (Some(pmra), Some(pmdec)) if cos_dec.abs() > 0.05 => {
-                // Gaia pmra is mu_alpha*cos(delta), same convention as Hipparcos
-                let mu_alpha_cos_delta = pmra as f64 * MAS_PER_YR_TO_RAD_PER_YR;
-                let mu_delta = pmdec as f64 * MAS_PER_YR_TO_RAD_PER_YR;
-                (mu_alpha_cos_delta / cos_dec, mu_delta)
-            }
-            _ => (0.0, 0.0),
+        let (mu_ra, mu_dec) = if cos_dec.abs() > 0.05 {
+            // Gaia pmra is mu_alpha*cos(delta), same convention as Hipparcos
+            let mu_alpha_cos_delta = star.pmra as f64 * MAS_PER_YR_TO_RAD_PER_YR;
+            let mu_delta = star.pmdec as f64 * MAS_PER_YR_TO_RAD_PER_YR;
+            (mu_alpha_cos_delta / cos_dec, mu_delta)
+        } else {
+            (0.0, 0.0)
         };
 
         let ra = ra_rad + mu_ra * dt_years;

@@ -50,23 +50,16 @@ impl Default for DistortionFitConfig {
 }
 
 /// Result of a distortion fitting procedure.
+///
+/// Note there is no jointly-fit CRPIX here: polynomial fits absorb the optical
+/// center into their order-0 terms (moved into `CameraModel::crpix` later by
+/// `extract_crpix`), and radial fits carry the optical-axis position inside the
+/// model ([`RadialDistortion::center`]). Both leave the projection origin
+/// (`crpix`) at the image center for the solver's geometry.
 #[derive(Debug, Clone)]
 pub struct DistortionFitResult {
     /// The fitted distortion model.
     pub model: Distortion,
-    /// Optional optical center offset (CRPIX) fit jointly with the
-    /// distortion model.
-    ///
-    /// - `None` for [`Distortion::Polynomial`] fits — the polynomial
-    ///   absorbs the center offset into its order-0 (constant) terms,
-    ///   which `extract_crpix` later moves into [`CameraModel::crpix`].
-    /// - `None` for [`Distortion::Radial`] fits too — the jointly-fit
-    ///   optical-axis position is carried inside the model itself
-    ///   ([`RadialDistortion::center`]), NOT in `crpix`: on mosaic cameras
-    ///   the optical axis can sit far off the detector (a CCD corner on
-    ///   TESS), while `crpix` is the projection origin and must stay near
-    ///   the image center for the solver's geometry.
-    pub crpix: Option<[f64; 2]>,
     /// Correction factor for the anchor focal length (the focal length
     /// implied by the solve FOV used to project the ideal points):
     /// `f_true = focal_scale · f_anchor`. Always `1.0` for polynomial fits;
@@ -115,8 +108,8 @@ pub(super) struct MatchedPoint {
 ///     y_obs = cy + y_n · (1 + k1·r² + k2·r⁴ + k3·r⁶)
 /// ```
 ///
-/// Returns the radial coefficients in [`DistortionFitResult::model`] and
-/// the fitted optical-center offset in [`DistortionFitResult::crpix`].
+/// Returns the radial coefficients (with the optical center carried inside the
+/// model, per [`RadialDistortion::center`]) in [`DistortionFitResult::model`].
 /// Same interface as [`fit_polynomial_distortion`] otherwise. Suitable for
 /// most photographic / computer-vision lens calibrations; for cameras with
 /// significant tangential / decentering distortion (e.g. TESS), prefer
@@ -143,7 +136,6 @@ pub fn fit_radial_distortion(
     if points.len() < MIN_RADIAL_POINTS {
         return DistortionFitResult {
             model: Distortion::None,
-            crpix: None,
             focal_scale: 1.0,
             rmse_before_px: 0.0,
             rmse_after_px: 0.0,
@@ -161,8 +153,12 @@ pub fn fit_radial_distortion(
     let model = fit.rescaled_model();
 
     // Compute before/after RMSE on the SAME inlier set for a fair comparison.
-    let rmse_before =
-        compute_corrected_rmse_centered(&points, &fit.mask, &Distortion::None, [0.0, 0.0]);
+    // Identity intrinsics → predicted == ideal, so this is the raw
+    // (pre-correction) obs-vs-ideal RMS over the inliers.
+    let rmse_before = masked_rms(
+        &intrinsics_residuals(&points, &[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        &fit.mask,
+    );
     let residuals = intrinsics_residuals(
         &points,
         &[
@@ -179,7 +175,6 @@ pub fn fit_radial_distortion(
 
     DistortionFitResult {
         model: Distortion::Radial(model),
-        crpix: None,
         focal_scale: fit.gamma,
         rmse_before_px: rmse_before,
         rmse_after_px: rmse_after,
@@ -554,46 +549,6 @@ pub(super) fn masked_rms(residuals: &[f64], mask: &[bool]) -> f64 {
     }
 }
 
-/// Like [`compute_corrected_rmse`] but applies an optional crpix shift
-/// before the distortion model evaluates. Used for centered radial where
-/// the model is anchored at `(cx, cy)` rather than the geometric origin.
-pub(super) fn compute_corrected_rmse_centered(
-    points: &[MatchedPoint],
-    mask: &[bool],
-    distortion: &Distortion,
-    crpix: [f64; 2],
-) -> f64 {
-    if points.is_empty() {
-        return 0.0;
-    }
-    let mut sum_sq = 0.0_f64;
-    let mut n = 0usize;
-    for (i, p) in points.iter().enumerate() {
-        if !mask[i] {
-            continue;
-        }
-        // Forward model: ideal → observed in the geometric frame.
-        // For centered models, shift to the optical-axis frame, distort,
-        // shift back.
-        let (predicted_x, predicted_y) = match distortion {
-            Distortion::None => (p.x_ideal, p.y_ideal),
-            _ => {
-                let (dx, dy) = distortion.distort(p.x_ideal - crpix[0], p.y_ideal - crpix[1]);
-                (dx + crpix[0], dy + crpix[1])
-            }
-        };
-        let rx = p.x_obs - predicted_x;
-        let ry = p.y_obs - predicted_y;
-        sum_sq += rx * rx + ry * ry;
-        n += 1;
-    }
-    if n == 0 {
-        0.0
-    } else {
-        (sum_sq / n as f64).sqrt()
-    }
-}
-
 /// Solve `(k1, k2, k3)` from matched points using least squares.
 ///
 /// Model: `x_obs - x_ideal = x_ideal · (k1·r² + k2·r⁴ + k3·r⁶)`
@@ -642,12 +597,12 @@ fn fit_radial_ls(points: &[MatchedPoint], mask: &[bool]) -> (f64, f64, f64) {
 
 // ── Polynomial (SIP-like) distortion fitting ────────────────────────────────
 
-/// Result of a sigma-clipped polynomial fit (forward + inverse).
+/// Result of a sigma-clipped forward polynomial fit. The inverse (`ap`/`bp`)
+/// coefficients are no longer fit or stored — inversion is done numerically
+/// (Newton) and `PolynomialDistortion::new` zero-fills the legacy fields.
 pub(super) struct PolyFitResult {
     pub a_coeffs: Vec<f64>,
     pub b_coeffs: Vec<f64>,
-    pub ap_coeffs: Vec<f64>,
-    pub bp_coeffs: Vec<f64>,
     pub mask: Vec<bool>,
     pub iterations: u32,
 }
@@ -784,16 +739,9 @@ pub(super) fn fit_polynomial_sigma_clip(
     // The inverse polynomial (distorted → ideal) is no longer fit:
     // PolynomialDistortion::undistort uses Newton iteration on the forward
     // polynomial, which is exact (limited only by forward expressiveness).
-    // The ap/bp fields remain in PolynomialDistortion for binary format
-    // compatibility but are zero-valued.
-    let ap_coeffs = vec![0.0; ncoeffs];
-    let bp_coeffs = vec![0.0; ncoeffs];
-
     PolyFitResult {
         a_coeffs,
         b_coeffs,
-        ap_coeffs,
-        bp_coeffs,
         mask,
         iterations,
     }
@@ -841,7 +789,6 @@ pub fn fit_polynomial_distortion(
     if points.is_empty() {
         return DistortionFitResult {
             model: Distortion::None,
-            crpix: None,
             focal_scale: 1.0,
             rmse_before_px: 0.0,
             rmse_after_px: 0.0,
@@ -864,7 +811,6 @@ pub fn fit_polynomial_distortion(
         );
         return DistortionFitResult {
             model: Distortion::None,
-            crpix: None,
             focal_scale: 1.0,
             rmse_before_px: rmse_raw,
             rmse_after_px: rmse_raw,
@@ -877,14 +823,7 @@ pub fn fit_polynomial_distortion(
     // Delegate to the reusable sigma-clip helper
     let fit = fit_polynomial_sigma_clip(&points, order, scale, config);
 
-    let model = PolynomialDistortion::new(
-        order,
-        scale,
-        fit.a_coeffs,
-        fit.b_coeffs,
-        fit.ap_coeffs,
-        fit.bp_coeffs,
-    );
+    let model = PolynomialDistortion::new(order, scale, fit.a_coeffs, fit.b_coeffs);
     let dist = Distortion::Polynomial(model.clone());
     // Compute before/after RMSE on the SAME inlier set for a fair comparison
     let rmse_before = compute_corrected_rmse(&points, &fit.mask, &Distortion::None);
@@ -898,7 +837,6 @@ pub fn fit_polynomial_distortion(
 
     DistortionFitResult {
         model: dist,
-        crpix: None,
         focal_scale: 1.0,
         rmse_before_px: rmse_before,
         rmse_after_px: rmse_after,
@@ -1046,25 +984,28 @@ pub(super) fn compute_corrected_rmse(
     (sum_sq / count as f64).sqrt()
 }
 
-/// Compute the percentile of a sorted slice. `p` is in [0, 1].
-pub(super) fn percentile(sorted: &[f64], p: f64) -> f64 {
+/// Percentile of a **pre-sorted** slice. `p` is in [0, 1].
+fn percentile_sorted(sorted: &[f64], p: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
     }
-    let mut values = sorted.to_vec();
-    values.sort_by(f64::total_cmp);
-    let idx = (p * (values.len() - 1) as f64).round() as usize;
-    values[idx.min(values.len() - 1)]
+    let idx = (p * (sorted.len() - 1) as f64).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
 }
 
 /// MAD-derived σ estimate (`1.4826 · MAD`) of a residual slice.
 ///
-/// Uses the [`percentile`] helper (which sorts internally) for both the median
-/// and the median-absolute-deviation, matching the legacy fit convention.
+/// Sorts once for the median, then reuses the same buffer for the
+/// median-absolute-deviation (two sorts total, one allocation).
 fn mad_sigma(inlier_resids: &[f64]) -> f64 {
-    let median = percentile(inlier_resids, 0.5);
-    let abs_devs: Vec<f64> = inlier_resids.iter().map(|&r| (r - median).abs()).collect();
-    let mad = percentile(&abs_devs, 0.5);
+    let mut buf: Vec<f64> = inlier_resids.to_vec();
+    buf.sort_by(f64::total_cmp);
+    let median = percentile_sorted(&buf, 0.5);
+    for v in buf.iter_mut() {
+        *v = (*v - median).abs();
+    }
+    buf.sort_by(f64::total_cmp);
+    let mad = percentile_sorted(&buf, 0.5);
     mad * 1.4826
 }
 

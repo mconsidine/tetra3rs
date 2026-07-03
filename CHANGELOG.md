@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+### Changed (breaking)
+
+- **`calibrate_camera` now returns `Result<CalibrateResult>`** (was
+  `CalibrateResult`). It returns `Error::InvalidInput` instead of fabricating a
+  camera model when the input has no successful solves, no parity consensus, or
+  too few matched points for any fit to complete (previously these produced an
+  identity model with a `0.1 rad` invented FOV or an `f64::MAX` RMSE, or
+  panicked). Rust callers must handle the `Result`; the Python
+  `SolverDatabase.calibrate_camera` now raises `ValueError` in these cases.
+- **`PolynomialDistortion::new` takes 4 arguments** `(order, scale, a, b)`
+  instead of 6 — the legacy inverse `ap`/`bp` coefficients are zero-filled
+  (the model inverts numerically via Newton). The Python constructor keeps
+  `ap_coeffs` / `bp_coeffs` as optional, ignored keyword arguments for
+  backward compatibility. The struct fields persist for binary-format
+  compatibility.
+- **`solve_from_centroids` (Python)** no longer requires `fov_estimate_*` or
+  `image_*` when a `camera_model` is given — the model already carries that
+  geometry. They remain required when `camera_model` is omitted.
+- Narrowed the public surface: `star_from_gaia` / `star_from_hipparcos`,
+  `SolveConfig::pixel_scale`, and the `StarCatalog` spatial-index fields are
+  now crate-private; `StarCatalog::{from_slice, query_stars_from_uvec}`,
+  `query_stars` (now test-only), and `PolynomialDistortion::is_zero` were
+  removed. `GaiaStar::{pmra, pmdec}` are now `f32` (were always-`Some`
+  `Option`s). Unused `HipparcosStar` uncertainty/parallax/`v_i` fields dropped.
+
+### Fixed
+
+- **Robustness sweep** — hardened panics, OOM, and silent-garbage paths
+  reachable from ordinary input: centroid extraction rejects degenerate images
+  / bad config instead of panicking; NaN-safe medians throughout; the solver
+  caps the candidate-key enumeration (a large `match_max_error` could allocate
+  gigabytes), bounds the hash-probe walk on corrupt databases, and drops
+  non-finite centroids; `GenerateDatabaseConfig::validate` rejects
+  index-corrupting parameters; the Gaia loader validates its header before
+  allocating. Python bindings raise typed exceptions (`ValueError` / `IOError`
+  / `TypeError`) instead of aborting, accept big-endian (FITS) and non-`f64`
+  arrays, and normalize/validate `attitude_hint` quaternions and matrices.
+- **Type stubs** reconciled with the bindings: removed the phantom
+  `undistort_centroids` / `distort_centroids` functions and the nonexistent
+  `SolveResult.distortion` property (added the real `camera_model`), fixed the
+  `crpix` dtype and `@overload` forms, and added `SolveFailure` /
+  `extract_centroids_fast` to `__all__`. `CatalogStar` now pickles.
+
 ## 0.8.0
 
 > **Note on serialized artifacts.** 0.8.0 changes the on-the-wire format of
