@@ -196,6 +196,16 @@ impl PyExtractionResult {
 ///         filter is used only to form the detection mask, so photometry
 ///         is unaffected. Consider lowering sigma_threshold when enabled.
 ///         None = disabled.
+///     max_sharpness: Reject blobs whose peak sharpness
+///         ``(peak - mean(8 neighbors)) / peak`` exceeds this — values near 1
+///         are hot pixels / cosmic rays, not stars. A critically sampled PSF
+///         scores ~0.5; strongly undersampled optics up to ~0.85; with a
+///         sub-pixel PSF real stars are indistinguishable from hot pixels,
+///         so leave it off. None = disabled (default).
+///     saturation_level: Pixel value at or above which the sensor is
+///         saturated; such blobs skip sub-pixel peak refinement (a flat top
+///         has no meaningful maximum) and keep the center-of-mass position.
+///         None = disabled.
 ///
 /// Returns:
 ///     ExtractionResult with centroids and image statistics.
@@ -209,6 +219,8 @@ impl PyExtractionResult {
     local_bg_block_size = Some(64),
     max_elongation = Some(3.0),
     matched_filter_sigma = None,
+    max_sharpness = None,
+    saturation_level = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_centroids(
@@ -220,6 +232,8 @@ pub(crate) fn extract_centroids(
     local_bg_block_size: Option<u32>,
     max_elongation: Option<f32>,
     matched_filter_sigma: Option<f32>,
+    max_sharpness: Option<f32>,
+    saturation_level: Option<f32>,
 ) -> PyResult<PyExtractionResult> {
     let (pixels, width, height) = image_to_f32(image)?;
 
@@ -234,6 +248,8 @@ pub(crate) fn extract_centroids(
         local_bg_block_size,
         max_elongation,
         matched_filter_sigma,
+        max_sharpness,
+        saturation_level,
     };
 
     let result =
@@ -269,6 +285,14 @@ pub(crate) fn extract_centroids(
 ///     min_pixels: Minimum pixels in a region (rejects hot pixels). Default 2.
 ///     max_centroids: Maximum number of centroids to return, brightest first.
 ///         None = all. A few dozen is plenty for solving / tracking.
+///     max_sharpness: Reject regions whose peak sharpness
+///         ``(peak - mean(8 neighbors)) / peak`` exceeds this — values near 1
+///         are hot pixels / cosmic rays, not stars; with a sub-pixel PSF
+///         real stars are indistinguishable, so leave it off.
+///         None = disabled (default).
+///     saturation_level: Pixel value at or above which the sensor is
+///         saturated; such regions skip sub-pixel peak refinement and keep
+///         the center-of-mass position. None = disabled.
 ///
 /// Returns:
 ///     ExtractionResult with centroids and image statistics.
@@ -279,13 +303,18 @@ pub(crate) fn extract_centroids(
     bg_grid = 64,
     min_pixels = 2,
     max_centroids = None,
+    max_sharpness = None,
+    saturation_level = None,
 ))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_centroids_fast(
     image: &Bound<'_, pyo3::PyAny>,
     sigma_threshold: f32,
     bg_grid: u32,
     min_pixels: usize,
     max_centroids: Option<usize>,
+    max_sharpness: Option<f32>,
+    saturation_level: Option<f32>,
 ) -> PyResult<PyExtractionResult> {
     let (pixels, width, height) = image_to_f32(image)?;
 
@@ -294,6 +323,8 @@ pub(crate) fn extract_centroids_fast(
         bg_grid,
         min_pixels,
         max_centroids,
+        max_sharpness,
+        saturation_level,
     };
 
     let result =

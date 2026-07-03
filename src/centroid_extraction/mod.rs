@@ -132,6 +132,27 @@ pub struct CentroidExtractionConfig {
     ///
     /// Default: None (disabled).
     pub matched_filter_sigma: Option<f32>,
+
+    /// Maximum DAOFIND-style sharpness: `(peak − mean(8 neighbors)) / peak`,
+    /// measured on the background-subtracted image at the blob's peak. Values
+    /// near 1 mean the flux is concentrated in a single pixel — a hot pixel
+    /// or cosmic-ray hit rather than a star. A critically sampled PSF scores
+    /// ~0.5; a strongly undersampled one can reach ~0.85; at very coarse
+    /// plate scales (PSF FWHM below a pixel, e.g. a 10° FOV on a 2k sensor)
+    /// real stars are single-pixel and indistinguishable from hot pixels, so
+    /// the gate must stay off. Enable (~0.7-0.9) only when the PSF spans
+    /// multiple pixels.
+    ///
+    /// Default: None (disabled)
+    pub max_sharpness: Option<f32>,
+
+    /// Pixel value at or above which the sensor is considered saturated.
+    /// A blob whose peak reaches this level skips quadratic peak refinement
+    /// (a flat-topped or bloomed profile has no meaningful sub-pixel
+    /// maximum), keeping the center-of-mass position instead.
+    ///
+    /// Default: None (disabled)
+    pub saturation_level: Option<f32>,
 }
 
 impl Default for CentroidExtractionConfig {
@@ -147,6 +168,8 @@ impl Default for CentroidExtractionConfig {
             local_bg_block_size: Some(64),
             max_elongation: Some(3.0),
             matched_filter_sigma: None,
+            max_sharpness: None,
+            saturation_level: None,
         }
     }
 }
@@ -304,6 +327,45 @@ fn accepted_peak_refine(
     }
 }
 
+/// DAOFIND-style sharpness of a blob peak: `(peak − mean(8 neighbors)) / peak`
+/// on background-subtracted values (`v(dy, dx)` samples relative to the peak,
+/// the same accessor convention as [`accepted_peak_refine`]). Out-of-bounds
+/// neighbors are skipped. Values near 1 mean the flux is concentrated in a
+/// single pixel — a hot pixel or cosmic-ray hit; a real PSF puts substantial
+/// flux into the neighbors (critically sampled ~0.5, strongly undersampled up
+/// to ~0.85). Returns `None` when the peak is non-positive or has no
+/// in-bounds neighbors (sharpness undefined — callers should not reject).
+fn peak_sharpness(
+    (pc, pr): (usize, usize),
+    (w, h): (usize, usize),
+    v: impl Fn(isize, isize) -> f64,
+) -> Option<f64> {
+    let peak = v(0, 0);
+    if peak <= 0.0 {
+        return None;
+    }
+    let mut sum = 0.0_f64;
+    let mut n = 0u32;
+    for dy in -1..=1_isize {
+        for dx in -1..=1_isize {
+            if dy == 0 && dx == 0 {
+                continue;
+            }
+            let rr = pr as isize + dy;
+            let cc = pc as isize + dx;
+            if rr < 0 || cc < 0 || rr >= h as isize || cc >= w as isize {
+                continue;
+            }
+            sum += v(dy, dx);
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    Some((peak - sum / n as f64) / peak)
+}
+
 /// Convert a DynamicImage to a Vec<f32> of grayscale values.
 fn to_grayscale_f32(img: &image::DynamicImage) -> Vec<f32> {
     use image::DynamicImage;
@@ -451,6 +513,113 @@ mod tests {
         assert!(c.x.abs() < 1.0, "Expected x near 0, got {}", c.x);
         assert!(c.y.abs() < 1.0, "Expected y near 0, got {}", c.y);
         assert!(c.mass.unwrap() > 0.0);
+    }
+
+    #[test]
+    fn test_peak_sharpness_values() {
+        // Lone hot pixel: all 8 neighbors zero → sharpness exactly 1.
+        let hot = |dy: isize, dx: isize| if dy == 0 && dx == 0 { 100.0 } else { 0.0 };
+        assert_eq!(peak_sharpness((1, 1), (3, 3), hot), Some(1.0));
+        // Flat plateau: neighbors equal the peak → sharpness 0.
+        let flat = |_: isize, _: isize| 50.0;
+        assert_eq!(peak_sharpness((1, 1), (3, 3), flat), Some(0.0));
+        // Corner peak: only the 3 in-bounds neighbors are averaged.
+        let corner = |dy: isize, dx: isize| if dy == 0 && dx == 0 { 90.0 } else { 30.0 };
+        assert_eq!(
+            peak_sharpness((0, 0), (3, 3), corner),
+            Some((90.0 - 30.0) / 90.0)
+        );
+        // Non-positive peak: undefined.
+        assert_eq!(peak_sharpness((1, 1), (3, 3), |_, _| -1.0), None);
+    }
+
+    #[test]
+    fn test_sharpness_gate_rejects_hot_pixel() {
+        // A real star plus a single hot pixel. The matched filter smears the
+        // hot pixel into a blob that passes `min_pixels`, but its sharpness
+        // on the *unfiltered* image (~1.0) trips the gate; the star (~0.5)
+        // survives. With the gate disabled, both are detected.
+        let (width, height) = (64u32, 64u32);
+        let mut pixels = render_stars(width, height, 10.0, 0.0, 2.0, 1.5, &[(20.0, 20.0, 800.0)]);
+        pixels[44 * 64 + 44] += 1200.0;
+
+        let base = CentroidExtractionConfig {
+            sigma_threshold: 4.0,
+            min_pixels: 3,
+            matched_filter_sigma: Some(1.5),
+            local_bg_block_size: None,
+            max_sharpness: Some(0.9),
+            ..Default::default()
+        };
+        let gated = extract_centroids_from_raw(&pixels, width, height, &base).unwrap();
+        assert_eq!(
+            gated.centroids.len(),
+            1,
+            "hot pixel should be rejected by the sharpness gate"
+        );
+        assert!((gated.centroids[0].x - (20.0 - 31.5)).abs() < 1.0);
+
+        let ungated = CentroidExtractionConfig {
+            max_sharpness: None,
+            ..base
+        };
+        let all = extract_centroids_from_raw(&pixels, width, height, &ungated).unwrap();
+        assert_eq!(
+            all.centroids.len(),
+            2,
+            "gate disabled: hot pixel should be detected"
+        );
+    }
+
+    #[test]
+    fn test_fast_path_sharpness_gate() {
+        // Single hot pixel with min_pixels = 1: only the sharpness gate can
+        // reject it on the fast path.
+        let (width, height) = (64u32, 64u32);
+        let mut pixels = render_stars(width, height, 10.0, 0.0, 2.0, 1.5, &[(20.0, 20.0, 800.0)]);
+        pixels[44 * 64 + 44] += 1200.0;
+
+        let base = FastCentroidConfig {
+            sigma_threshold: 4.0,
+            min_pixels: 1,
+            max_sharpness: Some(0.9),
+            ..Default::default()
+        };
+        let gated = extract_centroids_fast(&pixels, width, height, &base).unwrap();
+        assert_eq!(gated.centroids.len(), 1, "hot pixel should be rejected");
+
+        let ungated = FastCentroidConfig {
+            max_sharpness: None,
+            ..base
+        };
+        let all = extract_centroids_fast(&pixels, width, height, &ungated).unwrap();
+        assert_eq!(all.centroids.len(), 2, "gate disabled: hot pixel detected");
+    }
+
+    #[test]
+    fn test_saturation_guard_keeps_com() {
+        // A clipped (flat-top) star: with `saturation_level` set the parabola
+        // refinement is skipped and the CoM position is kept. The symmetric
+        // clipped PSF still centroids onto the true position.
+        let (width, height) = (64u32, 64u32);
+        let raw = render_stars(width, height, 10.0, 0.0, 1.0, 2.0, &[(30.0, 33.0, 20000.0)]);
+        let clipped: Vec<f32> = raw.iter().map(|&v| v.min(1000.0)).collect();
+
+        let config = CentroidExtractionConfig {
+            sigma_threshold: 4.0,
+            saturation_level: Some(1000.0),
+            local_bg_block_size: None,
+            ..Default::default()
+        };
+        let res = extract_centroids_from_raw(&clipped, width, height, &config).unwrap();
+        assert_eq!(res.centroids.len(), 1);
+        let c = &res.centroids[0];
+        assert!(
+            (c.x - (30.0 - 31.5)).abs() < 0.3 && (c.y - (33.0 - 31.5)).abs() < 0.3,
+            "saturated star CoM off: ({}, {})",
+            c.x,
+            c.y
+        );
     }
 
     /// Helper: render Gaussian stars on a background with an optional gradient

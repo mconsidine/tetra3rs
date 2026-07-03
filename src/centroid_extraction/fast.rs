@@ -4,7 +4,7 @@
 //! [`extract_centroids_fast`].
 
 use super::{
-    accepted_peak_refine, check_pixel_len, midpoint_f32, sort_and_truncate_by_mass,
+    accepted_peak_refine, check_pixel_len, midpoint_f32, peak_sharpness, sort_and_truncate_by_mass,
     CentroidExtractionResult,
 };
 use crate::centroid::Centroid;
@@ -40,6 +40,23 @@ pub struct FastCentroidConfig {
     /// all detections. For plate solving / tracking a few dozen is plenty.
     /// Default: None
     pub max_centroids: Option<usize>,
+
+    /// Maximum DAOFIND-style sharpness: `(peak − mean(8 neighbors)) / peak`,
+    /// measured on the background-subtracted image at the region's peak.
+    /// Values near 1 mean single-pixel flux — a hot pixel or cosmic-ray hit.
+    /// A critically sampled PSF scores ~0.5; a strongly undersampled one up
+    /// to ~0.85 — and at very coarse plate scales (sub-pixel PSF) real stars
+    /// are indistinguishable from hot pixels, so the gate must stay off.
+    /// Enable (~0.7-0.9) only when the PSF spans multiple pixels.
+    /// Default: None (disabled)
+    pub max_sharpness: Option<f32>,
+
+    /// Pixel value at or above which the sensor is considered saturated.
+    /// A region whose peak reaches this level skips the 3×3 parabola
+    /// refinement (a flat-topped profile has no meaningful sub-pixel
+    /// maximum), keeping the center-of-mass position.
+    /// Default: None (disabled)
+    pub saturation_level: Option<f32>,
 }
 
 impl Default for FastCentroidConfig {
@@ -49,6 +66,8 @@ impl Default for FastCentroidConfig {
             bg_grid: 64,
             min_pixels: 2,
             max_centroids: None,
+            max_sharpness: None,
+            saturation_level: None,
         }
     }
 }
@@ -247,8 +266,6 @@ pub fn extract_centroids_fast(
         let mut fx = reg.sum_wx / reg.sum_w;
         let mut fy = reg.sum_wy / reg.sum_w;
 
-        // Optional 3×3 parabola refine on the raw image at the peak (shared
-        // gate with the CCL path — see `accepted_peak_refine`).
         let (pc, pr) = (reg.peak_x as usize, reg.peak_y as usize);
         let bg = bilinear_grid(&bg_grid, nx, ny, block, pc, pr) as f64;
         let v = |dy: isize, dx: isize| -> f64 {
@@ -256,11 +273,27 @@ pub fn extract_centroids_fast(
             let cc = (pc as isize + dx) as usize;
             pixels[rr * w + cc] as f64 - bg
         };
-        if let Some((qx, qy)) =
-            accepted_peak_refine(reg.npix as usize, (pc, pr), (w, h), (fx, fy), v)
-        {
-            fx = qx;
-            fy = qy;
+
+        // Hot-pixel / cosmic-ray sharpness gate (shared with the CCL path).
+        if let Some(max_sharp) = config.max_sharpness {
+            if let Some(s) = peak_sharpness((pc, pr), (w, h), v) {
+                if s > max_sharp as f64 {
+                    continue;
+                }
+            }
+        }
+
+        // Optional 3×3 parabola refine on the raw image at the peak (shared
+        // gate with the CCL path — see `accepted_peak_refine`). Skipped for
+        // saturated peaks (no meaningful sub-pixel maximum on a flat top).
+        let saturated = config.saturation_level.is_some_and(|s| reg.peak_val >= s);
+        if !saturated {
+            if let Some((qx, qy)) =
+                accepted_peak_refine(reg.npix as usize, (pc, pr), (w, h), (fx, fy), v)
+            {
+                fx = qx;
+                fy = qy;
+            }
         }
 
         centroids.push(Centroid {

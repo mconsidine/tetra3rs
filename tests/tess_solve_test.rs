@@ -454,6 +454,7 @@ fn test_tess_fits_solve() {
             local_bg_block_size: Some(128),
             max_elongation: Some(30.0),
             matched_filter_sigma: None,
+            ..Default::default()
         };
 
         let extraction = tetra3::extract_centroids_from_raw(
@@ -613,6 +614,7 @@ fn bench_fast_vs_ccl_extraction() {
             bg_grid: 128,
             min_pixels: 3,
             max_centroids: None,
+            ..Default::default()
         };
 
         let best = |f: &dyn Fn() -> usize| -> (f64, usize) {
@@ -775,6 +777,7 @@ fn test_tess_distortion_fit_and_center_accuracy() {
             local_bg_block_size: Some(128),
             max_elongation: Some(30.0),
             matched_filter_sigma: None,
+            ..Default::default()
         };
 
         let extraction = tetra3::extract_centroids_from_raw(
@@ -976,6 +979,7 @@ fn test_tess_multi_image_calibration() {
         local_bg_block_size: Some(16),
         max_elongation: Some(6.0),
         matched_filter_sigma: None,
+        ..Default::default()
     };
 
     struct ImageData {

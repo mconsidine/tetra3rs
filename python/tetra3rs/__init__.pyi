@@ -1087,6 +1087,8 @@ def extract_centroids(
     local_bg_block_size: Optional[int] = 64,
     max_elongation: Optional[float] = 3.0,
     matched_filter_sigma: Optional[float] = None,
+    max_sharpness: Optional[float] = None,
+    saturation_level: Optional[float] = None,
 ) -> ExtractionResult:
     """Extract star centroids from a 2D image array.
 
@@ -1104,6 +1106,16 @@ def extract_centroids(
             (in pixels) before thresholding. Boosts point-source SNR; used
             only to form the detection mask so photometry is unaffected.
             Consider lowering sigma_threshold when enabled. None = disabled.
+        max_sharpness: Reject blobs whose peak sharpness
+            ``(peak - mean(8 neighbors)) / peak`` exceeds this — values near
+            1 are hot pixels / cosmic rays, not stars. A critically sampled
+            PSF scores ~0.5; strongly undersampled optics up to ~0.85; with
+            a sub-pixel PSF real stars are indistinguishable from hot pixels,
+            so leave it off. None = disabled (default).
+        saturation_level: Pixel value at or above which the sensor is
+            saturated; such blobs skip sub-pixel peak refinement (a flat top
+            has no meaningful maximum) and keep the center-of-mass position.
+            None = disabled.
 
     Returns:
         ExtractionResult with centroids and image statistics.
@@ -1116,6 +1128,8 @@ def extract_centroids_fast(
     bg_grid: int = 64,
     min_pixels: int = 2,
     max_centroids: Optional[int] = None,
+    max_sharpness: Optional[float] = None,
+    saturation_level: Optional[float] = None,
 ) -> ExtractionResult:
     """Fast single-pass centroid extraction — the "adequate star tracker" path.
 
@@ -1136,6 +1150,14 @@ def extract_centroids_fast(
         min_pixels: Minimum pixels in a region; rejects hot pixels.
         max_centroids: Maximum number of centroids to return, brightest first.
             None = all.
+        max_sharpness: Reject regions whose peak sharpness
+            ``(peak - mean(8 neighbors)) / peak`` exceeds this — values near
+            1 are hot pixels / cosmic rays, not stars; with a sub-pixel
+            PSF real stars are indistinguishable, so leave it off.
+            None = disabled (default).
+        saturation_level: Pixel value at or above which the sensor is
+            saturated; such regions skip sub-pixel peak refinement and keep
+            the center-of-mass position. None = disabled.
 
     Returns:
         ExtractionResult with centroids and image statistics.

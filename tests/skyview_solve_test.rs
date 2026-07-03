@@ -397,6 +397,7 @@ fn test_skyview_fits_solve() {
             local_bg_block_size: Some(64),
             max_elongation: Some(3.0),
             matched_filter_sigma: None,
+            ..Default::default()
         };
 
         let extraction =

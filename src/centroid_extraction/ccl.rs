@@ -12,7 +12,7 @@ use numeris::imageproc::{
 use numeris::DynMatrix;
 
 use super::{
-    accepted_peak_refine, median_f32, midpoint_f32, sort_and_truncate_by_mass,
+    accepted_peak_refine, median_f32, midpoint_f32, peak_sharpness, sort_and_truncate_by_mass,
     CentroidExtractionConfig, CentroidExtractionResult,
 };
 use crate::centroid::Centroid;
@@ -586,10 +586,6 @@ fn compute_blob_centroids(
             let cyy = sum_yy / sum_i - dy_bar * dy_bar;
             let cxy = sum_xy / sum_i - dx_bar * dy_bar;
 
-            // --- Quadratic peak refinement (shared gate; see accepted_peak_refine) ---
-            let mut final_x = xbar;
-            let mut final_y = ybar;
-
             let (pc, pr) = (peak_col, peak_row);
             // 3x3 grid of background-subtracted values around the peak
             let v = |dy: isize, dx: isize| -> f64 {
@@ -597,11 +593,30 @@ fn compute_blob_centroids(
                 let c = (pc as isize + dx) as usize;
                 gray[r * w + c] as f64 - local_bg
             };
-            if let Some((qx, qy)) =
-                accepted_peak_refine(pixel_count, (pc, pr), (w, h), (xbar, ybar), v)
-            {
-                final_x = qx;
-                final_y = qy;
+
+            // --- Hot-pixel / cosmic-ray sharpness gate ---
+            if let Some(max_sharp) = config.max_sharpness {
+                if let Some(s) = peak_sharpness((pc, pr), (w, h), v) {
+                    if s > max_sharp as f64 {
+                        return None;
+                    }
+                }
+            }
+
+            // --- Quadratic peak refinement (shared gate; see accepted_peak_refine) ---
+            // Skipped when the peak is saturated: a flat-topped or bloomed
+            // profile has no meaningful sub-pixel maximum, and a 2-3 px flat
+            // top can still "pass" the parabola with a skewed vertex.
+            let mut final_x = xbar;
+            let mut final_y = ybar;
+            let saturated = config.saturation_level.is_some_and(|s| peak_val >= s);
+            if !saturated {
+                if let Some((qx, qy)) =
+                    accepted_peak_refine(pixel_count, (pc, pr), (w, h), (xbar, ybar), v)
+                {
+                    final_x = qx;
+                    final_y = qy;
+                }
             }
 
             Some(RawCentroid {

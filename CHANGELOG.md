@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Added — extraction quality gates
+
+- **`max_sharpness`** (both extraction configs): DAOFIND-style hot-pixel /
+  cosmic-ray gate — rejects blobs whose peak sharpness
+  `(peak − mean(8 neighbors))/peak` exceeds the limit, measured on the
+  unfiltered background-subtracted image (so a matched-filter-smeared hot
+  pixel is still caught). Off by default: with a sub-pixel PSF (wide-FOV
+  trackers, e.g. 10° on a 2k sensor) real stars are indistinguishable from
+  hot pixels; enable (~0.7–0.9) only when the PSF spans multiple pixels.
+- **`saturation_level`** (both extraction configs): blobs whose peak reaches
+  the sensor's saturation level skip quadratic sub-pixel peak refinement (a
+  flat-topped or bloomed profile has no meaningful maximum) and keep the
+  center-of-mass position. Off by default.
+
 ### Fixed — CCL-path noise estimator (`sigma_threshold` semantics)
 
 `extract_centroids_from_raw` / `extract_centroids_from_image` (the CCL path)
