@@ -45,6 +45,7 @@ use image::GenericImageView;
 
 mod ccl;
 mod fast;
+mod runs;
 
 pub use fast::{extract_centroids_fast, FastCentroidConfig};
 
@@ -98,11 +99,6 @@ pub struct CentroidExtractionConfig {
     /// Pixels more than this many sigma from the mean are excluded.
     /// Default: 3.0
     pub sigma_clip_factor: f32,
-
-    /// Whether to use 8-connectivity (true) or 4-connectivity (false) for
-    /// connected component labeling.
-    /// Default: true (8-connectivity)
-    pub use_8_connectivity: bool,
 
     /// Block size (in pixels) for local background estimation.
     ///
@@ -193,7 +189,6 @@ impl Default for CentroidExtractionConfig {
             max_centroids: None,
             sigma_clip_iterations: 5,
             sigma_clip_factor: 3.0,
-            use_8_connectivity: true,
             local_bg_block_size: Some(64),
             max_elongation: Some(3.0),
             matched_filter_sigma: Some(1.5),

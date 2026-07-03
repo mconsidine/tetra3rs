@@ -6,13 +6,11 @@
 
 use std::borrow::Cow;
 
-use numeris::imageproc::{
-    connected_components_with_label_buffer, gaussian_blur, BorderMode, Component, Connectivity,
-};
+use numeris::imageproc::{gaussian_blur, BorderMode};
 use numeris::DynMatrix;
 
 use super::{
-    accepted_peak_refine, elongation_from_cov, median_f32, par, peak_sharpness,
+    accepted_peak_refine, elongation_from_cov, median_f32, par, peak_sharpness, runs,
     sort_and_truncate_by_mass, BackgroundGrid, CentroidExtractionConfig, CentroidExtractionResult,
     DeblendMode,
 };
@@ -145,29 +143,29 @@ pub(super) fn extract_from_gray(
     };
     let thresh_src: &[f32] = &thresh_src;
 
-    // ── Step 4: threshold and label blobs ──
-    // Build a u8 mask DynMatrix in proper (h, w) layout for CCL — its
-    // bbox/labels conventions assume the supplied dimensions match the image.
-    let mask = DynMatrix::<u8>::from_fn(h, w, |r, c| {
-        if thresh_src[r * w + c] > mask_threshold {
-            1u8
-        } else {
-            0u8
-        }
-    });
-    let connectivity = if config.use_8_connectivity {
-        Connectivity::Eight
-    } else {
-        Connectivity::Four
-    };
-    let (labels, components) = connected_components_with_label_buffer(&mask, connectivity, 0u8);
+    // ── Step 4: threshold into runs and group into regions ──
+    // The run-length union-find core replaces the u8 mask + u32 labels
+    // buffers of the old generic connected-component labeling; downstream
+    // stages iterate each region's run list instead of testing labels, and
+    // the annulus's "not in any blob" test becomes
+    // `thresh_src[i] <= mask_threshold` (equivalent: every lit pixel was in
+    // some region). 8-connectivity is inherent to the run merging.
+    let regions = runs::sweep_runs(w, h, |r, c| thresh_src[r * w + c] > mask_threshold);
 
-    // ── Step 4: compute centroids ──
-    let raw_centroids = compute_blob_centroids(gray, &labels, &components, width, height, config);
-    // "Raw" blob count = connected components before the size/elongation/mass
+    // ── Step 5: compute centroids ──
+    let raw_centroids = compute_blob_centroids(
+        gray,
+        thresh_src,
+        mask_threshold,
+        &regions,
+        width,
+        height,
+        config,
+    );
+    // "Raw" blob count = connected regions before the size/elongation/mass
     // filters, matching the field's documented meaning and the fast path's
     // pre-`min_pixels` region count.
-    let num_blobs_raw = components.len();
+    let num_blobs_raw = regions.n_regions;
 
     // ── Step 5: convert to centered pixel coordinates ──
     // Origin at the geometric image center, (W-1)/2 and (H-1)/2 (pixel centers
@@ -316,11 +314,12 @@ struct RawCentroid {
     cov: crate::Matrix2,
 }
 
-/// Compute intensity-weighted centroids for each labeled blob.
+/// Compute intensity-weighted centroids for each connected region.
 ///
-/// Consumes [`numeris::imageproc::Component`]s for area / bounding box, plus
-/// the row-major labels buffer for per-pixel masking. For each blob that
-/// passes size and elongation filters:
+/// Consumes the run-length regions from [`runs::sweep_runs`]; each stage
+/// iterates the region's run list (row-major, so accumulation order matches
+/// the historical bbox-scan order exactly). For each blob that passes size
+/// and elongation filters:
 /// 1. A local background is estimated from the median of non-blob pixels in a
 ///    5-pixel annulus around the blob's bounding box.
 /// 2. Intensity-weighted moments are accumulated with the local background
@@ -344,8 +343,9 @@ struct RawCentroid {
 /// keeps the two builds bit-identical here.
 fn compute_blob_centroids(
     gray: &[f32],
-    labels: &[u32],
-    components: &[Component],
+    thresh_src: &[f32],
+    mask_threshold: f32,
+    regions: &runs::RunRegions,
     width: u32,
     height: u32,
     config: &CentroidExtractionConfig,
@@ -353,210 +353,219 @@ fn compute_blob_centroids(
     let w = width as usize;
     let h = height as usize;
 
-    // Reused across blobs to avoid a fresh allocation per component (dense
-    // fields can have thousands). The closure is `FnMut`, so it may borrow and
-    // `clear()` this buffer each iteration.
+    let (offsets, order) = regions.group_by_region();
+
+    // Reused across blobs to avoid a fresh allocation per region (dense
+    // fields can have thousands).
     let mut annulus_vals: Vec<f32> = Vec::new();
+    let mut out: Vec<RawCentroid> = Vec::new();
 
-    components
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, comp)| {
-            let blob_label = (idx + 1) as u32;
-            let pixel_count = comp.area as usize;
-            if pixel_count < config.min_pixels || pixel_count > config.max_pixels {
-                return None;
-            }
+    'region: for k in 0..regions.n_regions {
+        let region_runs = &order[offsets[k] as usize..offsets[k + 1] as usize];
+        let pixel_count: usize = region_runs
+            .iter()
+            .map(|&i| regions.runs[i as usize].len())
+            .sum();
+        if pixel_count < config.min_pixels || pixel_count > config.max_pixels {
+            continue;
+        }
 
-            // Bounding box (numeris uses (row, col) with inclusive max).
-            let min_row = comp.bbox_min.0 as usize;
-            let max_row = comp.bbox_max.0 as usize;
-            let min_col = comp.bbox_min.1 as usize;
-            let max_col = comp.bbox_max.1 as usize;
+        // Bounding box from the (row-major) run list.
+        let mut min_row = usize::MAX;
+        let mut max_row = 0usize;
+        let mut min_col = usize::MAX;
+        let mut max_col = 0usize;
+        for &i in region_runs {
+            let run = regions.runs[i as usize];
+            min_row = min_row.min(run.row as usize);
+            max_row = max_row.max(run.row as usize);
+            min_col = min_col.min(run.c0 as usize);
+            max_col = max_col.max(run.c1 as usize);
+        }
 
-            // Reference pixel = bbox top-left, to keep moments numerically stable.
-            let ref_col = min_col;
-            let ref_row = min_row;
+        // Reference pixel = bbox top-left, to keep moments numerically stable.
+        let ref_col = min_col;
+        let ref_row = min_row;
 
-            // --- Per-blob local background from annulus ---
-            // Expand bounding box by margin, collect non-blob pixels
-            const ANNULUS_MARGIN: usize = 5;
-            let r0 = min_row.saturating_sub(ANNULUS_MARGIN);
-            let r1 = (max_row + ANNULUS_MARGIN + 1).min(h);
-            let c0 = min_col.saturating_sub(ANNULUS_MARGIN);
-            let c1 = (max_col + ANNULUS_MARGIN + 1).min(w);
+        // --- Per-blob local background from annulus ---
+        // Expand bounding box by margin, collect pixels that are not part of
+        // *any* region (below the detection threshold — every lit pixel was
+        // grouped into some region).
+        const ANNULUS_MARGIN: usize = 5;
+        let r0 = min_row.saturating_sub(ANNULUS_MARGIN);
+        let r1 = (max_row + ANNULUS_MARGIN + 1).min(h);
+        let c0 = min_col.saturating_sub(ANNULUS_MARGIN);
+        let c1 = (max_col + ANNULUS_MARGIN + 1).min(w);
 
-            annulus_vals.clear();
-            for r in r0..r1 {
-                let row_off = r * w;
-                for c in c0..c1 {
-                    let i = row_off + c;
-                    if labels[i] == 0 {
-                        annulus_vals.push(gray[i]);
-                    }
+        annulus_vals.clear();
+        for r in r0..r1 {
+            let row_off = r * w;
+            for c in c0..c1 {
+                let i = row_off + c;
+                if thresh_src[i] <= mask_threshold {
+                    annulus_vals.push(gray[i]);
                 }
             }
+        }
 
-            // Median of annulus (residual local background in bg-subtracted image).
-            let local_bg = median_f32(&mut annulus_vals) as f64;
+        // Median of annulus (residual local background in bg-subtracted image).
+        let local_bg = median_f32(&mut annulus_vals) as f64;
 
-            // --- Single moment pass: intensity-weighted moments with the
-            // annulus-local background, tracking the peak in the same sweep ---
-            let mut sum_x = 0.0_f64;
-            let mut sum_y = 0.0_f64;
-            let mut sum_xx = 0.0_f64;
-            let mut sum_yy = 0.0_f64;
-            let mut sum_xy = 0.0_f64;
-            let mut sum_i = 0.0_f64;
-            let mut peak_val = f32::NEG_INFINITY;
-            let mut peak_col: usize = ref_col;
-            let mut peak_row: usize = ref_row;
+        // --- Single moment pass: intensity-weighted moments with the
+        // annulus-local background, tracking the peak in the same sweep ---
+        let mut sum_x = 0.0_f64;
+        let mut sum_y = 0.0_f64;
+        let mut sum_xx = 0.0_f64;
+        let mut sum_yy = 0.0_f64;
+        let mut sum_xy = 0.0_f64;
+        let mut sum_i = 0.0_f64;
+        let mut peak_val = f32::NEG_INFINITY;
+        let mut peak_col: usize = ref_col;
+        let mut peak_row: usize = ref_row;
 
-            for r in min_row..=max_row {
+        for &i in region_runs {
+            let run = regions.runs[i as usize];
+            let r = run.row as usize;
+            let row_off = r * w;
+            for c in run.c0 as usize..=run.c1 as usize {
+                let raw = gray[row_off + c];
+                if raw > peak_val {
+                    peak_val = raw;
+                    peak_col = c;
+                    peak_row = r;
+                }
+                let intensity = (raw as f64 - local_bg).max(0.0);
+                let dx = c as f64 - ref_col as f64;
+                let dy = r as f64 - ref_row as f64;
+                sum_x += dx * intensity;
+                sum_y += dy * intensity;
+                sum_xx += dx * dx * intensity;
+                sum_yy += dy * dy * intensity;
+                sum_xy += dx * dy * intensity;
+                sum_i += intensity;
+            }
+        }
+
+        if sum_i <= 0.0 {
+            continue;
+        }
+
+        let dx_bar = sum_x / sum_i;
+        let dy_bar = sum_y / sum_i;
+        let xbar = ref_col as f64 + dx_bar;
+        let ybar = ref_row as f64 + dy_bar;
+        let cxx = sum_xx / sum_i - dx_bar * dx_bar;
+        let cyy = sum_yy / sum_i - dy_bar * dy_bar;
+        let cxy = sum_xy / sum_i - dx_bar * dy_bar;
+
+        // Elongation filter — judged on the same intensity-weighted moments
+        // reported as `cov`.
+        if let Some(max_elong) = config.max_elongation {
+            if elongation_from_cov(cxx, cyy, cxy) > max_elong {
+                continue;
+            }
+        }
+
+        let saturated = config.saturation_level.is_some_and(|s| peak_val >= s);
+
+        // --- Minimal deblending (see DeblendMode) ---
+        // A blended pair centroids to the flux-weighted midpoint — a wrong
+        // position the pattern hash will consume. Reject mode drops blobs
+        // with more than one distinct peak: strict local maxima over the
+        // 8-neighborhood, above 30% of the blob peak (over local
+        // background), more than 2 px from any brighter accepted peak.
+        // Saturated blobs are exempt (plateau noise fakes maxima on a
+        // genuinely single star).
+        if config.deblend == DeblendMode::Reject && !saturated {
+            let thresh = local_bg + 0.3 * (peak_val as f64 - local_bg);
+            let mut maxima: Vec<(f32, usize, usize)> = Vec::new();
+            for &i in region_runs {
+                let run = regions.runs[i as usize];
+                let r = run.row as usize;
                 let row_off = r * w;
-                for c in min_col..=max_col {
-                    let i = row_off + c;
-                    if labels[i] != blob_label {
+                for c in run.c0 as usize..=run.c1 as usize {
+                    let v = gray[row_off + c];
+                    if (v as f64) <= thresh {
                         continue;
                     }
-                    let raw = gray[i];
-                    if raw > peak_val {
-                        peak_val = raw;
-                        peak_col = c;
-                        peak_row = r;
-                    }
-                    let intensity = (raw as f64 - local_bg).max(0.0);
-                    let dx = c as f64 - ref_col as f64;
-                    let dy = r as f64 - ref_row as f64;
-                    sum_x += dx * intensity;
-                    sum_y += dy * intensity;
-                    sum_xx += dx * dx * intensity;
-                    sum_yy += dy * dy * intensity;
-                    sum_xy += dx * dy * intensity;
-                    sum_i += intensity;
-                }
-            }
-
-            if sum_i <= 0.0 {
-                return None;
-            }
-
-            let dx_bar = sum_x / sum_i;
-            let dy_bar = sum_y / sum_i;
-            let xbar = ref_col as f64 + dx_bar;
-            let ybar = ref_row as f64 + dy_bar;
-            let cxx = sum_xx / sum_i - dx_bar * dx_bar;
-            let cyy = sum_yy / sum_i - dy_bar * dy_bar;
-            let cxy = sum_xy / sum_i - dx_bar * dy_bar;
-
-            // Elongation filter — judged on the same intensity-weighted
-            // moments reported as `cov` (they were historically computed
-            // against the *global* background in a separate first pass,
-            // so elongation and cov could disagree on marginal blobs).
-            if let Some(max_elong) = config.max_elongation {
-                if elongation_from_cov(cxx, cyy, cxy) > max_elong {
-                    return None;
-                }
-            }
-
-            let saturated = config.saturation_level.is_some_and(|s| peak_val >= s);
-
-            // --- Minimal deblending (see DeblendMode) ---
-            // A blended pair centroids to the flux-weighted midpoint — a
-            // wrong position the pattern hash will consume. Reject mode
-            // drops blobs with more than one distinct peak: strict local
-            // maxima over the 8-neighborhood, above 30% of the blob peak
-            // (over local background), more than 2 px from any brighter
-            // accepted peak. Saturated blobs are exempt (plateau noise
-            // fakes maxima on a genuinely single star).
-            if config.deblend == DeblendMode::Reject && !saturated {
-                let thresh = local_bg + 0.3 * (peak_val as f64 - local_bg);
-                let mut maxima: Vec<(f32, usize, usize)> = Vec::new();
-                for r in min_row..=max_row {
-                    let row_off = r * w;
-                    for c in min_col..=max_col {
-                        let i = row_off + c;
-                        if labels[i] != blob_label || (gray[i] as f64) <= thresh {
-                            continue;
-                        }
-                        let v = gray[i];
-                        let mut is_max = true;
-                        'nb: for dr in -1..=1_isize {
-                            for dc in -1..=1_isize {
-                                if dr == 0 && dc == 0 {
-                                    continue;
-                                }
-                                let rr = r as isize + dr;
-                                let cc = c as isize + dc;
-                                if rr < 0 || cc < 0 || rr >= h as isize || cc >= w as isize {
-                                    continue;
-                                }
-                                if gray[rr as usize * w + cc as usize] >= v {
-                                    is_max = false;
-                                    break 'nb;
-                                }
+                    let mut is_max = true;
+                    'nb: for dr in -1..=1_isize {
+                        for dc in -1..=1_isize {
+                            if dr == 0 && dc == 0 {
+                                continue;
+                            }
+                            let rr = r as isize + dr;
+                            let cc = c as isize + dc;
+                            if rr < 0 || cc < 0 || rr >= h as isize || cc >= w as isize {
+                                continue;
+                            }
+                            if gray[rr as usize * w + cc as usize] >= v {
+                                is_max = false;
+                                break 'nb;
                             }
                         }
-                        if is_max {
-                            maxima.push((v, c, r));
-                        }
                     }
-                }
-                maxima.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-                let mut kept: Vec<(usize, usize)> = Vec::new();
-                for &(_, c, r) in &maxima {
-                    let distinct = kept.iter().all(|&(kc, kr)| {
-                        let dx = c as f64 - kc as f64;
-                        let dy = r as f64 - kr as f64;
-                        dx * dx + dy * dy > 4.0
-                    });
-                    if distinct {
-                        kept.push((c, r));
-                        if kept.len() > 1 {
-                            return None;
-                        }
+                    if is_max {
+                        maxima.push((v, c, r));
                     }
                 }
             }
-
-            let (pc, pr) = (peak_col, peak_row);
-            // 3x3 grid of background-subtracted values around the peak
-            let v = |dy: isize, dx: isize| -> f64 {
-                let r = (pr as isize + dy) as usize;
-                let c = (pc as isize + dx) as usize;
-                gray[r * w + c] as f64 - local_bg
-            };
-
-            // --- Hot-pixel / cosmic-ray sharpness gate ---
-            if let Some(max_sharp) = config.max_sharpness {
-                if let Some(s) = peak_sharpness((pc, pr), (w, h), v) {
-                    if s > max_sharp as f64 {
-                        return None;
+            maxima.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            let mut kept: Vec<(usize, usize)> = Vec::new();
+            for &(_, c, r) in &maxima {
+                let distinct = kept.iter().all(|&(kc, kr)| {
+                    let dx = c as f64 - kc as f64;
+                    let dy = r as f64 - kr as f64;
+                    dx * dx + dy * dy > 4.0
+                });
+                if distinct {
+                    kept.push((c, r));
+                    if kept.len() > 1 {
+                        continue 'region;
                     }
                 }
             }
+        }
 
-            // --- Quadratic peak refinement (shared gate; see accepted_peak_refine) ---
-            // Skipped when the peak is saturated: a flat-topped or bloomed
-            // profile has no meaningful sub-pixel maximum, and a 2-3 px flat
-            // top can still "pass" the parabola with a skewed vertex.
-            let mut final_x = xbar;
-            let mut final_y = ybar;
-            if !saturated {
-                if let Some((qx, qy)) =
-                    accepted_peak_refine(pixel_count, (pc, pr), (w, h), (xbar, ybar), v)
-                {
-                    final_x = qx;
-                    final_y = qy;
+        let (pc, pr) = (peak_col, peak_row);
+        // 3x3 grid of background-subtracted values around the peak
+        let v = |dy: isize, dx: isize| -> f64 {
+            let r = (pr as isize + dy) as usize;
+            let c = (pc as isize + dx) as usize;
+            gray[r * w + c] as f64 - local_bg
+        };
+
+        // --- Hot-pixel / cosmic-ray sharpness gate ---
+        if let Some(max_sharp) = config.max_sharpness {
+            if let Some(s) = peak_sharpness((pc, pr), (w, h), v) {
+                if s > max_sharp as f64 {
+                    continue;
                 }
             }
+        }
 
-            Some(RawCentroid {
-                x_px: final_x as f32,
-                y_px: final_y as f32,
-                mass: sum_i as f32,
-                cov: crate::Matrix2::new([[cxx as f32, cxy as f32], [cxy as f32, cyy as f32]]),
-            })
-        })
-        .collect()
+        // --- Quadratic peak refinement (shared gate; see accepted_peak_refine) ---
+        // Skipped when the peak is saturated: a flat-topped or bloomed
+        // profile has no meaningful sub-pixel maximum, and a 2-3 px flat
+        // top can still "pass" the parabola with a skewed vertex.
+        let mut final_x = xbar;
+        let mut final_y = ybar;
+        if !saturated {
+            if let Some((qx, qy)) =
+                accepted_peak_refine(pixel_count, (pc, pr), (w, h), (xbar, ybar), v)
+            {
+                final_x = qx;
+                final_y = qy;
+            }
+        }
+
+        out.push(RawCentroid {
+            x_px: final_x as f32,
+            y_px: final_y as f32,
+            mass: sum_i as f32,
+            cov: crate::Matrix2::new([[cxx as f32, cxy as f32], [cxy as f32, cyy as f32]]),
+        });
+    }
+
+    out
 }

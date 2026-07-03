@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Changed (breaking) — one run-length detection core; `use_8_connectivity` removed
+
+Both extraction paths now detect through a single run-length union-find core
+(`sweep_runs`): a raster sweep turns the threshold predicate into horizontal
+runs, merges 8-connected runs across rows, and hands each caller its regions
+as run lists. The quality path no longer materializes a u8 mask or a u32
+labels buffer (~10 MB at 2 Mpix) and its per-blob stages iterate run lists
+in the same row-major order as before (moment sums bit-identical; TESS
+calibration metrics unchanged to the last digit). Measured on 2048² TESS
+frames: CCL extraction ~42 → ~26 ms (cumulative 71.5 → 26 ms this release),
+fast path ~23 → ~15-20 ms.
+
+**Breaking:** `CentroidExtractionConfig.use_8_connectivity` is removed —
+run merging is 8-connected by construction (4-connectivity was never useful
+for stars). The Python API is unaffected (it always used 8-connectivity).
+
 ### Changed — matched filter on by default, threshold auto-compensated
 
 - **`matched_filter_sigma` defaults to `Some(1.5)`** (was `None`): every

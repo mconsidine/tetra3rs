@@ -262,7 +262,6 @@ pub(crate) fn extract_centroids(
         max_centroids,
         sigma_clip_iterations: 5,
         sigma_clip_factor: 3.0,
-        use_8_connectivity: true,
         local_bg_block_size,
         max_elongation,
         matched_filter_sigma,

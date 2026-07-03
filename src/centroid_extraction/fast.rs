@@ -4,7 +4,7 @@
 //! [`extract_centroids_fast`].
 
 use super::{
-    accepted_peak_refine, check_pixel_len, elongation_from_cov, peak_sharpness,
+    accepted_peak_refine, check_pixel_len, elongation_from_cov, peak_sharpness, runs,
     sort_and_truncate_by_mass, BackgroundGrid, CentroidExtractionResult,
 };
 use crate::centroid::Centroid;
@@ -90,23 +90,6 @@ impl Default for FastCentroidConfig {
     }
 }
 
-/// Per-region moment accumulator for the single-pass detector. One per pixel
-/// **run**; runs that connect across rows are merged by union-find at the end.
-#[derive(Clone, Copy)]
-struct Region {
-    parent: u32,
-    sum_w: f64,   // Σ (value − bg), the background-subtracted flux
-    sum_wx: f64,  // Σ x·(value − bg)
-    sum_wy: f64,  // Σ y·(value − bg)
-    sum_wxx: f64, // Σ x²·(value − bg)
-    sum_wyy: f64, // Σ y²·(value − bg)
-    sum_wxy: f64, // Σ x·y·(value − bg)
-    npix: u32,
-    peak_val: f32,
-    peak_x: u32,
-    peak_y: u32,
-}
-
 /// Fast single-pass centroid extraction — the "adequate star tracker" path.
 ///
 /// An alternative to [`extract_centroids_from_raw`] that reads each pixel
@@ -164,158 +147,92 @@ pub fn extract_centroids_fast(
     let nx = w.div_ceil(block);
     let k = config.sigma_threshold;
 
-    // ── Single raster sweep: run-length detection + union-find moments ──
-    let mut regions: Vec<Region> = Vec::new();
-    // Runs of the previous / current row: (col_start, col_end_inclusive, label).
-    let mut prev: Vec<(u32, u32, u32)> = Vec::new();
-    let mut cur: Vec<(u32, u32, u32)> = Vec::new();
-
-    // Row-blended copy of the background grid, rebuilt at each row: the
-    // y-half of the bilinear interpolation is row-constant, so hoisting it
-    // leaves only a 1-D lerp per pixel in the sweep (the dominant cost).
+    // ── Single raster sweep via the shared run-length core ──
+    // The `lit` closure hoists the row-constant half of the background
+    // interpolation itself (rebuilt when the row changes); moments are
+    // computed afterwards from the run lists — lit pixels are ≪1% of the
+    // image, so the second touch of them is nearly free and keeps the sweep
+    // core shared with the quality path.
     let mut grid_row = vec![0.0_f32; nx];
-
-    for r in 0..h {
-        cur.clear();
-        let row = r * w;
-        let mut active: Option<(u32, Region)> = None; // (start_col, accumulator)
-
-        bg.blend_row(bg.row_params(r), &mut grid_row);
-
-        for c in 0..w {
-            let bgv = bg.lerp_in_row(&grid_row, c);
-            let p = pixels[row + c];
-            let lit = p.is_finite() && p > bgv + k * sigma;
-
-            if lit {
-                let weight = (p - bgv).max(0.0) as f64;
-                // Start a new run only when one isn't already open (building the
-                // Region eagerly every lit pixel would be wasteful).
-                if active.is_none() {
-                    active = Some((
-                        c as u32,
-                        Region {
-                            parent: 0, // set when finalized
-                            sum_w: 0.0,
-                            sum_wx: 0.0,
-                            sum_wy: 0.0,
-                            sum_wxx: 0.0,
-                            sum_wyy: 0.0,
-                            sum_wxy: 0.0,
-                            npix: 0,
-                            peak_val: f32::NEG_INFINITY,
-                            peak_x: c as u32,
-                            peak_y: r as u32,
-                        },
-                    ));
-                }
-                let reg = &mut active.as_mut().unwrap().1;
-                let (cf, rf) = (c as f64, r as f64);
-                reg.sum_w += weight;
-                reg.sum_wx += weight * cf;
-                reg.sum_wy += weight * rf;
-                reg.sum_wxx += weight * cf * cf;
-                reg.sum_wyy += weight * rf * rf;
-                reg.sum_wxy += weight * cf * rf;
-                reg.npix += 1;
-                if p > reg.peak_val {
-                    reg.peak_val = p;
-                    reg.peak_x = c as u32;
-                    reg.peak_y = r as u32;
-                }
-            } else if let Some((start, mut reg)) = active.take() {
-                let label = regions.len() as u32;
-                reg.parent = label;
-                regions.push(reg);
-                cur.push((start, c as u32 - 1, label));
-            }
+    let mut grid_row_y = usize::MAX;
+    let regions = runs::sweep_runs(w, h, |r, c| {
+        if r != grid_row_y {
+            bg.blend_row(bg.row_params(r), &mut grid_row);
+            grid_row_y = r;
         }
-        if let Some((start, mut reg)) = active.take() {
-            let label = regions.len() as u32;
-            reg.parent = label;
-            regions.push(reg);
-            cur.push((start, w as u32 - 1, label));
-        }
+        let p = pixels[r * w + c];
+        p.is_finite() && p > bg.lerp_in_row(&grid_row, c) + k * sigma
+    });
+    let (offsets, order) = regions.group_by_region();
 
-        // Merge current-row runs with 8-connected previous-row runs. Both lists
-        // are column-sorted, so a two-pointer sweep finds all overlaps.
-        let (mut i, mut j) = (0usize, 0usize);
-        while i < cur.len() && j < prev.len() {
-            let (cs, ce, cl) = cur[i];
-            let (ps, pe, pl) = prev[j];
-            if ce + 1 < ps {
-                i += 1; // current run ends left of (and not adjacent to) prev
-            } else if pe + 1 < cs {
-                j += 1; // prev run ends left of current
-            } else {
-                union(&mut regions, cl, pl);
-                if ce < pe {
-                    i += 1;
-                } else {
-                    j += 1;
-                }
-            }
-        }
-
-        std::mem::swap(&mut prev, &mut cur);
-    }
-
-    // ── Resolve union-find: fold each region into its root ──
-    let n_labels = regions.len();
-    for lab in 0..n_labels {
-        let root = find(&mut regions, lab as u32) as usize;
-        if root != lab {
-            let child = regions[lab];
-            let rt = &mut regions[root];
-            rt.sum_w += child.sum_w;
-            rt.sum_wx += child.sum_wx;
-            rt.sum_wy += child.sum_wy;
-            rt.sum_wxx += child.sum_wxx;
-            rt.sum_wyy += child.sum_wyy;
-            rt.sum_wxy += child.sum_wxy;
-            rt.npix += child.npix;
-            let (pv, px, py) = (child.peak_val, child.peak_x, child.peak_y);
-            if pv > rt.peak_val {
-                rt.peak_val = pv;
-                rt.peak_x = px;
-                rt.peak_y = py;
-            }
-        }
-    }
-
-    // ── Emit one centroid per root region ──
+    // ── Emit one centroid per region ──
     // Origin at the geometric image center (W-1)/2, (H-1)/2 (see the CCL path).
     let cx = (width - 1) as f32 / 2.0;
     let cy = (height - 1) as f32 / 2.0;
     let mut centroids: Vec<Centroid> = Vec::new();
-    let mut num_blobs_raw = 0usize;
-    for lab in 0..n_labels {
-        if find(&mut regions, lab as u32) as usize != lab {
-            continue; // not a root
-        }
-        num_blobs_raw += 1;
-        let reg = regions[lab];
-        if (reg.npix as usize) < config.min_pixels
-            || (reg.npix as usize) > config.max_pixels
-            || reg.sum_w <= 0.0
-        {
+    let num_blobs_raw = regions.n_regions;
+    'region: for kreg in 0..regions.n_regions {
+        let region_runs = &order[offsets[kreg] as usize..offsets[kreg + 1] as usize];
+        let npix: usize = region_runs
+            .iter()
+            .map(|&i| regions.runs[i as usize].len())
+            .sum();
+        if npix < config.min_pixels || npix > config.max_pixels {
             continue;
         }
-        let mut fx = reg.sum_wx / reg.sum_w;
-        let mut fy = reg.sum_wy / reg.sum_w;
+
+        // Intensity-weighted moments over the run list, background
+        // re-interpolated per run (identical arithmetic to the sweep's).
+        let mut sum_w = 0.0_f64;
+        let mut sum_wx = 0.0_f64;
+        let mut sum_wy = 0.0_f64;
+        let mut sum_wxx = 0.0_f64;
+        let mut sum_wyy = 0.0_f64;
+        let mut sum_wxy = 0.0_f64;
+        let mut peak_val = f32::NEG_INFINITY;
+        let mut peak_x = 0usize;
+        let mut peak_y = 0usize;
+        for &i in region_runs {
+            let run = regions.runs[i as usize];
+            let r = run.row as usize;
+            let rp = bg.row_params(r);
+            let row_off = r * w;
+            for c in run.c0 as usize..=run.c1 as usize {
+                let p = pixels[row_off + c];
+                let weight = (p - bg.value_at(c, rp)).max(0.0) as f64;
+                let (cf, rf) = (c as f64, r as f64);
+                sum_w += weight;
+                sum_wx += weight * cf;
+                sum_wy += weight * rf;
+                sum_wxx += weight * cf * cf;
+                sum_wyy += weight * rf * rf;
+                sum_wxy += weight * cf * rf;
+                if p > peak_val {
+                    peak_val = p;
+                    peak_x = c;
+                    peak_y = r;
+                }
+            }
+        }
+        if sum_w <= 0.0 {
+            continue;
+        }
+
+        let mut fx = sum_wx / sum_w;
+        let mut fy = sum_wy / sum_w;
 
         // Intensity-weighted central second moments — the same statistic the
         // CCL path reports as `cov` and judges elongation on.
-        let cxx = reg.sum_wxx / reg.sum_w - fx * fx;
-        let cyy = reg.sum_wyy / reg.sum_w - fy * fy;
-        let cxy = reg.sum_wxy / reg.sum_w - fx * fy;
+        let cxx = sum_wxx / sum_w - fx * fx;
+        let cyy = sum_wyy / sum_w - fy * fy;
+        let cxy = sum_wxy / sum_w - fx * fy;
         if let Some(max_elong) = config.max_elongation {
             if elongation_from_cov(cxx, cyy, cxy) > max_elong {
-                continue;
+                continue 'region;
             }
         }
 
-        let (pc, pr) = (reg.peak_x as usize, reg.peak_y as usize);
+        let (pc, pr) = (peak_x, peak_y);
         let peak_bg = bg.value_at(pc, bg.row_params(pr)) as f64;
         let v = |dy: isize, dx: isize| -> f64 {
             let rr = (pr as isize + dy) as usize;
@@ -335,11 +252,9 @@ pub fn extract_centroids_fast(
         // Optional 3×3 parabola refine on the raw image at the peak (shared
         // gate with the CCL path — see `accepted_peak_refine`). Skipped for
         // saturated peaks (no meaningful sub-pixel maximum on a flat top).
-        let saturated = config.saturation_level.is_some_and(|s| reg.peak_val >= s);
+        let saturated = config.saturation_level.is_some_and(|s| peak_val >= s);
         if !saturated {
-            if let Some((qx, qy)) =
-                accepted_peak_refine(reg.npix as usize, (pc, pr), (w, h), (fx, fy), v)
-            {
+            if let Some((qx, qy)) = accepted_peak_refine(npix, (pc, pr), (w, h), (fx, fy), v) {
                 fx = qx;
                 fy = qy;
             }
@@ -348,7 +263,7 @@ pub fn extract_centroids_fast(
         centroids.push(Centroid {
             x: fx as f32 - cx,
             y: fy as f32 - cy,
-            mass: Some(reg.sum_w as f32),
+            mass: Some(sum_w as f32),
             cov: Some(crate::Matrix2::new([
                 [cxx as f32, cxy as f32],
                 [cxy as f32, cyy as f32],
@@ -369,23 +284,4 @@ pub fn extract_centroids_fast(
         threshold: bg_mean + k * sigma,
         num_blobs_raw,
     })
-}
-
-/// Union-find root with path halving over the region accumulators.
-fn find(regions: &mut [Region], mut x: u32) -> u32 {
-    while regions[x as usize].parent != x {
-        let parent = regions[x as usize].parent;
-        regions[x as usize].parent = regions[parent as usize].parent; // halve
-        x = regions[x as usize].parent;
-    }
-    x
-}
-
-/// Link the roots of two region labels.
-fn union(regions: &mut [Region], a: u32, b: u32) {
-    let ra = find(regions, a);
-    let rb = find(regions, b);
-    if ra != rb {
-        regions[ra as usize].parent = rb;
-    }
 }
