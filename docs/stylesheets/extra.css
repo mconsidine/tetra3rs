@@ -1,71 +1,55 @@
-/* Ioskeley Mono — self-hosted */
-@font-face {
-    font-family: "Ioskeley Mono";
-    font-style: normal;
-    font-weight: 400;
-    src: url("../fonts/IoskeleyMono-Regular.woff2") format("woff2");
-    font-display: swap;
-}
-@font-face {
-    font-family: "Ioskeley Mono";
-    font-style: normal;
-    font-weight: 700;
-    src: url("../fonts/IoskeleyMono-Bold.woff2") format("woff2");
-    font-display: swap;
-}
-
-/* Apply Ioskeley Mono as the monospace font */
+/* Apply JetBrains Mono as the monospace font (loaded via mkdocs.yml) */
 :root {
-    --md-code-font: "Ioskeley Mono", SFMono-Regular, Consolas, monospace;
+    --md-code-font: "JetBrains Mono", SFMono-Regular, Consolas, monospace;
 }
 
-/* Earth tone palette overrides — light mode */
+/* "Deep Space" palette — light mode */
 [data-md-color-scheme="default"] {
-    --md-primary-fg-color: #5d4037;
-    --md-primary-fg-color--light: #8b6b61;
-    --md-primary-fg-color--dark: #3e2723;
-    --md-accent-fg-color: #bf8040;
-    --md-default-bg-color: #faf8f5;
-    --md-default-fg-color--light: #5c524a;
-    --md-typeset-a-color: #8d6e3f;
+    --md-primary-fg-color: #1a2744;
+    --md-primary-fg-color--light: #2d3f66;
+    --md-primary-fg-color--dark: #0f1a33;
+    --md-accent-fg-color: #0891b2;
+    --md-default-bg-color: #fafbfc;
+    --md-default-fg-color--light: #475569;
+    --md-typeset-a-color: #0891b2;
 }
 
-/* Warm code block backgrounds — light mode */
+/* Cool code block backgrounds — light mode */
 [data-md-color-scheme="default"] .highlight,
 [data-md-color-scheme="default"] .md-typeset code {
-    background-color: #f3ece4;
+    background-color: #f1f5f9;
 }
 
-/* Admonition accent colors — light mode */
+/* Admonition accent — light mode */
 [data-md-color-scheme="default"] .md-typeset .admonition,
 [data-md-color-scheme="default"] .md-typeset details {
-    border-color: #bf8040;
+    border-color: #0891b2;
 }
 
-/* Earth tone palette overrides — dark mode */
+/* "Deep Space" palette — dark mode */
 [data-md-color-scheme="slate"] {
-    --md-primary-fg-color: #4e342e;
-    --md-primary-fg-color--light: #6d4c41;
-    --md-primary-fg-color--dark: #3e2723;
-    --md-accent-fg-color: #d4a06a;
-    --md-default-bg-color: #1e1b18;
-    --md-default-fg-color: #e0d6cc;
-    --md-default-fg-color--light: #b8a99a;
-    --md-typeset-a-color: #d4a06a;
+    --md-primary-fg-color: #0f1a33;
+    --md-primary-fg-color--light: #1e2d4d;
+    --md-primary-fg-color--dark: #0a1226;
+    --md-accent-fg-color: #22d3ee;
+    --md-default-bg-color: #0f1419;
+    --md-default-fg-color: #e2e8f0;
+    --md-default-fg-color--light: #94a3b8;
+    --md-typeset-a-color: #22d3ee;
 }
 
-/* Warm code block backgrounds — dark mode */
+/* Cool code block backgrounds — dark mode */
 [data-md-color-scheme="slate"] .highlight,
 [data-md-color-scheme="slate"] .md-typeset code {
-    background-color: #2a2420;
+    background-color: #1a222e;
 }
 
 /* Sidebar styling */
 [data-md-color-scheme="default"] .md-sidebar {
-    border-right: 1px solid #e8e0d6;
+    border-right: 1px solid #e2e8f0;
 }
 [data-md-color-scheme="slate"] .md-sidebar {
-    border-right: 1px solid #332d28;
+    border-right: 1px solid #1e293b;
 }
 
 /* Widen the main content area */
@@ -93,7 +77,7 @@
     width: auto;
 }
 
-/* Constrain Plotly and other large embedded figures */
+/* Constrain large embedded figures */
 .jp-OutputArea-output > div,
 .cell_output > div {
     max-width: 100%;

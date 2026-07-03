@@ -32,5 +32,3 @@ Python API documentation for tetra3rs, auto-generated from type stubs.
 | Function | Description |
 |----------|-------------|
 | [`earth_barycentric_velocity()`](functions.md#tetra3rs.earth_barycentric_velocity) | Approximate Earth barycentric velocity for aberration correction |
-| [`undistort_centroids()`](functions.md#tetra3rs.undistort_centroids) | Apply inverse distortion to a list of centroids |
-| [`distort_centroids()`](functions.md#tetra3rs.distort_centroids) | Apply forward distortion to a list of centroids |

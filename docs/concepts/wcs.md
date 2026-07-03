@@ -61,3 +61,5 @@ After the initial attitude solve (SVD), tetra3rs performs a constrained 3-DOF ta
 2. **dξ₀, dη₀** — CRVAL offset in tangent-plane coordinates
 
 The pixel scale is locked to the value from the initial solve. Sigma-clipping rejects outlier matches during the refinement. This produces a more accurate WCS that minimizes residuals across all matched stars.
+
+The refined attitude is then re-verified at a match radius tied to the refined RMSE — final acceptance of a solve is decided on the refined solution, not the initial SVD estimate. See [Algorithm Overview](algorithm.md) for the verification statistics.
