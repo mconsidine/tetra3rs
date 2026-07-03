@@ -427,6 +427,40 @@ class TestExtractCentroids:
             nearest = min(((fx - cx) ** 2 + (fy - cy) ** 2) ** 0.5 for fx, fy in found)
             assert nearest < 1.0, f"spot ({cx},{cy}) nearest detection {nearest:.2f} px"
 
+    def test_degenerate_image_raises_not_panics(self):
+        """Zero-size / 1-wide images and bad config raise, not abort."""
+        empty = np.zeros((0, 0), dtype=np.float32)
+        with pytest.raises((ValueError, TypeError)):
+            tetra3rs.extract_centroids(empty)
+        tiny = np.zeros((1, 1), dtype=np.float32)
+        with pytest.raises(ValueError):
+            tetra3rs.extract_centroids(tiny)
+        img = np.zeros((16, 16), dtype=np.float32)
+        with pytest.raises(ValueError):
+            tetra3rs.extract_centroids(img, local_bg_block_size=0)
+
+    def test_non_ndarray_raises_typeerror(self):
+        """A plain list gives a clear TypeError, not an AttributeError."""
+        with pytest.raises(TypeError):
+            tetra3rs.extract_centroids([[1.0, 2.0], [3.0, 4.0]])
+
+    def test_big_endian_matches_native(self):
+        """Big-endian input (as FITS yields) extracts the same as native."""
+        h, w = 128, 128
+        native = np.full((h, w), 100.0, dtype=np.float32)
+        yy, xx = np.mgrid[54:75, 54:75]
+        native[yy, xx] += (
+            5000 * np.exp(-((yy - 64) ** 2 + (xx - 64) ** 2) / (2 * 2.0**2))
+        ).astype(np.float32)
+        big_endian = native.astype(">f4")
+        assert not big_endian.dtype.isnative
+        r_native = tetra3rs.extract_centroids(native, sigma_threshold=5.0)
+        r_big = tetra3rs.extract_centroids(big_endian, sigma_threshold=5.0)
+        assert len(r_native.centroids) == len(r_big.centroids) >= 1
+        assert r_native.image_width == r_big.image_width
+        # Same values in → same centroid position out.
+        assert abs(r_native.centroids[0].x - r_big.centroids[0].x) < 1e-4
+
     def test_fast_result_pickle_and_drop_in(self):
         """Fast path returns a pickleable ExtractionResult with usable centroids."""
         h, w = 64, 64

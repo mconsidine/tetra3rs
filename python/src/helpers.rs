@@ -62,13 +62,24 @@ pub(crate) fn parse_centroids_single(
     centroids: &Bound<'_, pyo3::PyAny>,
 ) -> PyResult<Vec<Centroid>> {
     if let Ok(list) = centroids.cast::<pyo3::types::PyList>() {
-        list.iter()
+        return list
+            .iter()
             .map(|item| {
                 let c: PyCentroid = item.extract()?;
                 Ok(c.inner)
             })
-            .collect()
-    } else if let Ok(arr) = centroids.extract::<PyReadonlyArray2<f64>>() {
+            .collect();
+    }
+    // numpy array path. Accept any numeric 2-D dtype (float32, ints, big-endian
+    // FITS data, …) by casting to native float64 — not just the float64 the
+    // caller might not have built.
+    if centroids.hasattr("dtype").unwrap_or(false) {
+        let arr_obj = centroids.call_method1("astype", ("float64",))?;
+        let arr = arr_obj.extract::<PyReadonlyArray2<f64>>().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(
+                "centroids array must be a 2-D numeric numpy array (Nx2 or Nx3)",
+            )
+        })?;
         let a = arr.as_array();
         let ncols = a.shape()[1];
         if ncols < 2 {
@@ -76,7 +87,7 @@ pub(crate) fn parse_centroids_single(
                 "centroids array must have at least 2 columns (x, y)",
             ));
         }
-        Ok((0..a.shape()[0])
+        return Ok((0..a.shape()[0])
             .map(|i| Centroid {
                 x: a[[i, 0]] as f32,
                 y: a[[i, 1]] as f32,
@@ -87,11 +98,23 @@ pub(crate) fn parse_centroids_single(
                 },
                 cov: None,
             })
-            .collect())
-    } else {
-        Err(pyo3::exceptions::PyTypeError::new_err(
-            "centroids must be a list of Centroid objects or an Nx2/Nx3 numpy array",
-        ))
+            .collect());
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "centroids must be a list of Centroid objects or an Nx2/Nx3 numpy array",
+    ))
+}
+
+/// Map a `tetra3::Error` to the most appropriate Python exception type, so
+/// callers get `ValueError` for bad input, `IOError` for file problems, etc.,
+/// instead of an undifferentiated `RuntimeError`.
+pub(crate) fn map_tetra3_err(e: tetra3::Error) -> PyErr {
+    use pyo3::exceptions::{PyIOError, PyValueError};
+    match e {
+        tetra3::Error::InvalidInput(m) => PyValueError::new_err(m),
+        tetra3::Error::InvalidCatalog(m) => PyValueError::new_err(format!("invalid catalog: {m}")),
+        tetra3::Error::Io(e) => PyIOError::new_err(e.to_string()),
+        tetra3::Error::Postcard(e) => PyRuntimeError::new_err(format!("postcard error: {e}")),
     }
 }
 

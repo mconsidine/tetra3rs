@@ -20,10 +20,36 @@ struct ExtractionResultSer {
 
 /// Convert a 2D numpy array of any supported dtype to Vec<f32>.
 ///
-/// Supported dtypes: float64, float32, uint8, uint16, int16.
+/// Supported dtypes: float64, float32, uint8, uint16, int16. Non-native byte
+/// order (e.g. the big-endian `>f4` that `np.frombuffer` produces from FITS
+/// data) is converted to native order first.
 fn image_to_f32(image: &Bound<'_, pyo3::PyAny>) -> PyResult<(Vec<f32>, u32, u32)> {
-    // Get the dtype string to dispatch
-    let dtype = image.getattr("dtype")?;
+    use pyo3::exceptions::PyTypeError;
+
+    // Require a numpy array. A plain list (or anything without `dtype`) should
+    // get a clear TypeError rather than a confusing AttributeError.
+    let Ok(dtype) = image.getattr("dtype") else {
+        return Err(PyTypeError::new_err(
+            "image must be a 2D numpy array (got an object with no 'dtype')",
+        ));
+    };
+    let ndim: usize = image.getattr("ndim")?.extract()?;
+    if ndim != 2 {
+        return Err(PyTypeError::new_err(format!(
+            "image must be a 2D numpy array, got {ndim} dimension(s)"
+        )));
+    }
+
+    // Normalize non-native byte order (FITS arrays are big-endian). `astype`
+    // with a native-order dtype yields a correctly-valued native copy; recurse
+    // once on it (it then passes the is-native check).
+    let is_native: bool = dtype.getattr("isnative")?.extract()?;
+    if !is_native {
+        let native_dtype = dtype.call_method1("newbyteorder", ("=",))?;
+        let converted = image.call_method1("astype", (native_dtype,))?;
+        return image_to_f32(&converted);
+    }
+
     let kind: String = dtype.getattr("kind")?.extract()?;
     let itemsize: usize = dtype.getattr("itemsize")?.extract()?;
 
@@ -243,7 +269,7 @@ pub(crate) fn extract_centroids(
 
     let result =
         tetra3::centroid_extraction::extract_centroids_from_raw(&pixels, width, height, &config)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(crate::helpers::map_tetra3_err)?;
 
     let py_centroids: Vec<PyCentroid> = result
         .centroids
@@ -315,7 +341,7 @@ pub(crate) fn extract_centroids_fast(
 
     let result =
         tetra3::centroid_extraction::extract_centroids_fast(&pixels, width, height, &config)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(crate::helpers::map_tetra3_err)?;
 
     let py_centroids: Vec<PyCentroid> = result
         .centroids

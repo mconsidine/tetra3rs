@@ -94,12 +94,12 @@ impl PyCentroid {
 
     /// Remove lens distortion from this centroid's position (distorted → ideal).
     ///
-    /// Takes a distortion model (RadialDistortion)
+    /// Takes a distortion model (RadialDistortion or PolynomialDistortion)
     /// and returns a new Centroid at the corrected position.
     /// Brightness and covariance are preserved.
     ///
     /// Args:
-    ///     distortion: A RadialDistortion model.
+    ///     distortion: A RadialDistortion or PolynomialDistortion model.
     ///
     /// Returns:
     ///     A new Centroid with undistorted (ideal) position.
@@ -118,12 +118,12 @@ impl PyCentroid {
 
     /// Apply lens distortion to this centroid's position (ideal → distorted).
     ///
-    /// Takes a distortion model (RadialDistortion)
+    /// Takes a distortion model (RadialDistortion or PolynomialDistortion)
     /// and returns a new Centroid at the distorted position.
     /// Brightness and covariance are preserved.
     ///
     /// Args:
-    ///     distortion: A RadialDistortion model.
+    ///     distortion: A RadialDistortion or PolynomialDistortion model.
     ///
     /// Returns:
     ///     A new Centroid with distorted position.

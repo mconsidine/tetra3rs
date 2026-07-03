@@ -40,6 +40,18 @@ impl PyCatalogStar {
         self.inner.mag
     }
 
+    fn __reduce__(slf: &Bound<'_, Self>) -> PyResult<(Py<PyAny>, (Vec<u8>,))> {
+        let bytes = crate::helpers::to_postcard_bytes(&slf.borrow().inner)?;
+        let from_bytes = slf.get_type().getattr("_from_pickle_bytes")?;
+        Ok((from_bytes.unbind(), (bytes,)))
+    }
+
+    #[staticmethod]
+    fn _from_pickle_bytes(data: &[u8]) -> PyResult<Self> {
+        let inner = crate::helpers::from_postcard_bytes::<Star>(data)?;
+        Ok(Self { inner })
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "CatalogStar(id={}, ra={:.4}°, dec={:.4}°, mag={:.2})",

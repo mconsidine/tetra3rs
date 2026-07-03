@@ -1,4 +1,3 @@
-use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 
@@ -162,7 +161,7 @@ impl PyCameraModel {
     fn save_to_file(&self, path: &str) -> PyResult<()> {
         self.inner
             .save_to_file(path)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(crate::helpers::map_tetra3_err)
     }
 
     /// Load a camera model from a file.
@@ -174,8 +173,7 @@ impl PyCameraModel {
     ///     CameraModel loaded from the file.
     #[staticmethod]
     fn load_from_file(path: &str) -> PyResult<Self> {
-        let inner = CameraModel::load_from_file(path)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let inner = CameraModel::load_from_file(path).map_err(crate::helpers::map_tetra3_err)?;
         Ok(Self { inner })
     }
 

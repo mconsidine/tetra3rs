@@ -13,7 +13,7 @@ __git_hash__: str
 import datetime
 import numpy as np
 import numpy.typing as npt
-from typing import Optional, Union
+from typing import Optional, Union, overload
 
 class CameraModel:
     """Camera intrinsics model: focal length, optical center, parity, and distortion.
@@ -291,12 +291,9 @@ class SolveResult:
         ...
 
     @property
-    def distortion(self) -> Optional[Union["RadialDistortion", "PolynomialDistortion"]]:
-        """The distortion model used during solving, if any.
-
-        Returns a ``RadialDistortion`` or ``PolynomialDistortion`` instance,
-        or ``None`` if no distortion was applied.
-        """
+    def camera_model(self) -> CameraModel:
+        """The camera model used for the solve (focal length, image dimensions,
+        optical center, distortion, and parity)."""
         ...
 
     @property
@@ -333,38 +330,21 @@ class SolveResult:
         ...
 
     @property
-    def crpix(self) -> npt.NDArray[np.float32]:
+    def crpix(self) -> npt.NDArray[np.float64]:
         """Optical center offset from the geometric image center, in pixels [x, y]."""
         ...
-
-    from typing import overload
 
     @overload
     def pixel_to_world(self, x: float, y: float) -> tuple[float, float]: ...
     @overload
     def pixel_to_world(
         self, x: npt.NDArray[np.float64], y: npt.NDArray[np.float64]
-    ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]: ...
-
-    def pixel_to_world(
-        self,
-        x: Union[float, npt.NDArray[np.float64]],
-        y: Union[float, npt.NDArray[np.float64]],
-    ) -> Union[tuple[float, float], tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]]:
+    ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
         """Convert centered pixel coordinates to world coordinates (RA, Dec in degrees).
 
         Pixel coordinates use the same convention as solver centroids:
-        origin at the image center, +X right, +Y down.
-
-        Args:
-            x: X pixel coordinate(s). Scalar or 1D numpy array.
-            y: Y pixel coordinate(s). Scalar or 1D numpy array.
-
-        Returns:
-            (ra_deg, dec_deg): Tuple of RA and Dec in degrees.
-                Scalars if input is scalar, numpy arrays if input is array.
-                Array elements are NaN where the transform is undefined.
-                Returns None for scalar input if the point is degenerate.
+        origin at the image center, +X right, +Y down. Scalars in, scalars out;
+        1D numpy arrays in, 1D numpy arrays out (NaN where undefined).
         """
         ...
 
@@ -373,27 +353,13 @@ class SolveResult:
     @overload
     def world_to_pixel(
         self, ra_deg: npt.NDArray[np.float64], dec_deg: npt.NDArray[np.float64]
-    ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]: ...
-
-    def world_to_pixel(
-        self,
-        ra_deg: Union[float, npt.NDArray[np.float64]],
-        dec_deg: Union[float, npt.NDArray[np.float64]],
-    ) -> Union[Optional[tuple[float, float]], tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]]:
+    ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
         """Convert world coordinates (RA, Dec in degrees) to centered pixel coordinates.
 
         Returns pixel coordinates in the same convention as solver centroids:
-        origin at the image center, +X right, +Y down.
-
-        Args:
-            ra_deg: Right ascension in degrees. Scalar or 1D numpy array.
-            dec_deg: Declination in degrees. Scalar or 1D numpy array.
-
-        Returns:
-            (x, y): Tuple of pixel coordinates.
-                Scalars if input is scalar, numpy arrays if input is array.
-                Array elements are NaN for points behind the camera.
-                Returns None for scalar input if the point is behind the camera.
+        origin at the image center, +X right, +Y down. Scalars in, scalars out
+        (None if the point is behind the camera); 1D numpy arrays in, arrays out
+        (NaN for points behind the camera).
         """
         ...
 
@@ -560,7 +526,9 @@ class Centroid:
         """
         ...
 
-    def undistort(self, distortion: RadialDistortion) -> Centroid:
+    def undistort(
+        self, distortion: Union[RadialDistortion, PolynomialDistortion]
+    ) -> Centroid:
         """Remove lens distortion from this centroid's position (distorted → ideal).
 
         Returns a new Centroid at the corrected position.
@@ -568,7 +536,9 @@ class Centroid:
         """
         ...
 
-    def distort(self, distortion: RadialDistortion) -> Centroid:
+    def distort(
+        self, distortion: Union[RadialDistortion, PolynomialDistortion]
+    ) -> Centroid:
         """Apply lens distortion to this centroid's position (ideal → distorted).
 
         Returns a new Centroid at the distorted position.
@@ -1164,40 +1134,6 @@ def extract_centroids_fast(
 
     Returns:
         ExtractionResult with centroids and image statistics.
-    """
-    ...
-
-def undistort_centroids(
-    centroids: list[Centroid],
-    distortion: Union[RadialDistortion, PolynomialDistortion],
-) -> list[Centroid]:
-    """Apply distortion correction to a list of centroids (distorted → ideal).
-
-    Returns a new list with corrected positions; brightness and covariance are preserved.
-
-    Args:
-        centroids: List of Centroid objects.
-        distortion: A RadialDistortion model.
-
-    Returns:
-        A new list of Centroid objects with undistorted positions.
-    """
-    ...
-
-def distort_centroids(
-    centroids: list[Centroid],
-    distortion: Union[RadialDistortion, PolynomialDistortion],
-) -> list[Centroid]:
-    """Apply forward distortion to a list of centroids (ideal → distorted).
-
-    Returns a new list with distorted positions; brightness and covariance are preserved.
-
-    Args:
-        centroids: List of Centroid objects.
-        distortion: A RadialDistortion model.
-
-    Returns:
-        A new list of Centroid objects with distorted positions.
     """
     ...
 

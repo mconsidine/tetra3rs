@@ -155,7 +155,7 @@ impl PyRadialDistortion {
 
 /// SIP-like polynomial distortion model with independent x,y correction terms.
 ///
-/// Forward:  x_d = x + Σ A_pq · (x/s)^p · (y/s)^q   (2 ≤ p+q ≤ order)
+/// Forward:  x_d = x + Σ A_pq · (x/s)^p · (y/s)^q   (0 ≤ p+q ≤ order)
 /// Inverse:  x_i = x_d + Σ AP_pq · (x_d/s)^p · (y_d/s)^q
 ///
 /// Where s = scale = image_width/2.
