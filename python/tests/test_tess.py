@@ -8,7 +8,6 @@ Requires Gaia catalog and TESS same-CCD images (downloaded from GCS).
 """
 
 import pytest
-
 import tetra3rs
 
 from .conftest import (
@@ -58,7 +57,7 @@ class TestTessMultiImageCalibration:
         # -- Tiered solve + calibrate (matching notebook) --
         pass_configs = [
             # (match_radius, cal_order, fov_error_deg)
-            (0.01, 3, 0.5),
+            (0.005, 3, 0.5),
             (0.005, 4, 0.5),
             (0.003, 5, 0.5),
             (0.002, 6, 0.5),
