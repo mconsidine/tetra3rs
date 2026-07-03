@@ -12,99 +12,11 @@ use numeris::imageproc::{
 use numeris::DynMatrix;
 
 use super::{
-    accepted_peak_refine, elongation_from_cov, median_f32, midpoint_f32, peak_sharpness,
-    sort_and_truncate_by_mass, CentroidExtractionConfig, CentroidExtractionResult,
+    accepted_peak_refine, elongation_from_cov, median_f32, par, peak_sharpness,
+    sort_and_truncate_by_mass, BackgroundGrid, CentroidExtractionConfig, CentroidExtractionResult,
 };
 use crate::centroid::Centroid;
 use crate::error::{Error, Result};
-
-/// Parallelism dispatch for the centroid-extraction hot paths.
-///
-/// Each helper has two cfg-gated twins: a [Rayon](https://docs.rs/rayon)
-/// work-stealing version under the `parallel` feature and a plain sequential
-/// version otherwise. The feature flag lives only here, so the two paths cannot
-/// drift apart and the call sites read identically in both configurations.
-///
-/// All helpers are deterministic: the element-wise maps write disjoint outputs
-/// and `map_indices` / `for_each_chunk_mut` assign each index or chunk to a
-/// fixed output slot, so results are independent of thread count and the
-/// non-`parallel` build is bit-identical to the original sequential code.
-///
-/// Scope is deliberately narrow. Profiling (`smrecording.fits`, 2.1 Mpix) shows
-/// `estimate_local_background` is ~60% of extraction wall-clock; the per-blob
-/// centroid loop is ~2% and connected-component labeling lives in numeris and
-/// is sequential there, so neither is parallelized here.
-mod par {
-    #[cfg(feature = "parallel")]
-    use rayon::prelude::*;
-
-    /// Map `f` over `0..n` into a `Vec`, preserving index order.
-    #[cfg(feature = "parallel")]
-    pub fn map_indices<T, F>(n: usize, f: F) -> Vec<T>
-    where
-        T: Send,
-        F: Fn(usize) -> T + Sync + Send,
-    {
-        (0..n).into_par_iter().map(f).collect()
-    }
-    #[cfg(not(feature = "parallel"))]
-    pub fn map_indices<T, F>(n: usize, f: F) -> Vec<T>
-    where
-        F: Fn(usize) -> T,
-    {
-        (0..n).map(f).collect()
-    }
-
-    /// Apply `f(i, chunk)` to each disjoint `chunk_len`-sized chunk of `buf`.
-    /// `buf.len()` must be a multiple of `chunk_len` (one chunk per image row).
-    #[cfg(feature = "parallel")]
-    pub fn for_each_chunk_mut<T, F>(buf: &mut [T], chunk_len: usize, f: F)
-    where
-        T: Send,
-        F: Fn(usize, &mut [T]) + Sync + Send,
-    {
-        buf.par_chunks_mut(chunk_len)
-            .enumerate()
-            .for_each(|(i, c)| f(i, c));
-    }
-    #[cfg(not(feature = "parallel"))]
-    pub fn for_each_chunk_mut<T, F>(buf: &mut [T], chunk_len: usize, mut f: F)
-    where
-        F: FnMut(usize, &mut [T]),
-    {
-        for (i, c) in buf.chunks_mut(chunk_len).enumerate() {
-            f(i, c);
-        }
-    }
-
-    /// Apply `f(i, chunk_a, chunk_b)` to corresponding disjoint
-    /// `chunk_len`-sized chunks of two buffers (one image row each).
-    #[cfg(feature = "parallel")]
-    pub fn for_each_chunk_pair_mut<T, U, F>(a: &mut [T], b: &mut [U], chunk_len: usize, f: F)
-    where
-        T: Send,
-        U: Send,
-        F: Fn(usize, &mut [T], &mut [U]) + Sync + Send,
-    {
-        a.par_chunks_mut(chunk_len)
-            .zip(b.par_chunks_mut(chunk_len))
-            .enumerate()
-            .for_each(|(i, (ca, cb))| f(i, ca, cb));
-    }
-    #[cfg(not(feature = "parallel"))]
-    pub fn for_each_chunk_pair_mut<T, U, F>(a: &mut [T], b: &mut [U], chunk_len: usize, mut f: F)
-    where
-        F: FnMut(usize, &mut [T], &mut [U]),
-    {
-        for (i, (ca, cb)) in a
-            .chunks_mut(chunk_len)
-            .zip(b.chunks_mut(chunk_len))
-            .enumerate()
-        {
-            f(i, ca, cb);
-        }
-    }
-}
 
 /// Shared extraction pipeline for both image and raw-pixel entry points.
 pub(super) fn extract_from_gray(
@@ -164,10 +76,13 @@ pub(super) fn extract_from_gray(
     let mut filter_input: Option<DynMatrix<f32>> = None;
 
     if let Some(block_size) = config.local_bg_block_size {
-        let (grid, nx, ny) = background_grid(gray_input, width, height, block_size);
         let bs = block_size as usize;
+        // Stride bs/16 (vs the fast path's bs/8) keeps extra sampling margin
+        // on this calibration-quality path; the build-time σ is ignored in
+        // favor of the estimator below, run against the bilinear surface.
+        let (bg, _) = BackgroundGrid::build(gray_input, w, h, bs, (bs / 16).max(1));
 
-        let residuals = subsample_residuals(gray_input, w, h, &grid, nx, ny, bs);
+        let residuals = subsample_residuals(gray_input, w, h, &bg);
         (bg_mean, bg_sigma) = estimate_background(&residuals, width, height, config);
 
         // Fused residual pass (rows in parallel under the `parallel` feature;
@@ -176,10 +91,10 @@ pub(super) fn extract_from_gray(
         if filter_sigma.is_some() {
             let mut unclamped = vec![0.0_f32; w * h];
             par::for_each_chunk_pair_mut(&mut clamped, &mut unclamped, w, |y, cr, ur| {
-                let (by0, by1, fy) = interp_row_params(y, bs, ny);
+                let rp = bg.row_params(y);
                 let row = y * w;
                 for x in 0..w {
-                    let r = gray_input[row + x] - interp_bg(&grid, nx, bs, x, by0, by1, fy);
+                    let r = gray_input[row + x] - bg.value_at(x, rp);
                     cr[x] = r.max(0.0);
                     ur[x] = r;
                 }
@@ -187,11 +102,10 @@ pub(super) fn extract_from_gray(
             filter_input = Some(DynMatrix::from_vec(w, h, unclamped));
         } else {
             par::for_each_chunk_mut(&mut clamped, w, |y, cr| {
-                let (by0, by1, fy) = interp_row_params(y, bs, ny);
+                let rp = bg.row_params(y);
                 let row = y * w;
                 for (x, out) in cr.iter_mut().enumerate() {
-                    *out =
-                        (gray_input[row + x] - interp_bg(&grid, nx, bs, x, by0, by1, fy)).max(0.0);
+                    *out = (gray_input[row + x] - bg.value_at(x, rp)).max(0.0);
                 }
             });
         }
@@ -285,144 +199,24 @@ pub(super) fn extract_from_gray(
     })
 }
 
-/// Block-median background grid: the image is divided into
-/// `block_size × block_size` tiles and each tile's (subsampled) median is
-/// computed. Bilinear interpolation between tile centers — done on the fly by
-/// [`interp_row_params`] + the fused residual pass in [`extract_from_gray`] —
-/// reconstructs a smooth background surface that removes large-scale
-/// structure (nebulosity, Milky Way emission, vignetting) while preserving
-/// point sources. Returns `(medians, nx, ny)`, row-major `nx`-wide.
-///
-/// Under the `parallel` feature the per-block medians fan out across threads;
-/// each block writes its own output slot, so the result is identical to the
-/// sequential path.
-fn background_grid(
-    pixels: &[f32],
-    width: u32,
-    height: u32,
-    block_size: u32,
-) -> (Vec<f32>, usize, usize) {
-    let w = width as usize;
-    let h = height as usize;
-    let bs = block_size as usize;
-
-    // Number of blocks in each dimension
-    let nx = w.div_ceil(bs);
-    let ny = h.div_ceil(bs);
-
-    // Compute median for each block. Blocks are independent and each writes its
-    // own index, so this maps in parallel under the `parallel` feature.
-    //
-    // Each block is subsampled on a stride grid rather than exhausted: at the
-    // default 64-px block, stride 4 medians 256 samples instead of 4096. The
-    // block median's standard error (≈1.25σ/√n) stays ≲ 0.08σ — far below
-    // any detection threshold — while the median stage, the dominant cost of
-    // extraction, drops ~16×. (The fast path's `coarse_background` uses the
-    // same trick at stride block/8; block/16 here keeps extra margin since
-    // this path is the calibration-quality one.)
-    //
-    // Only non-finite samples are excluded (NaN-masked regions). Zeros and
-    // negatives are legitimate background samples — excluding them, as this
-    // function once did, biases the background *up* on dark-subtracted
-    // frames whose true background is ~0.
-    let stride = (bs / 16).max(1);
-    let block_medians: Vec<f32> = par::map_indices(nx * ny, |bi| {
-        let bx = bi % nx;
-        let by = bi / nx;
-        let x0 = bx * bs;
-        let y0 = by * bs;
-        let x1 = (x0 + bs).min(w);
-        let y1 = (y0 + bs).min(h);
-
-        let mut vals: Vec<f32> = Vec::with_capacity((bs / stride + 1).pow(2));
-        let mut y = y0;
-        let mut phase = 0usize;
-        while y < y1 {
-            let row = y * w;
-            // Stagger the column phase per sample row (a diagonal lattice):
-            // a plain stride grid samples only one column-residue class,
-            // which aliases against column-periodic structure (CMOS
-            // fixed-pattern noise, Bayer residue). Cycling the phase covers
-            // every residue class equally across `stride` consecutive sample
-            // rows. (Row-periodic structure with period dividing the stride
-            // still aliases — sample rows are inherently strided — but
-            // column FPN is the dominant periodic artifact in practice.)
-            let mut x = x0 + phase;
-            while x < x1 {
-                let v = pixels[row + x];
-                if v.is_finite() {
-                    vals.push(v);
-                }
-                x += stride;
-            }
-            phase = (phase + 1) % stride;
-            y += stride;
-        }
-
-        midpoint_f32(&mut vals)
-    });
-
-    (block_medians, nx, ny)
-}
-
-/// Row-constant part of the bilinear interpolation over a block grid: for
-/// image row `y`, the two grid rows it blends between and the blend weight.
-#[inline]
-fn interp_row_params(y: usize, bs: usize, ny: usize) -> (usize, usize, f32) {
-    let half_bs = bs as f32 / 2.0;
-    let by_f = (y as f32 - half_bs) / bs as f32;
-    let by0 = (by_f.floor() as isize).max(0).min(ny as isize - 1) as usize;
-    let by1 = (by0 + 1).min(ny - 1);
-    let fy = (by_f - by0 as f32).clamp(0.0, 1.0);
-    (by0, by1, fy)
-}
-
-/// Bilinear background value at `(x, y)` from a block-median grid — the same
-/// four-term blend the materialized background buffer used to hold, evaluated
-/// on the fly. `(by0, by1, fy)` come from [`interp_row_params`].
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn interp_bg(grid: &[f32], nx: usize, bs: usize, x: usize, by0: usize, by1: usize, fy: f32) -> f32 {
-    let half_bs = bs as f32 / 2.0;
-    let bx_f = (x as f32 - half_bs) / bs as f32;
-    let bx0 = (bx_f.floor() as isize).max(0).min(nx as isize - 1) as usize;
-    let bx1 = (bx0 + 1).min(nx - 1);
-    let fx = (bx_f - bx0 as f32).clamp(0.0, 1.0);
-
-    let m00 = grid[by0 * nx + bx0];
-    let m10 = grid[by0 * nx + bx1];
-    let m01 = grid[by1 * nx + bx0];
-    let m11 = grid[by1 * nx + bx1];
-
-    m00 * (1.0 - fx) * (1.0 - fy) + m10 * fx * (1.0 - fy) + m01 * (1.0 - fx) * fy + m11 * fx * fy
-}
-
 /// Background-subtracted residuals at the block subsample lattice (the same
-/// staggered lattice [`background_grid`] medians over), against the bilinear
-/// surface — the identical reference the full-image residual pass used, so
-/// feeding these to [`estimate_background`] preserves its semantics while
-/// touching ~stride² fewer samples.
-fn subsample_residuals(
-    pixels: &[f32],
-    w: usize,
-    h: usize,
-    grid: &[f32],
-    nx: usize,
-    ny: usize,
-    bs: usize,
-) -> Vec<f32> {
-    let stride = (bs / 16).max(1);
+/// staggered lattice [`BackgroundGrid::build`] medians over), against the
+/// bilinear surface — the identical reference the full-image residual pass
+/// used, so feeding these to [`estimate_background`] preserves its semantics
+/// while touching ~stride² fewer samples.
+fn subsample_residuals(pixels: &[f32], w: usize, h: usize, bg: &BackgroundGrid) -> Vec<f32> {
+    let stride = bg.stride();
     let mut out: Vec<f32> = Vec::with_capacity((w / stride + 1) * (h / stride + 1));
     let mut y = 0usize;
     let mut phase = 0usize;
     while y < h {
-        let (by0, by1, fy) = interp_row_params(y, bs, ny);
+        let rp = bg.row_params(y);
         let row = y * w;
         let mut x = phase;
         while x < w {
             let v = pixels[row + x];
             if v.is_finite() {
-                out.push(v - interp_bg(grid, nx, bs, x, by0, by1, fy));
+                out.push(v - bg.value_at(x, rp));
             }
             x += stride;
         }

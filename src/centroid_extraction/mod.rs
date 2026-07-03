@@ -305,6 +305,252 @@ fn check_pixel_len(len: usize, width: u32, height: u32) -> Result<()> {
     Ok(())
 }
 
+/// Parallelism dispatch for the centroid-extraction hot paths.
+///
+/// Each helper has two cfg-gated twins: a [Rayon](https://docs.rs/rayon)
+/// work-stealing version under the `parallel` feature and a plain sequential
+/// version otherwise. The feature flag lives only here, so the two paths cannot
+/// drift apart and the call sites read identically in both configurations.
+///
+/// All helpers are deterministic: the element-wise maps write disjoint outputs
+/// and `map_indices` / `for_each_chunk_mut` assign each index or chunk to a
+/// fixed output slot, so results are independent of thread count and the
+/// non-`parallel` build is bit-identical to the original sequential code.
+///
+/// Scope is deliberately narrow. Profiling (`smrecording.fits`, 2.1 Mpix) shows
+/// `estimate_local_background` is ~60% of extraction wall-clock; the per-blob
+/// centroid loop is ~2% and connected-component labeling lives in numeris and
+/// is sequential there, so neither is parallelized here.
+pub(super) mod par {
+    #[cfg(feature = "parallel")]
+    use rayon::prelude::*;
+
+    /// Map `f` over `0..n` into a `Vec`, preserving index order.
+    #[cfg(feature = "parallel")]
+    pub fn map_indices<T, F>(n: usize, f: F) -> Vec<T>
+    where
+        T: Send,
+        F: Fn(usize) -> T + Sync + Send,
+    {
+        (0..n).into_par_iter().map(f).collect()
+    }
+    #[cfg(not(feature = "parallel"))]
+    pub fn map_indices<T, F>(n: usize, f: F) -> Vec<T>
+    where
+        F: Fn(usize) -> T,
+    {
+        (0..n).map(f).collect()
+    }
+
+    /// Apply `f(i, chunk)` to each disjoint `chunk_len`-sized chunk of `buf`.
+    /// `buf.len()` must be a multiple of `chunk_len` (one chunk per image row).
+    #[cfg(feature = "parallel")]
+    pub fn for_each_chunk_mut<T, F>(buf: &mut [T], chunk_len: usize, f: F)
+    where
+        T: Send,
+        F: Fn(usize, &mut [T]) + Sync + Send,
+    {
+        buf.par_chunks_mut(chunk_len)
+            .enumerate()
+            .for_each(|(i, c)| f(i, c));
+    }
+    #[cfg(not(feature = "parallel"))]
+    pub fn for_each_chunk_mut<T, F>(buf: &mut [T], chunk_len: usize, mut f: F)
+    where
+        F: FnMut(usize, &mut [T]),
+    {
+        for (i, c) in buf.chunks_mut(chunk_len).enumerate() {
+            f(i, c);
+        }
+    }
+
+    /// Apply `f(i, chunk_a, chunk_b)` to corresponding disjoint
+    /// `chunk_len`-sized chunks of two buffers (one image row each).
+    #[cfg(feature = "parallel")]
+    pub fn for_each_chunk_pair_mut<T, U, F>(a: &mut [T], b: &mut [U], chunk_len: usize, f: F)
+    where
+        T: Send,
+        U: Send,
+        F: Fn(usize, &mut [T], &mut [U]) + Sync + Send,
+    {
+        a.par_chunks_mut(chunk_len)
+            .zip(b.par_chunks_mut(chunk_len))
+            .enumerate()
+            .for_each(|(i, (ca, cb))| f(i, ca, cb));
+    }
+    #[cfg(not(feature = "parallel"))]
+    pub fn for_each_chunk_pair_mut<T, U, F>(a: &mut [T], b: &mut [U], chunk_len: usize, mut f: F)
+    where
+        F: FnMut(usize, &mut [T], &mut [U]),
+    {
+        for (i, (ca, cb)) in a
+            .chunks_mut(chunk_len)
+            .zip(b.chunks_mut(chunk_len))
+            .enumerate()
+        {
+            f(i, ca, cb);
+        }
+    }
+}
+
+/// Coarse block-median background grid shared by both extraction paths.
+///
+/// The image is divided into `block × block` tiles; each tile's median comes
+/// from a phase-staggered stride subsample (a diagonal lattice: every
+/// column-residue class is sampled equally, so column-periodic structure —
+/// CMOS fixed-pattern noise, Bayer residue — does not alias; the block
+/// median's standard error ≈ 1.25σ/√n stays far below detection thresholds).
+/// Only non-finite samples are excluded: zeros and negatives are legitimate
+/// background on dark-subtracted frames.
+///
+/// Interpolation is bilinear between block centers and **linearly
+/// extrapolates** beyond the outermost centers — clamping (the historical
+/// behavior) left any gradient un-modeled across the outer `block/2` border
+/// band, which lights up as border false positives at tight thresholds.
+pub(super) struct BackgroundGrid {
+    grid: Vec<f32>,
+    nx: usize,
+    ny: usize,
+    block: usize,
+    stride: usize,
+}
+
+impl BackgroundGrid {
+    /// Build the grid. Also returns the global noise σ estimated during the
+    /// same pass as the RMS of below-median subsample residuals about their
+    /// block median (the half-normal estimator, robust to stars which only
+    /// push the distribution upward). The fast path uses this σ directly;
+    /// the CCL path ignores it and re-estimates against the bilinear surface
+    /// (see `subsample_residuals` + `estimate_background`).
+    pub(super) fn build(
+        pixels: &[f32],
+        w: usize,
+        h: usize,
+        block: usize,
+        stride: usize,
+    ) -> (Self, f32) {
+        let nx = w.div_ceil(block);
+        let ny = h.div_ceil(block);
+
+        // (median, Σresidual², n_below) per block; blocks are independent and
+        // each writes its own slot, so this maps in parallel.
+        let per_block: Vec<(f32, f64, usize)> = par::map_indices(nx * ny, |bi| {
+            let bx = bi % nx;
+            let by = bi / nx;
+            let x0 = bx * block;
+            let y0 = by * block;
+            let x1 = (x0 + block).min(w);
+            let y1 = (y0 + block).min(h);
+
+            let mut vals: Vec<f32> = Vec::with_capacity((block / stride + 1).pow(2));
+            let mut y = y0;
+            let mut phase = 0usize;
+            while y < y1 {
+                let row = y * w;
+                let mut x = x0 + phase;
+                while x < x1 {
+                    let v = pixels[row + x];
+                    if v.is_finite() {
+                        vals.push(v);
+                    }
+                    x += stride;
+                }
+                phase = (phase + 1) % stride;
+                y += stride;
+            }
+            let median = midpoint_f32(&mut vals);
+            let mut sq = 0.0_f64;
+            let mut n = 0usize;
+            for &v in &vals {
+                if v <= median {
+                    let d = (v - median) as f64;
+                    sq += d * d;
+                    n += 1;
+                }
+            }
+            (median, sq, n)
+        });
+
+        let grid: Vec<f32> = per_block.iter().map(|&(m, _, _)| m).collect();
+        let (sq_sum, n_sum) = per_block
+            .iter()
+            .fold((0.0_f64, 0usize), |(s, n), &(_, sq, k)| (s + sq, n + k));
+        let sigma = if n_sum > 0 {
+            (sq_sum / n_sum as f64).sqrt() as f32
+        } else {
+            0.0
+        };
+
+        (
+            Self {
+                grid,
+                nx,
+                ny,
+                block,
+                stride,
+            },
+            sigma,
+        )
+    }
+
+    pub(super) fn stride(&self) -> usize {
+        self.stride
+    }
+
+    /// Representative background level: the midpoint of the block medians.
+    pub(super) fn level(&self) -> f32 {
+        midpoint_f32(&mut self.grid.clone())
+    }
+
+    /// Row-constant part of the interpolation for image row `y`: the two
+    /// grid rows to blend and the (unclamped — extrapolating) blend weight.
+    #[inline]
+    pub(super) fn row_params(&self, y: usize) -> (usize, usize, f32) {
+        if self.ny == 1 {
+            return (0, 0, 0.0);
+        }
+        let bf = (y as f32 - self.block as f32 / 2.0) / self.block as f32;
+        let by0 = (bf.floor() as isize).clamp(0, self.ny as isize - 2) as usize;
+        (by0, by0 + 1, bf - by0 as f32)
+    }
+
+    /// Background value at `(x, row)` given `row_params(row)`.
+    #[inline]
+    pub(super) fn value_at(&self, x: usize, (by0, by1, fy): (usize, usize, f32)) -> f32 {
+        let (bx0, bx1, fx) = self.col_params(x);
+        let g0 = self.grid[by0 * self.nx + bx0] * (1.0 - fy) + self.grid[by1 * self.nx + bx0] * fy;
+        let g1 = self.grid[by0 * self.nx + bx1] * (1.0 - fy) + self.grid[by1 * self.nx + bx1] * fy;
+        g0 * (1.0 - fx) + g1 * fx
+    }
+
+    /// Blend one grid row for `row_params(row)` into `out` (length `nx`) —
+    /// hoists the row-constant half of the interpolation out of per-pixel
+    /// sweeps; combine with [`Self::lerp_in_row`].
+    #[inline]
+    pub(super) fn blend_row(&self, (by0, by1, fy): (usize, usize, f32), out: &mut [f32]) {
+        for (bx, g) in out.iter_mut().enumerate() {
+            *g = self.grid[by0 * self.nx + bx] * (1.0 - fy) + self.grid[by1 * self.nx + bx] * fy;
+        }
+    }
+
+    /// Background value at column `x` from a [`Self::blend_row`] result.
+    #[inline]
+    pub(super) fn lerp_in_row(&self, row_blend: &[f32], x: usize) -> f32 {
+        let (bx0, bx1, fx) = self.col_params(x);
+        row_blend[bx0] * (1.0 - fx) + row_blend[bx1] * fx
+    }
+
+    #[inline]
+    fn col_params(&self, x: usize) -> (usize, usize, f32) {
+        if self.nx == 1 {
+            return (0, 0, 0.0);
+        }
+        let bf = (x as f32 - self.block as f32 / 2.0) / self.block as f32;
+        let bx0 = (bf.floor() as isize).clamp(0, self.nx as isize - 2) as usize;
+        (bx0, bx0 + 1, bf - bx0 as f32)
+    }
+}
+
 /// Elongation ratio (major/minor axis) of a blob from its intensity-weighted
 /// central second moments: `√(λ_max/λ_min)` of the 2×2 covariance
 /// `[[cxx, cxy], [cxy, cyy]]`. `λ_min` is floored so degenerate (collinear)
@@ -650,6 +896,27 @@ mod tests {
                 "phase ({px}, {py}): error ({ex:.4}, {ey:.4}) px"
             );
         }
+    }
+
+    #[test]
+    fn test_background_extrapolates_at_borders() {
+        // Steep gradient on a frame only 2 background blocks wide — the
+        // geometry where a border *clamp* leaves ~7.5 ADU of un-modeled ramp
+        // across the outer 32-px band (well above the compensated filtered
+        // threshold) and lights it up with false detections. Linear
+        // extrapolation beyond the outer block centers must model it away.
+        let (width, height) = (128u32, 128u32);
+        let pixels = render_stars(width, height, 100.0, 30.0, 20.0, 1.5, &[]);
+        let cfg = CentroidExtractionConfig {
+            sigma_threshold: 5.0,
+            ..Default::default()
+        };
+        let res = extract_centroids_from_raw(&pixels, width, height, &cfg).unwrap();
+        assert_eq!(
+            res.centroids.len(),
+            0,
+            "gradient border band produced detections"
+        );
     }
 
     #[test]

@@ -4,8 +4,8 @@
 //! [`extract_centroids_fast`].
 
 use super::{
-    accepted_peak_refine, check_pixel_len, elongation_from_cov, midpoint_f32, peak_sharpness,
-    sort_and_truncate_by_mass, CentroidExtractionResult,
+    accepted_peak_refine, check_pixel_len, elongation_from_cov, peak_sharpness,
+    sort_and_truncate_by_mass, BackgroundGrid, CentroidExtractionResult,
 };
 use crate::centroid::Centroid;
 use crate::error::{Error, Result};
@@ -160,7 +160,8 @@ pub fn extract_centroids_fast(
 
     // ── Pre-pass: coarse background grid + global noise σ (subsampled) ──
     let block = config.bg_grid as usize;
-    let (bg_grid, nx, ny, sigma) = coarse_background(pixels, w, h, block);
+    let (bg, sigma) = BackgroundGrid::build(pixels, w, h, block, (block / 8).max(1));
+    let nx = w.div_ceil(block);
     let k = config.sigma_threshold;
 
     // ── Single raster sweep: run-length detection + union-find moments ──
@@ -172,34 +173,22 @@ pub fn extract_centroids_fast(
     // Row-blended copy of the background grid, rebuilt at each row: the
     // y-half of the bilinear interpolation is row-constant, so hoisting it
     // leaves only a 1-D lerp per pixel in the sweep (the dominant cost).
-    // Same blend up to f32 associativity as `bilinear_grid`.
     let mut grid_row = vec![0.0_f32; nx];
-    let half = block as f32 / 2.0;
 
     for r in 0..h {
         cur.clear();
         let row = r * w;
         let mut active: Option<(u32, Region)> = None; // (start_col, accumulator)
 
-        let fyf = (r as f32 - half) / block as f32;
-        let by0 = (fyf.floor() as isize).clamp(0, ny as isize - 1) as usize;
-        let by1 = (by0 + 1).min(ny - 1);
-        let fy = (fyf - by0 as f32).clamp(0.0, 1.0);
-        for (bx, g) in grid_row.iter_mut().enumerate() {
-            *g = bg_grid[by0 * nx + bx] * (1.0 - fy) + bg_grid[by1 * nx + bx] * fy;
-        }
+        bg.blend_row(bg.row_params(r), &mut grid_row);
 
         for c in 0..w {
-            let fxf = (c as f32 - half) / block as f32;
-            let bx0 = (fxf.floor() as isize).clamp(0, nx as isize - 1) as usize;
-            let bx1 = (bx0 + 1).min(nx - 1);
-            let fx = (fxf - bx0 as f32).clamp(0.0, 1.0);
-            let bg = grid_row[bx0] * (1.0 - fx) + grid_row[bx1] * fx;
+            let bgv = bg.lerp_in_row(&grid_row, c);
             let p = pixels[row + c];
-            let lit = p.is_finite() && p > bg + k * sigma;
+            let lit = p.is_finite() && p > bgv + k * sigma;
 
             if lit {
-                let weight = (p - bg).max(0.0) as f64;
+                let weight = (p - bgv).max(0.0) as f64;
                 // Start a new run only when one isn't already open (building the
                 // Region eagerly every lit pixel would be wasteful).
                 if active.is_none() {
@@ -327,11 +316,11 @@ pub fn extract_centroids_fast(
         }
 
         let (pc, pr) = (reg.peak_x as usize, reg.peak_y as usize);
-        let bg = bilinear_grid(&bg_grid, nx, ny, block, pc, pr) as f64;
+        let peak_bg = bg.value_at(pc, bg.row_params(pr)) as f64;
         let v = |dy: isize, dx: isize| -> f64 {
             let rr = (pr as isize + dy) as usize;
             let cc = (pc as isize + dx) as usize;
-            pixels[rr * w + cc] as f64 - bg
+            pixels[rr * w + cc] as f64 - peak_bg
         };
 
         // Hot-pixel / cosmic-ray sharpness gate (shared with the CCL path).
@@ -369,7 +358,7 @@ pub fn extract_centroids_fast(
 
     sort_and_truncate_by_mass(&mut centroids, config.max_centroids);
 
-    let bg_mean = midpoint_f32(&mut bg_grid.clone());
+    let bg_mean = bg.level();
 
     Ok(CentroidExtractionResult {
         centroids,
@@ -399,88 +388,4 @@ fn union(regions: &mut [Region], a: u32, b: u32) {
     if ra != rb {
         regions[ra as usize].parent = rb;
     }
-}
-
-/// Coarse background grid + global noise σ from a subsampled pre-pass.
-///
-/// The image is divided into `block × block` cells; each cell's median is taken
-/// from a strided subsample (~1/64 of the pixels for the default block), giving
-/// an `nx × ny` background grid. The global noise σ is the RMS of the
-/// below-median residuals across the subsample (the half-normal estimate,
-/// robust to stars which only push the distribution upward).
-///
-/// Returns `(grid, nx, ny, sigma)` with `grid` row-major `nx`-wide.
-fn coarse_background(
-    pixels: &[f32],
-    w: usize,
-    h: usize,
-    block: usize,
-) -> (Vec<f32>, usize, usize, f32) {
-    let nx = w.div_ceil(block);
-    let ny = h.div_ceil(block);
-    let stride = (block / 8).max(1);
-    let mut grid = vec![0.0_f32; nx * ny];
-    let mut sq_sum = 0.0_f64;
-    let mut sq_n = 0usize;
-    let mut samples: Vec<f32> = Vec::with_capacity((block / stride + 1).pow(2));
-
-    for by in 0..ny {
-        let y0 = by * block;
-        let y1 = (y0 + block).min(h);
-        for bx in 0..nx {
-            let x0 = bx * block;
-            let x1 = (x0 + block).min(w);
-            samples.clear();
-            let mut y = y0;
-            while y < y1 {
-                let row = y * w;
-                let mut x = x0;
-                while x < x1 {
-                    let v = pixels[row + x];
-                    if v.is_finite() {
-                        samples.push(v);
-                    }
-                    x += stride;
-                }
-                y += stride;
-            }
-            let median = midpoint_f32(&mut samples);
-            grid[by * nx + bx] = median;
-            // Below-median residuals → robust noise (uncontaminated by stars).
-            for &v in samples.iter() {
-                if v <= median {
-                    let d = (v - median) as f64;
-                    sq_sum += d * d;
-                    sq_n += 1;
-                }
-            }
-        }
-    }
-
-    let sigma = if sq_n > 0 {
-        (sq_sum / sq_n as f64).sqrt() as f32
-    } else {
-        0.0
-    };
-    (grid, nx, ny, sigma)
-}
-
-/// Bilinear interpolation of a coarse background grid at pixel `(x, y)`.
-///
-/// Grid samples sit at block centers (`block/2 + bx·block`); positions outside
-/// the centers clamp to the nearest edge cell.
-fn bilinear_grid(grid: &[f32], nx: usize, ny: usize, block: usize, x: usize, y: usize) -> f32 {
-    let half = block as f32 / 2.0;
-    let fx = (x as f32 - half) / block as f32;
-    let fy = (y as f32 - half) / block as f32;
-    let bx0 = (fx.floor().max(0.0) as usize).min(nx - 1);
-    let by0 = (fy.floor().max(0.0) as usize).min(ny - 1);
-    let bx1 = (bx0 + 1).min(nx - 1);
-    let by1 = (by0 + 1).min(ny - 1);
-    let tx = (fx - bx0 as f32).clamp(0.0, 1.0);
-    let ty = (fy - by0 as f32).clamp(0.0, 1.0);
-    let g = |bx: usize, by: usize| grid[by * nx + bx];
-    let top = g(bx0, by0) * (1.0 - tx) + g(bx1, by0) * tx;
-    let bot = g(bx0, by1) * (1.0 - tx) + g(bx1, by1) * tx;
-    top * (1.0 - ty) + bot * ty
 }
