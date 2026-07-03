@@ -47,6 +47,10 @@ class TestSkyViewSolve:
             max_centroids=200,
             local_bg_block_size=64,
             max_elongation=3.0,
+            # DSS cutouts at 17.6"/px have a sub-pixel PSF: real stars are
+            # indistinguishable from hot pixels, so the sharpness gate must
+            # be off for this (edge-case) plate scale.
+            max_sharpness=None,
         )
         assert len(result.centroids) >= 4, (
             f"Only {len(result.centroids)} centroids extracted"

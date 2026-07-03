@@ -137,13 +137,14 @@ pub struct CentroidExtractionConfig {
     /// measured on the background-subtracted image at the blob's peak. Values
     /// near 1 mean the flux is concentrated in a single pixel — a hot pixel
     /// or cosmic-ray hit rather than a star. A critically sampled PSF scores
-    /// ~0.5; a strongly undersampled one can reach ~0.85; at very coarse
-    /// plate scales (PSF FWHM below a pixel, e.g. a 10° FOV on a 2k sensor)
-    /// real stars are single-pixel and indistinguishable from hot pixels, so
-    /// the gate must stay off. Enable (~0.7-0.9) only when the PSF spans
-    /// multiple pixels.
+    /// ~0.5; a strongly undersampled one can reach ~0.85. The default 0.9
+    /// passes any system whose PSF spans multiple pixels (the design norm —
+    /// star trackers defocus deliberately, because a sub-pixel PSF forfeits
+    /// sub-pixel centroiding). Set `None` for severely undersampled data
+    /// (PSF FWHM below ~1.5 px), where real stars are geometrically
+    /// indistinguishable from hot pixels.
     ///
-    /// Default: None (disabled)
+    /// Default: Some(0.9)
     pub max_sharpness: Option<f32>,
 
     /// Pixel value at or above which the sensor is considered saturated.
@@ -168,7 +169,7 @@ impl Default for CentroidExtractionConfig {
             local_bg_block_size: Some(64),
             max_elongation: Some(3.0),
             matched_filter_sigma: None,
-            max_sharpness: None,
+            max_sharpness: Some(0.9),
             saturation_level: None,
         }
     }

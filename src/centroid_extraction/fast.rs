@@ -45,10 +45,10 @@ pub struct FastCentroidConfig {
     /// measured on the background-subtracted image at the region's peak.
     /// Values near 1 mean single-pixel flux — a hot pixel or cosmic-ray hit.
     /// A critically sampled PSF scores ~0.5; a strongly undersampled one up
-    /// to ~0.85 — and at very coarse plate scales (sub-pixel PSF) real stars
-    /// are indistinguishable from hot pixels, so the gate must stay off.
-    /// Enable (~0.7-0.9) only when the PSF spans multiple pixels.
-    /// Default: None (disabled)
+    /// to ~0.85. The default 0.9 passes any system whose PSF spans multiple
+    /// pixels; set `None` for severely undersampled data (PSF FWHM below
+    /// ~1.5 px), where real stars are indistinguishable from hot pixels.
+    /// Default: Some(0.9)
     pub max_sharpness: Option<f32>,
 
     /// Pixel value at or above which the sensor is considered saturated.
@@ -66,7 +66,7 @@ impl Default for FastCentroidConfig {
             bg_grid: 64,
             min_pixels: 2,
             max_centroids: None,
-            max_sharpness: None,
+            max_sharpness: Some(0.9),
             saturation_level: None,
         }
     }

@@ -397,6 +397,10 @@ fn test_skyview_fits_solve() {
             local_bg_block_size: Some(64),
             max_elongation: Some(3.0),
             matched_filter_sigma: None,
+            // DSS cutouts at 17.6″/px have a sub-pixel PSF: real stars are
+            // geometrically indistinguishable from hot pixels, so the
+            // sharpness gate must be off for this (edge-case) plate scale.
+            max_sharpness: None,
             ..Default::default()
         };
 

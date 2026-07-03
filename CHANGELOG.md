@@ -8,9 +8,11 @@
   cosmic-ray gate — rejects blobs whose peak sharpness
   `(peak − mean(8 neighbors))/peak` exceeds the limit, measured on the
   unfiltered background-subtracted image (so a matched-filter-smeared hot
-  pixel is still caught). Off by default: with a sub-pixel PSF (wide-FOV
-  trackers, e.g. 10° on a 2k sensor) real stars are indistinguishable from
-  hot pixels; enable (~0.7–0.9) only when the PSF spans multiple pixels.
+  pixel is still caught). **Defaults to 0.9**, which passes any system whose
+  PSF spans multiple pixels (a critically sampled PSF scores ~0.5, a strongly
+  undersampled one ~0.85, a hot pixel ~1.0). Set `None` for severely
+  undersampled data (PSF FWHM below ~1.5 px, e.g. resampled survey cutouts),
+  where real stars are geometrically indistinguishable from hot pixels.
 - **`saturation_level`** (both extraction configs): blobs whose peak reaches
   the sensor's saturation level skip quadratic sub-pixel peak refinement (a
   flat-topped or bloomed profile has no meaningful maximum) and keep the
