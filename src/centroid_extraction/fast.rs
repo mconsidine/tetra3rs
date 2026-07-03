@@ -169,13 +169,32 @@ pub fn extract_centroids_fast(
     let mut prev: Vec<(u32, u32, u32)> = Vec::new();
     let mut cur: Vec<(u32, u32, u32)> = Vec::new();
 
+    // Row-blended copy of the background grid, rebuilt at each row: the
+    // y-half of the bilinear interpolation is row-constant, so hoisting it
+    // leaves only a 1-D lerp per pixel in the sweep (the dominant cost).
+    // Same blend up to f32 associativity as `bilinear_grid`.
+    let mut grid_row = vec![0.0_f32; nx];
+    let half = block as f32 / 2.0;
+
     for r in 0..h {
         cur.clear();
         let row = r * w;
         let mut active: Option<(u32, Region)> = None; // (start_col, accumulator)
 
+        let fyf = (r as f32 - half) / block as f32;
+        let by0 = (fyf.floor() as isize).clamp(0, ny as isize - 1) as usize;
+        let by1 = (by0 + 1).min(ny - 1);
+        let fy = (fyf - by0 as f32).clamp(0.0, 1.0);
+        for (bx, g) in grid_row.iter_mut().enumerate() {
+            *g = bg_grid[by0 * nx + bx] * (1.0 - fy) + bg_grid[by1 * nx + bx] * fy;
+        }
+
         for c in 0..w {
-            let bg = bilinear_grid(&bg_grid, nx, ny, block, c, r);
+            let fxf = (c as f32 - half) / block as f32;
+            let bx0 = (fxf.floor() as isize).clamp(0, nx as isize - 1) as usize;
+            let bx1 = (bx0 + 1).min(nx - 1);
+            let fx = (fxf - bx0 as f32).clamp(0.0, 1.0);
+            let bg = grid_row[bx0] * (1.0 - fx) + grid_row[bx1] * fx;
             let p = pixels[row + c];
             let lit = p.is_finite() && p > bg + k * sigma;
 

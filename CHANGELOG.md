@@ -155,6 +155,14 @@ distortion first (the tiered calibration flow does this automatically).
 
 ### Performance
 
+- **CCL extraction ~40% faster** (71.5 → ~42 ms on 2048² TESS frames,
+  matched filter on). Block medians are computed from a phase-staggered
+  stride subsample; the materialized full-image background buffer and its
+  separate subtraction passes are replaced by one fused pass that
+  interpolates the block grid on the fly (writing the filter's unclamped
+  input directly into the blur matrix); noise statistics run on subsampled
+  bilinear residuals with the same estimator. The fast path hoists the
+  row-constant half of its per-pixel bilinear out of the sweep (~10%).
 - **Faster no-match / wrong-FOV solves.** The FOV sweep step doubled to
   `4·match_radius·fov` — measurements show verification tolerates the full
   match radius of midpoint scale error, so half the sweep values cover the

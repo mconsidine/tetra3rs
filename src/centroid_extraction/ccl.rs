@@ -38,35 +38,6 @@ mod par {
     #[cfg(feature = "parallel")]
     use rayon::prelude::*;
 
-    /// `(a - b).max(0.0)` element-wise (background subtraction with clamp).
-    #[cfg(feature = "parallel")]
-    pub fn map_subtract_clamp(a: &[f32], b: &[f32]) -> Vec<f32> {
-        a.par_iter()
-            .zip(b.par_iter())
-            .map(|(&v, &bg)| (v - bg).max(0.0))
-            .collect()
-    }
-    #[cfg(not(feature = "parallel"))]
-    pub fn map_subtract_clamp(a: &[f32], b: &[f32]) -> Vec<f32> {
-        a.iter()
-            .zip(b.iter())
-            .map(|(&v, &bg)| (v - bg).max(0.0))
-            .collect()
-    }
-
-    /// `a - b` element-wise (background subtraction, unclamped).
-    #[cfg(feature = "parallel")]
-    pub fn map_subtract(a: &[f32], b: &[f32]) -> Vec<f32> {
-        a.par_iter()
-            .zip(b.par_iter())
-            .map(|(&v, &bg)| v - bg)
-            .collect()
-    }
-    #[cfg(not(feature = "parallel"))]
-    pub fn map_subtract(a: &[f32], b: &[f32]) -> Vec<f32> {
-        a.iter().zip(b.iter()).map(|(&v, &bg)| v - bg).collect()
-    }
-
     /// Map `f` over `0..n` into a `Vec`, preserving index order.
     #[cfg(feature = "parallel")]
     pub fn map_indices<T, F>(n: usize, f: F) -> Vec<T>
@@ -105,6 +76,34 @@ mod par {
             f(i, c);
         }
     }
+
+    /// Apply `f(i, chunk_a, chunk_b)` to corresponding disjoint
+    /// `chunk_len`-sized chunks of two buffers (one image row each).
+    #[cfg(feature = "parallel")]
+    pub fn for_each_chunk_pair_mut<T, U, F>(a: &mut [T], b: &mut [U], chunk_len: usize, f: F)
+    where
+        T: Send,
+        U: Send,
+        F: Fn(usize, &mut [T], &mut [U]) + Sync + Send,
+    {
+        a.par_chunks_mut(chunk_len)
+            .zip(b.par_chunks_mut(chunk_len))
+            .enumerate()
+            .for_each(|(i, (ca, cb))| f(i, ca, cb));
+    }
+    #[cfg(not(feature = "parallel"))]
+    pub fn for_each_chunk_pair_mut<T, U, F>(a: &mut [T], b: &mut [U], chunk_len: usize, mut f: F)
+    where
+        F: FnMut(usize, &mut [T], &mut [U]),
+    {
+        for (i, (ca, cb)) in a
+            .chunks_mut(chunk_len)
+            .zip(b.chunks_mut(chunk_len))
+            .enumerate()
+        {
+            f(i, ca, cb);
+        }
+    }
 }
 
 /// Shared extraction pipeline for both image and raw-pixel entry points.
@@ -139,47 +138,87 @@ pub(super) fn extract_from_gray(
         )));
     }
 
-    // ── Step 1: local background subtraction ──
-    // If local_bg_block_size is set, estimate and subtract a spatially varying
-    // background model. This is critical for images with nebulosity, Milky Way
-    // emission, vignetting, or other large-scale intensity gradients. Without
-    // it the input is used as-is (borrowed — no full-image copies).
+    let filter_sigma = config
+        .matched_filter_sigma
+        .filter(|s| s.is_finite() && *s > 0.0);
+
+    // ── Steps 1-2: background model, residuals, and noise stats ──
+    // With `local_bg_block_size` set, a block-median grid is built (from a
+    // staggered subsample) and everything downstream works from residuals
+    // against its bilinear surface. The residuals are produced by ONE fused
+    // pass over the image that interpolates the surface on the fly and
+    // writes the clamped measurement image and — only when the matched
+    // filter is on — the unclamped filter input directly into the blur's
+    // matrix. (Blurring the clamped image would rectify negative noise into
+    // a positive DC offset; measuring on the unclamped one would let
+    // negative pixels cancel star flux.) The materialized full-image
+    // background buffer and its separate subtract passes are gone.
+    //
+    // Noise statistics use the same estimator either way; on the local-bg
+    // path it runs on bilinear residuals at the block subsample lattice
+    // (identical reference surface, ~stride² fewer samples) instead of a
+    // full-image residual buffer.
     let gray: Cow<[f32]>;
-    let local_bg: Option<Vec<f32>>;
+    let bg_mean: f32;
+    let bg_sigma: f32;
+    let local_bg: bool;
+    let mut filter_input: Option<DynMatrix<f32>> = None;
+
     if let Some(block_size) = config.local_bg_block_size {
-        let bg = estimate_local_background(gray_input, width, height, block_size);
-        gray = Cow::Owned(par::map_subtract_clamp(gray_input, &bg));
-        local_bg = Some(bg);
+        local_bg = true;
+        let (grid, nx, ny) = background_grid(gray_input, width, height, block_size);
+        let bs = block_size as usize;
+
+        let residuals = subsample_residuals(gray_input, w, h, &grid, nx, ny, bs);
+        (bg_mean, bg_sigma) = estimate_background(&residuals, width, height, config);
+
+        // Fused residual pass (rows in parallel under the `parallel` feature;
+        // each row writes disjoint output, results independent of threads).
+        let mut clamped = vec![0.0_f32; w * h];
+        if filter_sigma.is_some() {
+            let mut unclamped = vec![0.0_f32; w * h];
+            par::for_each_chunk_pair_mut(&mut clamped, &mut unclamped, w, |y, cr, ur| {
+                let (by0, by1, fy) = interp_row_params(y, bs, ny);
+                let row = y * w;
+                for x in 0..w {
+                    let r = gray_input[row + x] - interp_bg(&grid, nx, bs, x, by0, by1, fy);
+                    cr[x] = r.max(0.0);
+                    ur[x] = r;
+                }
+            });
+            filter_input = Some(DynMatrix::from_vec(w, h, unclamped));
+        } else {
+            par::for_each_chunk_mut(&mut clamped, w, |y, cr| {
+                let (by0, by1, fy) = interp_row_params(y, bs, ny);
+                let row = y * w;
+                for (x, out) in cr.iter_mut().enumerate() {
+                    *out =
+                        (gray_input[row + x] - interp_bg(&grid, nx, bs, x, by0, by1, fy)).max(0.0);
+                }
+            });
+        }
+        gray = Cow::Owned(clamped);
     } else {
+        local_bg = false;
+        (bg_mean, bg_sigma) = estimate_background(gray_input, width, height, config);
         gray = Cow::Borrowed(gray_input);
-        local_bg = None;
+        if filter_sigma.is_some() {
+            filter_input = Some(DynMatrix::from_vec(w, h, gray_input.to_vec()));
+        }
     }
     let gray: &[f32] = &gray;
 
-    // ── Step 2: estimate residual background noise ──
-    // Use unclamped residuals for noise estimation so the lower half of the
-    // distribution is preserved (clamping to 0 destroys it).
-    let noise_input: Cow<[f32]> = if let Some(ref bg) = local_bg {
-        Cow::Owned(par::map_subtract(gray_input, bg))
-    } else {
-        Cow::Borrowed(gray_input)
-    };
-    let (bg_mean, bg_sigma) = estimate_background(&noise_input, width, height, config);
-
     // ── Step 3: optional matched filter for thresholding only ──
-    // When `matched_filter_sigma` is set, the *unclamped* residual is
-    // convolved with a Gaussian and threshold/CCL run on the filtered copy —
-    // blurring the clamped image would rectify negative noise into a
-    // positive DC offset that silently loosens the threshold. Centroids are
-    // still measured on the unfiltered `gray`, so intensities and CoM
-    // positions are unaffected. The detection threshold is scaled by the
-    // kernel's white-noise suppression factor so `sigma_threshold` keeps
-    // meaning "sigmas of the noise actually present in the thresholded
-    // image", filter on or off. Under the `parallel` feature numeris's
-    // gaussian_blur runs multi-threaded.
-    let (thresh_src, mask_threshold): (Cow<[f32]>, f32) = match config.matched_filter_sigma {
-        Some(sigma) if sigma.is_finite() && sigma > 0.0 => {
-            let mat = DynMatrix::<f32>::from_vec(w, h, noise_input.to_vec());
+    // The unclamped residual is convolved with a Gaussian and threshold/CCL
+    // run on the filtered copy; centroids are still measured on the
+    // unfiltered `gray`, so intensities and CoM positions are unaffected.
+    // The detection threshold is scaled by the kernel's white-noise
+    // suppression factor so `sigma_threshold` keeps meaning "sigmas of the
+    // noise actually present in the thresholded image", filter on or off.
+    // Under the `parallel` feature numeris's gaussian_blur runs
+    // multi-threaded.
+    let (thresh_src, mask_threshold): (Cow<[f32]>, f32) = match (filter_sigma, filter_input) {
+        (Some(sigma), Some(mat)) => {
             let filtered = gaussian_blur(&mat, sigma, BorderMode::Replicate).into_vec();
             let suppression = gaussian_noise_suppression(sigma);
             (
@@ -214,7 +253,7 @@ pub(super) fn extract_from_gray(
     // ── Step 4: compute centroids ──
     // Use the local-background-subtracted image for centroid weighting so that
     // the intensity weights reflect only the stellar signal, not the gradient.
-    let bg_for_centroids = if local_bg.is_some() {
+    let bg_for_centroids = if local_bg {
         // Already subtracted — use 0 as the level
         0.0
     } else {
@@ -265,22 +304,23 @@ pub(super) fn extract_from_gray(
     })
 }
 
-/// Estimate a spatially varying background by computing block medians and
-/// interpolating between block centers.
+/// Block-median background grid: the image is divided into
+/// `block_size × block_size` tiles and each tile's (subsampled) median is
+/// computed. Bilinear interpolation between tile centers — done on the fly by
+/// [`interp_row_params`] + the fused residual pass in [`extract_from_gray`] —
+/// reconstructs a smooth background surface that removes large-scale
+/// structure (nebulosity, Milky Way emission, vignetting) while preserving
+/// point sources. Returns `(medians, nx, ny)`, row-major `nx`-wide.
 ///
-/// The image is divided into `block_size × block_size` tiles. For each tile,
-/// the median pixel value is computed (ignoring zeros). A smooth background
-/// surface is then reconstructed via bilinear interpolation between tile
-/// centers.
-///
-/// This effectively removes large-scale structure (nebulosity, Milky Way
-/// emission, vignetting) while preserving point sources (stars).
-///
-/// This is the dominant extraction stage (~60% of wall-clock); under the
-/// `parallel` feature the per-block medians and the per-row interpolation both
-/// fan out across threads. Each block / row writes its own output slot, so the
-/// result is identical to the sequential path.
-fn estimate_local_background(pixels: &[f32], width: u32, height: u32, block_size: u32) -> Vec<f32> {
+/// Under the `parallel` feature the per-block medians fan out across threads;
+/// each block writes its own output slot, so the result is identical to the
+/// sequential path.
+fn background_grid(
+    pixels: &[f32],
+    width: u32,
+    height: u32,
+    block_size: u32,
+) -> (Vec<f32>, usize, usize) {
     let w = width as usize;
     let h = height as usize;
     let bs = block_size as usize;
@@ -341,39 +381,74 @@ fn estimate_local_background(pixels: &[f32], width: u32, height: u32, block_size
         midpoint_f32(&mut vals)
     });
 
-    // Bilinearly interpolate between block centers to produce a smooth
-    // background estimate at every pixel. Each row depends only on the shared,
-    // immutable block medians, so rows are filled in parallel over disjoint
-    // output slices.
-    let mut background = vec![0.0f32; w * h];
+    (block_medians, nx, ny)
+}
+
+/// Row-constant part of the bilinear interpolation over a block grid: for
+/// image row `y`, the two grid rows it blends between and the blend weight.
+#[inline]
+fn interp_row_params(y: usize, bs: usize, ny: usize) -> (usize, usize, f32) {
     let half_bs = bs as f32 / 2.0;
+    let by_f = (y as f32 - half_bs) / bs as f32;
+    let by0 = (by_f.floor() as isize).max(0).min(ny as isize - 1) as usize;
+    let by1 = (by0 + 1).min(ny - 1);
+    let fy = (by_f - by0 as f32).clamp(0.0, 1.0);
+    (by0, by1, fy)
+}
 
-    par::for_each_chunk_mut(&mut background, w, |y, row| {
-        // Position in block-center coordinates (row component)
-        let by_f = (y as f32 - half_bs) / bs as f32;
-        let by0 = (by_f.floor() as isize).max(0).min(ny as isize - 1) as usize;
-        let by1 = (by0 + 1).min(ny - 1);
-        let fy = (by_f - by0 as f32).clamp(0.0, 1.0);
+/// Bilinear background value at `(x, y)` from a block-median grid — the same
+/// four-term blend the materialized background buffer used to hold, evaluated
+/// on the fly. `(by0, by1, fy)` come from [`interp_row_params`].
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn interp_bg(grid: &[f32], nx: usize, bs: usize, x: usize, by0: usize, by1: usize, fy: f32) -> f32 {
+    let half_bs = bs as f32 / 2.0;
+    let bx_f = (x as f32 - half_bs) / bs as f32;
+    let bx0 = (bx_f.floor() as isize).max(0).min(nx as isize - 1) as usize;
+    let bx1 = (bx0 + 1).min(nx - 1);
+    let fx = (bx_f - bx0 as f32).clamp(0.0, 1.0);
 
-        for (x, px) in row.iter_mut().enumerate() {
-            let bx_f = (x as f32 - half_bs) / bs as f32;
-            let bx0 = (bx_f.floor() as isize).max(0).min(nx as isize - 1) as usize;
-            let bx1 = (bx0 + 1).min(nx - 1);
-            let fx = (bx_f - bx0 as f32).clamp(0.0, 1.0);
+    let m00 = grid[by0 * nx + bx0];
+    let m10 = grid[by0 * nx + bx1];
+    let m01 = grid[by1 * nx + bx0];
+    let m11 = grid[by1 * nx + bx1];
 
-            let m00 = block_medians[by0 * nx + bx0];
-            let m10 = block_medians[by0 * nx + bx1];
-            let m01 = block_medians[by1 * nx + bx0];
-            let m11 = block_medians[by1 * nx + bx1];
+    m00 * (1.0 - fx) * (1.0 - fy) + m10 * fx * (1.0 - fy) + m01 * (1.0 - fx) * fy + m11 * fx * fy
+}
 
-            *px = m00 * (1.0 - fx) * (1.0 - fy)
-                + m10 * fx * (1.0 - fy)
-                + m01 * (1.0 - fx) * fy
-                + m11 * fx * fy;
+/// Background-subtracted residuals at the block subsample lattice (the same
+/// staggered lattice [`background_grid`] medians over), against the bilinear
+/// surface — the identical reference the full-image residual pass used, so
+/// feeding these to [`estimate_background`] preserves its semantics while
+/// touching ~stride² fewer samples.
+fn subsample_residuals(
+    pixels: &[f32],
+    w: usize,
+    h: usize,
+    grid: &[f32],
+    nx: usize,
+    ny: usize,
+    bs: usize,
+) -> Vec<f32> {
+    let stride = (bs / 16).max(1);
+    let mut out: Vec<f32> = Vec::with_capacity((w / stride + 1) * (h / stride + 1));
+    let mut y = 0usize;
+    let mut phase = 0usize;
+    while y < h {
+        let (by0, by1, fy) = interp_row_params(y, bs, ny);
+        let row = y * w;
+        let mut x = phase;
+        while x < w {
+            let v = pixels[row + x];
+            if v.is_finite() {
+                out.push(v - interp_bg(grid, nx, bs, x, by0, by1, fy));
+            }
+            x += stride;
         }
-    });
-
-    background
+        phase = (phase + 1) % stride;
+        y += stride;
+    }
+    out
 }
 
 /// White-noise standard-deviation suppression factor of the separable 2-D
