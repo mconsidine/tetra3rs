@@ -918,7 +918,15 @@ fn n_choose_k(n: usize, k: usize) -> usize {
     result
 }
 
-/// Enumerate all pattern keys in the given range, tagged with distance² from center.
+/// Enumerate pattern keys in the given range, tagged with distance² from center.
+///
+/// Only *monotone non-decreasing* tuples (`key[i] ≤ key[i+1]`) are emitted:
+/// catalog keys are quantized from ascending edge ratios
+/// (`compute_sorted_edge_angles` → `compute_edge_ratios` →
+/// `compute_pattern_key`, a monotone per-dimension quantization), so every
+/// stored key satisfies the invariant and a non-monotone probe can never hit.
+/// Skipping them is behavior-preserving and cuts a large share of the hash
+/// probes whenever adjacent range dimensions overlap.
 fn enumerate_key_range(
     key_min: &[u32; NUM_EDGE_RATIOS],
     key_max: &[u32; NUM_EDGE_RATIOS],
@@ -948,7 +956,14 @@ fn enumerate_key_range_recursive(
         out.push((dist_sq, *current));
         return;
     }
-    for v in key_min[dim]..=key_max[dim] {
+    // Monotone pruning: this dimension can never be below the previous one in
+    // any stored key (see `enumerate_key_range`), so start the scan there.
+    let lo = if dim > 0 {
+        key_min[dim].max(current[dim - 1])
+    } else {
+        key_min[dim]
+    };
+    for v in lo..=key_max[dim] {
         current[dim] = v;
         enumerate_key_range_recursive(key_min, key_max, center, dim + 1, current, out);
     }
@@ -1111,6 +1126,53 @@ mod tests {
             (shift_rad - expected).abs() < 1e-6,
             "shift {shift_rad:.2e} rad, expected ~{expected:.2e} rad"
         );
+    }
+
+    #[test]
+    fn test_enumerate_key_range_monotone_pruning() {
+        // The enumeration must emit exactly the monotone non-decreasing
+        // tuples of the full Cartesian product (catalog keys are quantized
+        // from ascending edge ratios, so non-monotone probes can never hit),
+        // each tagged with its distance² from the center key.
+        let cases: [([u32; NUM_EDGE_RATIOS], [u32; NUM_EDGE_RATIOS]); 3] = [
+            // Wide overlapping spans — pruning removes most tuples.
+            ([2, 2, 2, 2, 2], [5, 5, 5, 5, 5]),
+            // Disjoint ascending spans — nothing to prune.
+            ([0, 2, 4, 6, 8], [1, 3, 5, 7, 9]),
+            // Partially overlapping adjacent spans.
+            ([1, 2, 2, 4, 4], [3, 4, 5, 5, 6]),
+        ];
+        for (key_min, key_max) in cases {
+            let center: [u32; NUM_EDGE_RATIOS] =
+                std::array::from_fn(|i| (key_min[i] + key_max[i]) / 2);
+
+            let mut got: Vec<(u32, [u32; NUM_EDGE_RATIOS])> = Vec::new();
+            enumerate_key_range(&key_min, &key_max, &center, &mut got);
+
+            // Brute-force reference: full product, filtered to monotone.
+            let mut expected: Vec<(u32, [u32; NUM_EDGE_RATIOS])> = Vec::new();
+            for a in key_min[0]..=key_max[0] {
+                for b in key_min[1]..=key_max[1] {
+                    for c in key_min[2]..=key_max[2] {
+                        for d in key_min[3]..=key_max[3] {
+                            for e in key_min[4]..=key_max[4] {
+                                let k = [a, b, c, d, e];
+                                if k.windows(2).all(|w| w[0] <= w[1]) {
+                                    let dist_sq: u32 = (0..NUM_EDGE_RATIOS)
+                                        .map(|i| {
+                                            let dd = k[i] as i32 - center[i] as i32;
+                                            (dd * dd) as u32
+                                        })
+                                        .sum();
+                                    expected.push((dist_sq, k));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(got, expected, "min={key_min:?} max={key_max:?}");
+        }
     }
 
     #[test]
