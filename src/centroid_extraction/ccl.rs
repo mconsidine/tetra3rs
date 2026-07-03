@@ -291,6 +291,20 @@ fn estimate_local_background(pixels: &[f32], width: u32, height: u32, block_size
 
     // Compute median for each block. Blocks are independent and each writes its
     // own index, so this maps in parallel under the `parallel` feature.
+    //
+    // Each block is subsampled on a stride grid rather than exhausted: at the
+    // default 64-px block, stride 4 medians 256 samples instead of 4096. The
+    // block median's standard error (≈1.25σ/√n) stays ≲ 0.08σ — far below
+    // any detection threshold — while the median stage, the dominant cost of
+    // extraction, drops ~16×. (The fast path's `coarse_background` uses the
+    // same trick at stride block/8; block/16 here keeps extra margin since
+    // this path is the calibration-quality one.)
+    //
+    // Only non-finite samples are excluded (NaN-masked regions). Zeros and
+    // negatives are legitimate background samples — excluding them, as this
+    // function once did, biases the background *up* on dark-subtracted
+    // frames whose true background is ~0.
+    let stride = (bs / 16).max(1);
     let block_medians: Vec<f32> = par::map_indices(nx * ny, |bi| {
         let bx = bi % nx;
         let by = bi / nx;
@@ -299,14 +313,29 @@ fn estimate_local_background(pixels: &[f32], width: u32, height: u32, block_size
         let x1 = (x0 + bs).min(w);
         let y1 = (y0 + bs).min(h);
 
-        let mut vals: Vec<f32> = Vec::with_capacity(bs * bs);
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let v = pixels[y * w + x];
-                if v > 0.0 && v.is_finite() {
+        let mut vals: Vec<f32> = Vec::with_capacity((bs / stride + 1).pow(2));
+        let mut y = y0;
+        let mut phase = 0usize;
+        while y < y1 {
+            let row = y * w;
+            // Stagger the column phase per sample row (a diagonal lattice):
+            // a plain stride grid samples only one column-residue class,
+            // which aliases against column-periodic structure (CMOS
+            // fixed-pattern noise, Bayer residue). Cycling the phase covers
+            // every residue class equally across `stride` consecutive sample
+            // rows. (Row-periodic structure with period dividing the stride
+            // still aliases — sample rows are inherently strided — but
+            // column FPN is the dominant periodic artifact in practice.)
+            let mut x = x0 + phase;
+            while x < x1 {
+                let v = pixels[row + x];
+                if v.is_finite() {
                     vals.push(v);
                 }
+                x += stride;
             }
+            phase = (phase + 1) % stride;
+            y += stride;
         }
 
         midpoint_f32(&mut vals)

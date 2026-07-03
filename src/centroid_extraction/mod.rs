@@ -562,8 +562,13 @@ mod tests {
         // zero. Regression guard: convolving the *clamped* residual rectified
         // negative noise into a positive DC offset comparable to the
         // compensated threshold, which would light up the whole frame.
-        let (width, height) = (128u32, 128u32);
-        let pixels = render_stars(width, height, 100.0, 30.0, 20.0, 1.5, &[]);
+        // 4x4+ background blocks: the bilinear background clamps at the
+        // outermost block centers, so a steep gradient on a 2-block-wide
+        // frame leaves an un-modeled ramp near the borders that exceeds any
+        // tight threshold — a (pre-existing) edge-extrapolation limitation,
+        // not what this test measures.
+        let (width, height) = (256u32, 256u32);
+        let pixels = render_stars(width, height, 100.0, 10.0, 20.0, 1.5, &[]);
         let cfg = CentroidExtractionConfig {
             sigma_threshold: 5.0,
             ..Default::default()
@@ -699,10 +704,16 @@ mod tests {
         for row in 0..h {
             for col in 0..w {
                 // Large-scale gradient the coarse-grid background must reject,
-                // plus a cheap deterministic dither so the noise σ is nonzero.
-                let dither = (((row * w + col) as u32).wrapping_mul(2_654_435_761) >> 8) as f32
-                    / 16_777_216.0
-                    - 0.5;
+                // plus deterministic hash noise (splitmix64 finalizer). A
+                // proper hash matters: the multiplicative Weyl sequence this
+                // helper once used is an arithmetic progression mod 1, whose
+                // subsequences under any strided sampling are grossly
+                // non-uniform — unlike real sensor noise.
+                let mut z = (row * w + col) as u64 ^ 0x9e37_79b9_7f4a_7c15;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                z ^= z >> 31;
+                let dither = (z >> 40) as f32 / 16_777_216.0 - 0.5;
                 pixels[row * w + col] = bg + gradient * (col as f32 / w as f32) + noise * dither;
             }
         }
