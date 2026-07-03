@@ -48,6 +48,24 @@ mod fast;
 
 pub use fast::{extract_centroids_fast, FastCentroidConfig};
 
+/// Deblending policy for blobs containing more than one distinct intensity
+/// peak (a blended star pair yields a single centroid at the flux-weighted
+/// midpoint — a wrong position the pattern hash will happily consume).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeblendMode {
+    /// Keep blended blobs as a single merged centroid (historical behavior).
+    #[default]
+    Off,
+    /// Reject blobs with more than one distinct peak — the safe choice for
+    /// plate solving, where a missing star costs far less than a wrong
+    /// position. A peak counts as distinct when it is a strict local maximum
+    /// over its 8-neighborhood, rises above 30% of the blob's peak (over the
+    /// local background), and lies more than 2 px from any brighter accepted
+    /// peak. Saturated blobs (per `saturation_level`) are exempt: plateau
+    /// noise fakes multiple maxima on a genuinely single star.
+    Reject,
+}
+
 /// Configuration for centroid extraction from an image.
 #[derive(Debug, Clone)]
 pub struct CentroidExtractionConfig {
@@ -158,6 +176,12 @@ pub struct CentroidExtractionConfig {
     ///
     /// Default: None (disabled)
     pub saturation_level: Option<f32>,
+
+    /// What to do with blobs containing more than one distinct intensity
+    /// peak (blended star pairs). See [`DeblendMode`].
+    ///
+    /// Default: [`DeblendMode::Off`]
+    pub deblend: DeblendMode,
 }
 
 impl Default for CentroidExtractionConfig {
@@ -175,6 +199,7 @@ impl Default for CentroidExtractionConfig {
             matched_filter_sigma: Some(1.5),
             max_sharpness: Some(0.9),
             saturation_level: None,
+            deblend: DeblendMode::Off,
         }
     }
 }
@@ -894,6 +919,116 @@ mod tests {
             assert!(
                 ex.abs() < 0.02 && ey.abs() < 0.02,
                 "phase ({px}, {py}): error ({ex:.4}, {ey:.4}) px"
+            );
+        }
+    }
+
+    #[test]
+    fn test_deblend_reject() {
+        // A blended pair (4 px apart, comparable brightness) merges into one
+        // blob whose centroid lands between the stars. Off keeps the merged
+        // centroid (historical behavior); Reject drops the blob while
+        // keeping the isolated star. A saturated flat-top star is exempt
+        // even though plateau noise fakes multiple maxima.
+        let (width, height) = (96u32, 96u32);
+        let mut pixels = render_stars(
+            width,
+            height,
+            100.0,
+            0.0,
+            4.0,
+            1.3,
+            &[
+                (30.0, 30.0, 2000.0),
+                (34.0, 30.0, 1500.0),
+                (70.0, 70.0, 2000.0),
+            ],
+        );
+        let base = CentroidExtractionConfig {
+            sigma_threshold: 5.0,
+            local_bg_block_size: None,
+            ..Default::default()
+        };
+        let merged = extract_centroids_from_raw(&pixels, width, height, &base).unwrap();
+        assert_eq!(merged.centroids.len(), 2, "pair merges into one blob");
+
+        let reject = CentroidExtractionConfig {
+            deblend: DeblendMode::Reject,
+            ..base.clone()
+        };
+        let res = extract_centroids_from_raw(&pixels, width, height, &reject).unwrap();
+        assert_eq!(res.centroids.len(), 1, "blended blob rejected");
+        assert!(
+            (res.centroids[0].x - (70.0 - 47.5)).abs() < 0.5,
+            "isolated star survives"
+        );
+
+        // Saturated exemption: clip the pair's peaks flat and mark the level.
+        for v in pixels.iter_mut() {
+            *v = v.min(600.0);
+        }
+        let sat = CentroidExtractionConfig {
+            deblend: DeblendMode::Reject,
+            saturation_level: Some(600.0),
+            ..base
+        };
+        let res = extract_centroids_from_raw(&pixels, width, height, &sat).unwrap();
+        assert_eq!(
+            res.centroids.len(),
+            2,
+            "saturated blobs exempt from deblend rejection"
+        );
+    }
+
+    #[test]
+    fn test_centroid_accuracy_ensemble() {
+        // Characterization: ensemble centroid RMSE vs truth for noisy stars
+        // at deterministic pseudo-random sub-pixel phases, at two PSF widths
+        // bracketing typical trackers (σ 0.9 ≈ TESS-like undersampled,
+        // σ 1.5 ≈ deliberately defocused). Run with --nocapture to see the
+        // measured RMSE. Guards sub-pixel accuracy regressions and answers
+        // "is the centroider the limiting error term?" for improvements like
+        // a windowed CoM: the TESS multi-sector calibration residual is
+        // ~0.077 px, so an ensemble RMSE well below that means the floor is
+        // elsewhere (catalog, proper motion, optics model).
+        let (width, height) = (96u32, 96u32);
+        for &(sigma_px, amp, bound) in &[
+            (0.9_f32, 3000.0_f32, 0.03_f32),
+            (1.5, 3000.0, 0.03),
+            (1.5, 300.0, 0.12),
+        ] {
+            let mut se = 0.0_f64;
+            let mut n = 0usize;
+            for trial in 0..40u64 {
+                // splitmix64-derived sub-pixel phase
+                let mut z = trial ^ 0x9e37_79b9_7f4a_7c15;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                let px = 47.0 + ((z >> 40) as f32 / 16_777_216.0 - 0.5);
+                let py = 47.0 + ((z >> 16 & 0xFF_FFFF) as f32 / 16_777_216.0 - 0.5);
+                let pixels =
+                    render_stars(width, height, 100.0, 0.0, 20.0, sigma_px, &[(px, py, amp)]);
+                let cfg = CentroidExtractionConfig {
+                    sigma_threshold: 5.0,
+                    local_bg_block_size: None,
+                    ..Default::default()
+                };
+                let res = extract_centroids_from_raw(&pixels, width, height, &cfg).unwrap();
+                assert_eq!(
+                    res.centroids.len(),
+                    1,
+                    "σ={sigma_px} amp={amp} trial={trial}"
+                );
+                let c = &res.centroids[0];
+                let (ex, ey) = ((c.x - (px - 47.5)) as f64, (c.y - (py - 47.5)) as f64);
+                se += ex * ex + ey * ey;
+                n += 1;
+            }
+            let rmse = (se / (2 * n) as f64).sqrt();
+            println!("centroid ensemble RMSE: psf σ={sigma_px} amp={amp} → {rmse:.4} px");
+            assert!(
+                rmse < bound as f64,
+                "σ={sigma_px} amp={amp}: RMSE {rmse:.4} px exceeds {bound}"
             );
         }
     }

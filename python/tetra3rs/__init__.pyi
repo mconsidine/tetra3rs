@@ -1089,6 +1089,7 @@ def extract_centroids(
     matched_filter_sigma: Optional[float] = 1.5,
     max_sharpness: Optional[float] = 0.9,
     saturation_level: Optional[float] = None,
+    deblend: str = "off",
 ) -> ExtractionResult:
     """Extract star centroids from a 2D image array.
 
@@ -1119,6 +1120,10 @@ def extract_centroids(
             saturated; such blobs skip sub-pixel peak refinement (a flat top
             has no meaningful maximum) and keep the center-of-mass position.
             None = disabled.
+        deblend: Policy for blobs with more than one distinct intensity
+            peak (blended pairs centroid to a wrong midpoint position).
+            "off" keeps them merged; "reject" drops them — the safe choice
+            for plate solving. Saturated blobs are exempt.
 
     Returns:
         ExtractionResult with centroids and image statistics.

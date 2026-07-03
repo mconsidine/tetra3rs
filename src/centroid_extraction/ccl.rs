@@ -14,6 +14,7 @@ use numeris::DynMatrix;
 use super::{
     accepted_peak_refine, elongation_from_cov, median_f32, par, peak_sharpness,
     sort_and_truncate_by_mass, BackgroundGrid, CentroidExtractionConfig, CentroidExtractionResult,
+    DeblendMode,
 };
 use crate::centroid::Centroid;
 use crate::error::{Error, Result};
@@ -458,6 +459,66 @@ fn compute_blob_centroids(
                 }
             }
 
+            let saturated = config.saturation_level.is_some_and(|s| peak_val >= s);
+
+            // --- Minimal deblending (see DeblendMode) ---
+            // A blended pair centroids to the flux-weighted midpoint — a
+            // wrong position the pattern hash will consume. Reject mode
+            // drops blobs with more than one distinct peak: strict local
+            // maxima over the 8-neighborhood, above 30% of the blob peak
+            // (over local background), more than 2 px from any brighter
+            // accepted peak. Saturated blobs are exempt (plateau noise
+            // fakes maxima on a genuinely single star).
+            if config.deblend == DeblendMode::Reject && !saturated {
+                let thresh = local_bg + 0.3 * (peak_val as f64 - local_bg);
+                let mut maxima: Vec<(f32, usize, usize)> = Vec::new();
+                for r in min_row..=max_row {
+                    let row_off = r * w;
+                    for c in min_col..=max_col {
+                        let i = row_off + c;
+                        if labels[i] != blob_label || (gray[i] as f64) <= thresh {
+                            continue;
+                        }
+                        let v = gray[i];
+                        let mut is_max = true;
+                        'nb: for dr in -1..=1_isize {
+                            for dc in -1..=1_isize {
+                                if dr == 0 && dc == 0 {
+                                    continue;
+                                }
+                                let rr = r as isize + dr;
+                                let cc = c as isize + dc;
+                                if rr < 0 || cc < 0 || rr >= h as isize || cc >= w as isize {
+                                    continue;
+                                }
+                                if gray[rr as usize * w + cc as usize] >= v {
+                                    is_max = false;
+                                    break 'nb;
+                                }
+                            }
+                        }
+                        if is_max {
+                            maxima.push((v, c, r));
+                        }
+                    }
+                }
+                maxima.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                let mut kept: Vec<(usize, usize)> = Vec::new();
+                for &(_, c, r) in &maxima {
+                    let distinct = kept.iter().all(|&(kc, kr)| {
+                        let dx = c as f64 - kc as f64;
+                        let dy = r as f64 - kr as f64;
+                        dx * dx + dy * dy > 4.0
+                    });
+                    if distinct {
+                        kept.push((c, r));
+                        if kept.len() > 1 {
+                            return None;
+                        }
+                    }
+                }
+            }
+
             let (pc, pr) = (peak_col, peak_row);
             // 3x3 grid of background-subtracted values around the peak
             let v = |dy: isize, dx: isize| -> f64 {
@@ -481,7 +542,6 @@ fn compute_blob_centroids(
             // top can still "pass" the parabola with a skewed vertex.
             let mut final_x = xbar;
             let mut final_y = ybar;
-            let saturated = config.saturation_level.is_some_and(|s| peak_val >= s);
             if !saturated {
                 if let Some((qx, qy)) =
                     accepted_peak_refine(pixel_count, (pc, pr), (w, h), (xbar, ybar), v)

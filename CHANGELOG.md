@@ -39,6 +39,18 @@ second moments inline (merged through union-find), so it also populates
 absorbs structure larger than a block (~64 px) before these filters see it;
 `max_pixels` matters for sharp bloomed regions, `max_elongation` for trails.
 
+### Added — opt-in deblending, centroid-accuracy characterization
+
+- **`deblend: DeblendMode`** (CCL path, default `Off`): a blended star pair
+  produces one centroid at the flux-weighted midpoint — a wrong position the
+  pattern hash will consume. `Reject` drops blobs with more than one distinct
+  intensity peak (strict 8-neighborhood maxima above 30% of the blob peak,
+  > 2 px apart); saturated blobs are exempt (plateau noise fakes maxima on a
+  genuinely single star). Python: `deblend="off" | "reject"`.
+- A deterministic ensemble test characterizes centroid accuracy across
+  sub-pixel phases (bright stars: ~0.004–0.006 px RMSE at PSF σ 0.9–1.5 px)
+  and guards against sub-pixel regressions.
+
 ### Added — extraction quality gates
 
 - **`max_sharpness`** (both extraction configs): DAOFIND-style hot-pixel /

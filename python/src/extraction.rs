@@ -2,7 +2,7 @@ use numpy::PyReadonlyArray2;
 use pyo3::prelude::*;
 
 use tetra3::centroid_extraction::{
-    CentroidExtractionConfig, CentroidExtractionResult, FastCentroidConfig,
+    CentroidExtractionConfig, CentroidExtractionResult, DeblendMode, FastCentroidConfig,
 };
 
 use crate::centroid::PyCentroid;
@@ -208,6 +208,10 @@ impl PyExtractionResult {
 ///         saturated; such blobs skip sub-pixel peak refinement (a flat top
 ///         has no meaningful maximum) and keep the center-of-mass position.
 ///         None = disabled.
+///     deblend: Policy for blobs with more than one distinct intensity peak
+///         (blended star pairs centroid to a wrong midpoint position).
+///         "off" keeps them merged; "reject" drops them — the safe choice
+///         for plate solving. Saturated blobs are exempt. Default "off".
 ///
 /// Returns:
 ///     ExtractionResult with centroids and image statistics.
@@ -223,6 +227,7 @@ impl PyExtractionResult {
     matched_filter_sigma = Some(1.5),
     max_sharpness = Some(0.9),
     saturation_level = None,
+    deblend = "off",
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_centroids(
@@ -236,8 +241,19 @@ pub(crate) fn extract_centroids(
     matched_filter_sigma: Option<f32>,
     max_sharpness: Option<f32>,
     saturation_level: Option<f32>,
+    deblend: &str,
 ) -> PyResult<PyExtractionResult> {
     let (pixels, width, height) = image_to_f32(image)?;
+
+    let deblend = match deblend {
+        "off" => DeblendMode::Off,
+        "reject" => DeblendMode::Reject,
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "deblend must be 'off' or 'reject', got '{other}'"
+            )))
+        }
+    };
 
     let config = CentroidExtractionConfig {
         sigma_threshold,
@@ -252,6 +268,7 @@ pub(crate) fn extract_centroids(
         matched_filter_sigma,
         max_sharpness,
         saturation_level,
+        deblend,
     };
 
     let result =
