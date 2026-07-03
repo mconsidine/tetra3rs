@@ -640,12 +640,20 @@ impl SolverDatabase {
                     // Every verified candidate consumes one unit of the
                     // multiple-comparison budget (`candidates_tested` is the
                     // sequential-Bonferroni divisor of the acceptance test
-                    // below). The pre-gate itself is deliberately *uncorrected*:
-                    // it only decides whether the candidate is promising
-                    // enough to refine — acceptance happens after
-                    // re-verification of the refined attitude.
+                    // below). The pre-gate itself is deliberately loose: its
+                    // only job is to keep hopeless candidates away from the
+                    // (relatively expensive) refinement — acceptance is
+                    // decided by re-verifying the *refined* attitude at a
+                    // tightened radius, which separates true from false
+                    // candidates far more sharply than this coarse-radius
+                    // p-value can. Hostile-but-solvable fields depend on the
+                    // slack: e.g. a galaxy-cluster frame where only ~8 of the
+                    // 50 brightest centroids are catalog stars scores ~1e-2
+                    // here yet re-verifies decisively once refined. The
+                    // ceiling never tightens below the user's budget.
+                    const PREGATE_CEILING: f64 = 1e-2;
                     *candidates_tested += 1;
-                    if prob_mismatch >= config.match_threshold {
+                    if prob_mismatch >= config.match_threshold.max(PREGATE_CEILING) {
                         continue;
                     }
 
@@ -874,7 +882,6 @@ impl SolverDatabase {
             trials as u32,
             1.0 - prob_single.min(1.0),
         );
-
         (matches, prob_mismatch)
     }
 
