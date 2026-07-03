@@ -80,7 +80,20 @@ pub fn load_hipparcos_catalog_from_file<P: AsRef<std::path::Path>>(
     path: P,
 ) -> crate::Result<Vec<HipparcosStar>> {
     let data = std::fs::read_to_string(path)?;
-    Ok(load_hipparcos_catalog(&data))
+    let total_lines = data.lines().filter(|l| !l.trim().is_empty()).count();
+    let stars = load_hipparcos_catalog(&data);
+    // A wrong-format file parses to zero stars but would otherwise build a
+    // useless (empty) database without any error; surface that here.
+    if total_lines > 0 && stars.is_empty() {
+        return Err(crate::error::Error::InvalidCatalog(format!(
+            "Hipparcos catalog: parsed 0 stars from {total_lines} non-empty lines (wrong format?)"
+        )));
+    }
+    let dropped = total_lines - stars.len();
+    if dropped > 0 {
+        tracing::warn!("Hipparcos catalog: skipped {dropped} unparseable line(s)");
+    }
+    Ok(stars)
 }
 
 #[cfg(test)]

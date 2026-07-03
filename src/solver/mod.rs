@@ -297,6 +297,57 @@ impl Default for GenerateDatabaseConfig {
     }
 }
 
+impl GenerateDatabaseConfig {
+    /// Validate that the generation parameters are self-consistent, before they
+    /// drive index arithmetic that would otherwise overflow, divide by zero, or
+    /// silently corrupt every pattern key. Returns [`crate::Error::InvalidInput`]
+    /// with a specific message for the first offending field.
+    pub fn validate(&self) -> crate::Result<()> {
+        use crate::Error::InvalidInput;
+        if !(self.max_fov_deg.is_finite() && self.max_fov_deg > 0.0 && self.max_fov_deg < 180.0) {
+            return Err(InvalidInput(format!(
+                "max_fov_deg must be in (0, 180), got {}",
+                self.max_fov_deg
+            )));
+        }
+        if let Some(min_fov) = self.min_fov_deg {
+            if !(min_fov.is_finite() && min_fov > 0.0 && min_fov <= self.max_fov_deg) {
+                return Err(InvalidInput(format!(
+                    "min_fov_deg must be in (0, max_fov_deg={}], got {}",
+                    self.max_fov_deg, min_fov
+                )));
+            }
+        }
+        // bins = round(0.25 / pattern_max_error); require it to land in [1, u32]
+        // so keys quantize correctly.
+        if !(self.pattern_max_error.is_finite() && self.pattern_max_error > 0.0)
+            || (0.25 / self.pattern_max_error).round() < 1.0
+        {
+            return Err(InvalidInput(format!(
+                "pattern_max_error must be finite and in (0, 0.25], got {}",
+                self.pattern_max_error
+            )));
+        }
+        // fov_divisions uses ln(multiscale_step) as a divisor; step <= 1 gives a
+        // zero/negative log and an infinite/NaN division count.
+        if !(self.multiscale_step.is_finite() && self.multiscale_step > 1.0) {
+            return Err(InvalidInput(format!(
+                "multiscale_step must be finite and > 1.0, got {}",
+                self.multiscale_step
+            )));
+        }
+        if self.verification_stars_per_fov == 0 {
+            return Err(InvalidInput(
+                "verification_stars_per_fov must be >= 1".into(),
+            ));
+        }
+        if self.catalog_nside == 0 {
+            return Err(InvalidInput("catalog_nside must be >= 1".into()));
+        }
+        Ok(())
+    }
+}
+
 // ── Configuration for plate solving ─────────────────────────────────────────
 
 /// Parameters controlling the plate-solve attempt.
@@ -610,4 +661,30 @@ pub(crate) fn focal_length_from_fov(image_width: u32, fov_rad: f64) -> f64 {
 /// `pixel_scale = 1 / focal_length_from_fov(...)`.
 pub(crate) fn pixel_scale_from_fov(image_width: u32, fov_rad: f64) -> f64 {
     1.0 / focal_length_from_fov(image_width, fov_rad)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_config_validate_accepts_default() {
+        assert!(GenerateDatabaseConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn generate_config_validate_rejects_bad_values() {
+        let bad = |f: fn(&mut GenerateDatabaseConfig)| {
+            let mut c = GenerateDatabaseConfig::default();
+            f(&mut c);
+            assert!(c.validate().is_err());
+        };
+        bad(|c| c.multiscale_step = 1.0); // ln(1) == 0 → infinite divisions
+        bad(|c| c.pattern_max_error = 0.0); // bins → ∞
+        bad(|c| c.pattern_max_error = -0.001);
+        bad(|c| c.verification_stars_per_fov = 0); // divide by zero
+        bad(|c| c.catalog_nside = 0);
+        bad(|c| c.max_fov_deg = 0.0);
+        bad(|c| c.min_fov_deg = Some(40.0)); // > max_fov_deg (30)
+    }
 }

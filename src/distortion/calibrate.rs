@@ -24,7 +24,7 @@ use crate::solver::{SolveResult, SolverDatabase};
 use super::fit::{
     build_id_lookup, compute_corrected_rmse, fit_polynomial_sigma_clip,
     fit_radial_centered_sigma_clip, intrinsics_residuals, masked_rms, project_to_matched_point,
-    MatchedPoint,
+    MatchedPoint, MIN_RADIAL_POINTS,
 };
 use super::polynomial::{num_coeffs, PolynomialDistortion};
 use super::Distortion;
@@ -313,7 +313,7 @@ fn multi_image_calibrate(
         .filter(|sol| sol.parity_flip == parity_flip)
         .map(|sol| sol.fov_rad)
         .collect();
-    fovs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    fovs.sort_by(f32::total_cmp);
     let median_fov = fovs[fovs.len() / 2];
     // True pinhole pixel scale (1/f) from median angular FOV. The median
     // solve FOV is a whole-field average biased by distortion, so this is
@@ -526,7 +526,7 @@ fn multi_image_calibrate(
 
         let min_points = match config.model {
             DistortionModelType::Polynomial { order } => num_coeffs(order),
-            DistortionModelType::Radial => 3,
+            DistortionModelType::Radial => MIN_RADIAL_POINTS,
         };
         if all_points.len() < min_points {
             debug!(
@@ -621,7 +621,11 @@ fn multi_image_calibrate(
         current_crpix = fit_crpix;
         last_rmse_before = rmse_before;
 
-        // Check convergence
+        // Check convergence. Two independent criteria: an absolute per-outer
+        // RMSE change (`convergence_threshold_px`, user-configurable) and a
+        // relative change — the latter stops runs whose RMSE has plateaued at a
+        // level well above the absolute floor (e.g. hard multi-sector fits).
+        const RMSE_REL_CONVERGENCE: f64 = 0.01; // 1% change between outers
         let rmse_change = (last_rmse - rmse_after).abs();
         let rmse_frac_change = if last_rmse > 1e-12 {
             rmse_change / last_rmse
@@ -631,7 +635,8 @@ fn multi_image_calibrate(
 
         last_rmse = rmse_after;
 
-        if rmse_frac_change < 0.01 || rmse_change < config.convergence_threshold_px {
+        if rmse_frac_change < RMSE_REL_CONVERGENCE || rmse_change < config.convergence_threshold_px
+        {
             debug!(
                 "  multi-cal: converged at outer iteration {} (RMSE change={:.4} px, {:.2}%)",
                 outer,

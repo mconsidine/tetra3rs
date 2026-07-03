@@ -14,7 +14,7 @@ use std::borrow::Cow;
 use std::time::Instant;
 
 use numeris::{Matrix3, Quaternion, Vector3};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::Centroid;
 
@@ -82,6 +82,20 @@ impl SolverDatabase {
     ) -> SolveResult {
         let t0 = Instant::now();
 
+        // The `SolveConfig::default()` camera model is a placeholder with a zero
+        // image size / focal length; a config left at those defaults yields a
+        // degenerate FOV and silently NoMatches. Warn loudly so the cause is
+        // visible rather than mysterious.
+        let cam = &config.camera_model;
+        let focal_ok = cam.focal_length_px.is_finite() && cam.focal_length_px > 0.0;
+        if cam.image_width == 0 || cam.image_height == 0 || !focal_ok {
+            warn!(
+                "camera model appears unconfigured (image {}x{}, focal_length_px {}); \
+                 solve will not match — build SolveConfig via new()/with_camera_model()",
+                cam.image_width, cam.image_height, cam.focal_length_px
+            );
+        }
+
         // ── Aberration correction: build corrected catalog vectors if velocity is set ──
         let star_vecs: Cow<[[f32; 3]]> = match config.observer_velocity_km_s {
             Some(v) => {
@@ -97,9 +111,13 @@ impl SolverDatabase {
         };
 
         // ── Preprocess centroids: subtract CRPIX and undistort (pixel-space, FOV-independent) ──
-        let cam = &config.camera_model;
+        // Non-finite inputs (NaN/inf) would quantize to bogus pattern keys and
+        // degrade the solve to a silent NoMatch, so drop them here (and any that
+        // undistort to non-finite) rather than feed them downstream.
+        let n_input = centroids.len();
         let preprocessed: Vec<Centroid> = centroids
             .iter()
+            .filter(|c| c.x.is_finite() && c.y.is_finite())
             .map(|c| {
                 // Subtract optical center offset
                 let cx = c.x as f64 - cam.crpix[0];
@@ -113,7 +131,14 @@ impl SolverDatabase {
                     cov: c.cov,
                 }
             })
+            .filter(|c| c.x.is_finite() && c.y.is_finite())
             .collect();
+        if preprocessed.len() < n_input {
+            debug!(
+                "Dropped {} non-finite centroid(s) before solve",
+                n_input - preprocessed.len()
+            );
+        }
         let working_centroids: &[Centroid] = &preprocessed;
 
         // ── Tracking-mode shortcut: if a hint is provided, try direct correspondence first ──
@@ -313,13 +338,32 @@ impl SolverDatabase {
             Some(user_err) => user_err,
             None => self.props.pattern_max_error,
         };
+        // Ceiling on the tolerance. The candidate-key search enumerates a 5-D
+        // Cartesian product of ~(2·err·bins + 1)^5 tuples per star combination;
+        // with no cap a large match_max_error (e.g. 0.1 at 250 bins ≈ 345M
+        // tuples, ~8 GB) exhausts memory. Bound the per-dimension bin span, but
+        // never below the database's own quantization error (the floor above).
+        const MAX_KEY_SPAN_BINS: f32 = 16.0;
+        let err_ceiling =
+            (MAX_KEY_SPAN_BINS / (2.0 * p_bins as f32)).max(self.props.pattern_max_error);
+        let p_max_err = if p_max_err > err_ceiling {
+            debug!(
+                "match_max_error {:.2e} exceeds enumeration ceiling {:.2e} ({} bins); clamping",
+                p_max_err, err_ceiling, p_bins
+            );
+            err_ceiling
+        } else {
+            p_max_err
+        };
         let match_threshold = config.match_threshold / self.props.num_patterns as f64;
         let timeout_ms = config.solve_timeout_ms;
 
-        // Guard against an empty pattern table (corrupt or placeholder
-        // database): the hash-probe arithmetic below would divide by zero.
+        // Guard against a corrupt or placeholder database. An empty table makes
+        // the hash-probe arithmetic below divide by zero; `num_patterns == 0`
+        // (with a non-empty table) makes `match_threshold` above `+inf`, so
+        // every candidate would pass verification and produce a bogus solution.
         let table_len = self.pattern_catalog.len() as u64;
-        if table_len == 0 {
+        if table_len == 0 || self.props.num_patterns == 0 {
             return failure(SolveStatus::NoMatch, t0);
         }
 
@@ -396,8 +440,11 @@ impl SolverDatabase {
                 // Pre-filter by 16-bit key hash
                 let key_hash16 = (pkey_hash & 0xFFFF) as u16;
 
-                // Walk the hash chain inline (quadratic probing)
-                for c in 0u64.. {
+                // Walk the hash chain inline (quadratic probing). Generator
+                // tables keep load ≤ 0.5 on a prime size, so an empty slot is
+                // always reached; the `table_len` cap only bounds the walk on a
+                // corrupt/over-full table (which would otherwise loop forever).
+                for c in 0u64..table_len {
                     let tidx = ((hidx.wrapping_add(c.wrapping_mul(c))) % table_len) as usize;
                     let entry = self.pattern_catalog.get(tidx);
                     if entry.is_empty() {
@@ -873,7 +920,9 @@ fn n_choose_k(n: usize, k: usize) -> usize {
     }
     let mut result = 1usize;
     for i in 0..k {
-        result = result * (n - i) / (i + 1);
+        // Saturate rather than overflow-panic for very large centroid counts;
+        // this value only feeds a debug log, so a saturated estimate is fine.
+        result = result.saturating_mul(n - i) / (i + 1);
     }
     result
 }

@@ -20,6 +20,12 @@ use super::polynomial::{num_coeffs, term_pairs, PolynomialDistortion};
 use super::radial::RadialDistortion;
 use super::Distortion;
 
+/// Minimum matched points for a Brown-Conrady radial fit. The LM solves for 8
+/// parameters (cx, cy, γ, k1–k3, p1, p2), so fewer points is under-determined —
+/// [`run_intrinsics_lm`] bails below this and callers must not treat the
+/// resulting warm-start as a real fit.
+pub(super) const MIN_RADIAL_POINTS: usize = 8;
+
 /// Configuration for distortion fitting.
 #[derive(Debug, Clone)]
 pub struct DistortionFitConfig {
@@ -131,7 +137,10 @@ pub fn fit_radial_distortion(
     let id_to_idx = build_id_lookup(database);
     let points = gather_matched_points(solve_results, centroids, database, &id_to_idx, image_width);
 
-    if points.is_empty() {
+    // Below MIN_RADIAL_POINTS the 8-parameter fit is under-determined and the LM
+    // returns its (identity) warm start, which would masquerade as a real fit.
+    // Report a clean no-op result instead.
+    if points.len() < MIN_RADIAL_POINTS {
         return DistortionFitResult {
             model: Distortion::None,
             crpix: None,
@@ -1043,7 +1052,7 @@ pub(super) fn percentile(sorted: &[f64], p: f64) -> f64 {
         return 0.0;
     }
     let mut values = sorted.to_vec();
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    values.sort_by(f64::total_cmp);
     let idx = (p * (values.len() - 1) as f64).round() as usize;
     values[idx.min(values.len() - 1)]
 }
@@ -1097,16 +1106,28 @@ pub(super) fn fit_poly_ls(
         row += 1;
     }
 
-    if let Ok(cx) = a_mat.solve_qr(&bx_vec) {
-        for j in 0..ncoeffs {
-            a_coeffs[j] = cx[j];
+    // A rank-deficient design matrix (e.g. collinear or too-few points) leaves
+    // the coefficients at their previous values; log it so a silently-degraded
+    // fit isn't reported as a normal one.
+    // A rank-deficient design matrix (e.g. collinear or too-few points) leaves
+    // the coefficients at their previous values; log it so a silently-degraded
+    // fit isn't reported as a normal one.
+    match a_mat.solve_qr(&bx_vec) {
+        Ok(cx) => {
+            for j in 0..ncoeffs {
+                a_coeffs[j] = cx[j];
+            }
         }
+        Err(_) => debug!("fit_poly_ls: x-axis QR solve failed; keeping prior coeffs"),
     }
 
-    if let Ok(cy) = a_mat.solve_qr(&by_vec) {
-        for j in 0..ncoeffs {
-            b_coeffs[j] = cy[j];
+    match a_mat.solve_qr(&by_vec) {
+        Ok(cy) => {
+            for j in 0..ncoeffs {
+                b_coeffs[j] = cy[j];
+            }
         }
+        Err(_) => debug!("fit_poly_ls: y-axis QR solve failed; keeping prior coeffs"),
     }
 }
 

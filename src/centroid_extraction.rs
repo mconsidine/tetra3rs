@@ -600,7 +600,7 @@ pub fn extract_centroids_fast(
     let bg_mean = {
         let mut g = bg_grid.clone();
         let m = g.len() / 2;
-        let (_, nth, _) = g.select_nth_unstable_by(m, |a, b| a.partial_cmp(b).unwrap());
+        let (_, nth, _) = g.select_nth_unstable_by(m, |a, b| a.total_cmp(b));
         *nth
     };
 
@@ -681,8 +681,7 @@ fn coarse_background(
                 0.0
             } else {
                 let m = samples.len() / 2;
-                let (_, nth, _) =
-                    samples.select_nth_unstable_by(m, |a, b| a.partial_cmp(b).unwrap());
+                let (_, nth, _) = samples.select_nth_unstable_by(m, |a, b| a.total_cmp(b));
                 *nth
             };
             grid[by * nx + bx] = median;
@@ -736,6 +735,28 @@ fn extract_from_gray(
 ) -> Result<CentroidExtractionResult> {
     let w = width as usize;
     let h = height as usize;
+
+    // ── Step 0: validate geometry and config ──
+    // The pipeline below indexes `width - 1` and chunks the image into rows of
+    // width `w`, both of which panic on a degenerate image; and a zero
+    // `local_bg_block_size` divides by zero in the background estimator. Reject
+    // these up front (the fast path guards the same cases).
+    if w < 2 || h < 2 {
+        return Err(Error::InvalidInput(format!(
+            "image must be at least 2x2, got {width}x{height}"
+        )));
+    }
+    if config.local_bg_block_size == Some(0) {
+        return Err(Error::InvalidInput(
+            "local_bg_block_size must be >= 1 (or None)".into(),
+        ));
+    }
+    if !config.sigma_threshold.is_finite() {
+        return Err(Error::InvalidInput(format!(
+            "sigma_threshold must be finite, got {}",
+            config.sigma_threshold
+        )));
+    }
 
     // ── Step 1: local background subtraction ──
     // If local_bg_block_size is set, estimate and subtract a spatially varying
@@ -903,7 +924,7 @@ fn estimate_local_background(pixels: &[f32], width: u32, height: u32, block_size
         if vals.is_empty() {
             0.0
         } else {
-            vals.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+            vals.sort_unstable_by(|a, b| a.total_cmp(b));
             vals[vals.len() / 2]
         }
     });
@@ -1246,7 +1267,7 @@ fn compute_blob_centroids(
                 let m = annulus_vals.len();
                 let mid = m / 2;
                 let (lower, nth, _) =
-                    annulus_vals.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+                    annulus_vals.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
                 if m.is_multiple_of(2) {
                     let prev = lower.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                     (prev + *nth) as f64 / 2.0
@@ -1335,6 +1356,30 @@ fn compute_blob_centroids(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_ccl_rejects_degenerate_geometry() {
+        let cfg = CentroidExtractionConfig::default();
+        // Zero-size and 1-wide images used to panic (chunk size 0 / width-1
+        // underflow) rather than return an error.
+        assert!(extract_centroids_from_raw(&[], 0, 0, &cfg).is_err());
+        assert!(extract_centroids_from_raw(&[1.0], 1, 1, &cfg).is_err());
+    }
+
+    #[test]
+    fn test_ccl_rejects_bad_config() {
+        let pixels = vec![0.0_f32; 16 * 16];
+        let zero_block = CentroidExtractionConfig {
+            local_bg_block_size: Some(0),
+            ..Default::default()
+        };
+        assert!(extract_centroids_from_raw(&pixels, 16, 16, &zero_block).is_err());
+        let nan_thresh = CentroidExtractionConfig {
+            sigma_threshold: f32::NAN,
+            ..Default::default()
+        };
+        assert!(extract_centroids_from_raw(&pixels, 16, 16, &nan_thresh).is_err());
+    }
 
     #[test]
     fn test_background_estimation() {

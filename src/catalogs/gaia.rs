@@ -41,7 +41,21 @@ pub fn load_gaia_binary<P: AsRef<Path>>(path: P) -> Result<Vec<GaiaStar>> {
     let num_stars = u64::from_le_bytes(header[8..16].try_into().unwrap()) as usize;
 
     let record_size = 36;
-    let mut buf = vec![0u8; num_stars * record_size];
+    // A corrupt/truncated header could claim a huge `num_stars`, driving a
+    // multi-gigabyte allocation (or a capacity-overflow abort) before
+    // `read_exact` gets a chance to fail. Require the star block to match the
+    // file's remaining bytes exactly first.
+    let expected_bytes = num_stars.checked_mul(record_size).ok_or_else(|| {
+        Error::InvalidCatalog("Gaia binary: num_stars * record_size overflows".into())
+    })?;
+    let data_bytes = file.metadata()?.len().saturating_sub(header.len() as u64);
+    if expected_bytes as u64 != data_bytes {
+        return Err(Error::InvalidCatalog(format!(
+            "Gaia binary: header claims {num_stars} stars ({expected_bytes} bytes) \
+             but file has {data_bytes} data bytes"
+        )));
+    }
+    let mut buf = vec![0u8; expected_bytes];
     file.read_exact(&mut buf)?;
 
     let mut stars = Vec::with_capacity(num_stars);
