@@ -28,7 +28,7 @@ postcard = { version = "1.0", features = ["alloc"] }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2"
 tracing = { version = "0.1.40", features = ["std"] }
-numeris = { version = "0.5.13", features = ["std", "serde", "optim"] }
+numeris = { version = "0.5.14", features = ["std", "serde", "optim"] }
 image = { version = "0.25", optional = true, default-features = false }
 rayon = { version = "1", optional = true }
 
