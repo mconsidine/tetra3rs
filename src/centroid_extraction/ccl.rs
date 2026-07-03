@@ -165,28 +165,40 @@ pub(super) fn extract_from_gray(
         Cow::Borrowed(gray_input)
     };
     let (bg_mean, bg_sigma) = estimate_background(&noise_input, width, height, config);
-    let threshold = bg_mean + config.sigma_threshold * bg_sigma;
 
     // ── Step 3: optional matched filter for thresholding only ──
-    // When `matched_filter_sigma` is set, the bg-subtracted residual is
-    // convolved with a Gaussian and threshold/CCL run on the filtered copy.
-    // Centroids are still measured on the unfiltered `gray`, so intensities
-    // and CoM positions are unaffected. Under the `parallel` feature numeris's
+    // When `matched_filter_sigma` is set, the *unclamped* residual is
+    // convolved with a Gaussian and threshold/CCL run on the filtered copy —
+    // blurring the clamped image would rectify negative noise into a
+    // positive DC offset that silently loosens the threshold. Centroids are
+    // still measured on the unfiltered `gray`, so intensities and CoM
+    // positions are unaffected. The detection threshold is scaled by the
+    // kernel's white-noise suppression factor so `sigma_threshold` keeps
+    // meaning "sigmas of the noise actually present in the thresholded
+    // image", filter on or off. Under the `parallel` feature numeris's
     // gaussian_blur runs multi-threaded.
-    let filtered: Option<Vec<f32>> = match config.matched_filter_sigma {
+    let (thresh_src, mask_threshold): (Cow<[f32]>, f32) = match config.matched_filter_sigma {
         Some(sigma) if sigma.is_finite() && sigma > 0.0 => {
-            let mat = DynMatrix::<f32>::from_vec(w, h, gray.to_vec());
-            Some(gaussian_blur(&mat, sigma, BorderMode::Replicate).into_vec())
+            let mat = DynMatrix::<f32>::from_vec(w, h, noise_input.to_vec());
+            let filtered = gaussian_blur(&mat, sigma, BorderMode::Replicate).into_vec();
+            let suppression = gaussian_noise_suppression(sigma);
+            (
+                Cow::Owned(filtered),
+                bg_mean + config.sigma_threshold * bg_sigma * suppression,
+            )
         }
-        _ => None,
+        _ => (
+            Cow::Borrowed(gray),
+            bg_mean + config.sigma_threshold * bg_sigma,
+        ),
     };
-    let thresh_src: &[f32] = filtered.as_deref().unwrap_or(gray);
+    let thresh_src: &[f32] = &thresh_src;
 
     // ── Step 4: threshold and label blobs ──
     // Build a u8 mask DynMatrix in proper (h, w) layout for CCL — its
     // bbox/labels conventions assume the supplied dimensions match the image.
     let mask = DynMatrix::<u8>::from_fn(h, w, |r, c| {
-        if thresh_src[r * w + c] > threshold {
+        if thresh_src[r * w + c] > mask_threshold {
             1u8
         } else {
             0u8
@@ -248,7 +260,7 @@ pub(super) fn extract_from_gray(
         image_height: height,
         background_mean: bg_mean,
         background_sigma: bg_sigma,
-        threshold,
+        threshold: mask_threshold,
         num_blobs_raw,
     })
 }
@@ -333,6 +345,27 @@ fn estimate_local_background(pixels: &[f32], width: u32, height: u32, block_size
     });
 
     background
+}
+
+/// White-noise standard-deviation suppression factor of the separable 2-D
+/// Gaussian blur used by the matched filter.
+///
+/// For a normalized 1-D kernel `k`, convolving white noise multiplies its
+/// standard deviation by `√(Σk²)` per axis, so the separable 2-D factor is
+/// `Σk²`. The kernel is replicated exactly as numeris builds it (radius
+/// `ceil(3σ)`, `exp(−x²/2σ²)` weights, normalized); for σ ≳ 1 this
+/// approaches the continuous limit `1/(2√π·σ)`.
+fn gaussian_noise_suppression(sigma: f32) -> f32 {
+    let radius = (3.0 * sigma).ceil() as i64;
+    let inv_two_sigma_sq = 1.0 / (2.0 * sigma as f64 * sigma as f64);
+    let mut sum = 0.0_f64;
+    let mut sum_sq = 0.0_f64;
+    for i in -radius..=radius {
+        let w = (-((i * i) as f64) * inv_two_sigma_sq).exp();
+        sum += w;
+        sum_sq += w * w;
+    }
+    (sum_sq / (sum * sum)) as f32
 }
 
 /// Estimate background level and noise.

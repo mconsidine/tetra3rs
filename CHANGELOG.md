@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Changed — matched filter on by default, threshold auto-compensated
+
+- **`matched_filter_sigma` defaults to `Some(1.5)`** (was `None`): every
+  serious point-source detector convolves before thresholding; for a
+  σ≈1.5 px PSF the peak-SNR gain is ~2× (≈0.75 mag more detection depth at
+  the same false-positive rate), with a broad optimum (σ within ~2× of the
+  true PSF width). Set `None` to threshold unfiltered.
+- **The detection threshold is now scaled by the kernel's noise-suppression
+  factor** (Σk² of the separable blur), so `sigma_threshold` means "sigmas
+  of the noise actually present in the thresholded image" with the filter on
+  or off — toggling the filter no longer requires retuning the threshold.
+  `ExtractionResult.threshold` reports the threshold actually applied.
+- **The filter now convolves the unclamped residual.** Previously it blurred
+  the zero-clamped background-subtracted image, rectifying negative noise
+  into a positive DC offset that silently loosened the effective threshold.
+
 ### Added — extraction quality gates
 
 - **`max_sharpness`** (both extraction configs): DAOFIND-style hot-pixel /

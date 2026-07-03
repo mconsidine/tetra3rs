@@ -192,10 +192,11 @@ impl PyExtractionResult {
 ///     local_bg_block_size: Block size for local background estimation. None = global only.
 ///     max_elongation: Maximum blob elongation ratio. None = disabled.
 ///     matched_filter_sigma: Apply a Gaussian matched filter of this sigma
-///         (in pixels) before thresholding. Boosts point-source SNR; the
-///         filter is used only to form the detection mask, so photometry
-///         is unaffected. Consider lowering sigma_threshold when enabled.
-///         None = disabled.
+///         (in pixels) before thresholding (~2x point-source SNR for a
+///         sigma~1.5 px PSF). Used only to form the detection mask, so
+///         photometry is unaffected, and the threshold is automatically
+///         scaled for the filtered noise level — no retuning needed.
+///         None = disabled. Default 1.5.
 ///     max_sharpness: Reject blobs whose peak sharpness
 ///         ``(peak - mean(8 neighbors)) / peak`` exceeds this — values near 1
 ///         are hot pixels / cosmic rays, not stars. A critically sampled PSF
@@ -219,7 +220,7 @@ impl PyExtractionResult {
     max_centroids = None,
     local_bg_block_size = Some(64),
     max_elongation = Some(3.0),
-    matched_filter_sigma = None,
+    matched_filter_sigma = Some(1.5),
     max_sharpness = Some(0.9),
     saturation_level = None,
 ))]

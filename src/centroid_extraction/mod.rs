@@ -121,16 +121,20 @@ pub struct CentroidExtractionConfig {
     /// centroid positions and intensities are still measured on the
     /// unfiltered bg-subtracted image, so photometry is unaffected.
     ///
-    /// A matched filter boosts point-source SNR by concentrating the
-    /// star's PSF into fewer effective pixels before thresholding. The
-    /// gain is largest for faint stars in noisy or dense images. The
-    /// filter has a broad optimum: σ within a factor of ~2 of the true
-    /// PSF width still recovers nearly all the SNR.
+    /// A matched filter boosts point-source SNR before thresholding —
+    /// ~2× peak SNR (≈0.75 mag more depth at the same false-positive rate)
+    /// for a σ≈1.5 px PSF. The gain is largest for faint stars in noisy or
+    /// dense images, and the optimum is broad: σ within a factor of ~2 of
+    /// the true PSF width recovers nearly all of it.
     ///
-    /// When enabled, consider lowering `sigma_threshold` (e.g. to 2.5–3.0)
-    /// since the filtered image has lower noise.
+    /// The detection threshold is automatically scaled by the kernel's
+    /// noise-suppression factor, so `sigma_threshold` means "sigmas of the
+    /// noise actually present in the thresholded image" whether the filter
+    /// is on or off — no retuning needed when toggling it.
     ///
-    /// Default: None (disabled).
+    /// Default: Some(1.5). Set `None` to threshold the unfiltered image
+    /// (marginally faster; appropriate when downstream limits like
+    /// `max_centroids` make faint-star depth irrelevant).
     pub matched_filter_sigma: Option<f32>,
 
     /// Maximum DAOFIND-style sharpness: `(peak − mean(8 neighbors)) / peak`,
@@ -168,7 +172,7 @@ impl Default for CentroidExtractionConfig {
             use_8_connectivity: true,
             local_bg_block_size: Some(64),
             max_elongation: Some(3.0),
-            matched_filter_sigma: None,
+            matched_filter_sigma: Some(1.5),
             max_sharpness: Some(0.9),
             saturation_level: None,
         }
@@ -514,6 +518,62 @@ mod tests {
         assert!(c.x.abs() < 1.0, "Expected x near 0, got {}", c.x);
         assert!(c.y.abs() < 1.0, "Expected y near 0, got {}", c.y);
         assert!(c.mass.unwrap() > 0.0);
+    }
+
+    #[test]
+    fn test_matched_filter_depth_gain() {
+        // A star too faint for the unfiltered 5σ cut is recovered when the
+        // matched filter is on — at the SAME sigma_threshold, because the
+        // detection threshold is scaled by the kernel's noise-suppression
+        // factor automatically.
+        let (width, height) = (64u32, 64u32);
+        let pixels = render_stars(width, height, 100.0, 0.0, 20.0, 1.5, &[(30.0, 30.0, 20.0)]);
+        let base = CentroidExtractionConfig {
+            sigma_threshold: 5.0,
+            local_bg_block_size: None,
+            matched_filter_sigma: None,
+            ..Default::default()
+        };
+        let unfiltered = extract_centroids_from_raw(&pixels, width, height, &base).unwrap();
+        assert_eq!(
+            unfiltered.centroids.len(),
+            0,
+            "star should sit below the unfiltered cut"
+        );
+
+        let filtered_cfg = CentroidExtractionConfig {
+            matched_filter_sigma: Some(1.5),
+            ..base
+        };
+        let filtered = extract_centroids_from_raw(&pixels, width, height, &filtered_cfg).unwrap();
+        assert_eq!(
+            filtered.centroids.len(),
+            1,
+            "matched filter should recover the faint star"
+        );
+        assert!((filtered.centroids[0].x - (30.0 - 31.5)).abs() < 1.0);
+        assert!((filtered.centroids[0].y - (30.0 - 31.5)).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_matched_filter_no_noise_false_positives() {
+        // Pure noise + gradient with the (default-on) filter and local
+        // background: the compensated threshold must keep false positives at
+        // zero. Regression guard: convolving the *clamped* residual rectified
+        // negative noise into a positive DC offset comparable to the
+        // compensated threshold, which would light up the whole frame.
+        let (width, height) = (128u32, 128u32);
+        let pixels = render_stars(width, height, 100.0, 30.0, 20.0, 1.5, &[]);
+        let cfg = CentroidExtractionConfig {
+            sigma_threshold: 5.0,
+            ..Default::default()
+        };
+        let res = extract_centroids_from_raw(&pixels, width, height, &cfg).unwrap();
+        assert_eq!(
+            res.centroids.len(),
+            0,
+            "noise-only frame produced detections"
+        );
     }
 
     #[test]
