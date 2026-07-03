@@ -8,7 +8,7 @@ use tetra3::solver::SolveResult;
 use tetra3::Centroid;
 
 use crate::centroid::PyCentroid;
-use crate::solve_result::PySolveResult;
+use crate::solve_result::{PySolveFailure, PySolveResult};
 
 /// Parse solve_results and centroids from Python objects.
 ///
@@ -17,20 +17,29 @@ pub(crate) fn parse_solve_results_and_centroids(
     solve_results: &Bound<'_, pyo3::PyAny>,
     centroids: &Bound<'_, pyo3::PyAny>,
 ) -> PyResult<(Vec<SolveResult>, Vec<Vec<Centroid>>)> {
-    // Try to extract as a single SolveResult first. Python-side results are
-    // always successful solves, so wrap each as `Ok` for the Rust API.
+    // Try to extract as a single SolveResult first. Lists may mix
+    // SolveResult and SolveFailure items — the Rust calibrate API accepts
+    // failures and skips them, so a caller can pass its solve outputs
+    // straight through without filtering.
     let sr_vec: Vec<SolveResult> = if let Ok(single) = solve_results.extract::<PySolveResult>() {
         vec![Ok(single.inner)]
     } else if let Ok(list) = solve_results.cast::<pyo3::types::PyList>() {
         list.iter()
             .map(|item| {
-                let sr: PySolveResult = item.extract()?;
-                Ok(Ok(sr.inner))
+                if let Ok(sr) = item.extract::<PySolveResult>() {
+                    Ok(Ok(sr.inner))
+                } else if let Ok(fail) = item.extract::<PySolveFailure>() {
+                    Ok(Err(fail.inner))
+                } else {
+                    Err(pyo3::exceptions::PyTypeError::new_err(
+                        "solve_results items must be SolveResult or SolveFailure objects",
+                    ))
+                }
             })
             .collect::<PyResult<Vec<SolveResult>>>()?
     } else {
         return Err(pyo3::exceptions::PyTypeError::new_err(
-            "solve_results must be a SolveResult or list of SolveResult objects",
+            "solve_results must be a SolveResult or list of SolveResult / SolveFailure objects",
         ));
     };
 

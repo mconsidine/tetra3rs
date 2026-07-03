@@ -478,8 +478,13 @@ class TestExtractCentroids:
         """Fast path returns a pickleable ExtractionResult with usable centroids."""
         h, w = 64, 64
         image = np.random.normal(100, 5, (h, w)).astype(np.float32)
+        # A star-shaped 3x3 patch (a bare 2-pixel spike is a hot-pixel pair,
+        # which the default sharpness gate now correctly rejects).
         image[32, 32] = 10000
-        image[31, 32] = 8000  # 2-pixel region so min_pixels=2 keeps it
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            image[32 + dr, 32 + dc] = 5000
+        for dr, dc in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
+            image[32 + dr, 32 + dc] = 2500
 
         result = tetra3rs.extract_centroids_fast(image, sigma_threshold=4.0)
         assert len(result.centroids) >= 1

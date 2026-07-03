@@ -828,7 +828,7 @@ class SolverDatabase:
 
     def calibrate_camera(
         self,
-        solve_results: Union[SolveResult, list[SolveResult]],
+        solve_results: Union[SolveResult, list[Union[SolveResult, SolveFailure]]],
         centroids: Union[
             list[Centroid],
             npt.NDArray[np.float64],
@@ -860,7 +860,9 @@ class SolverDatabase:
           symmetric about the optical center.
 
         Args:
-            solve_results: A SolveResult or list of SolveResult objects.
+            solve_results: A SolveResult, or a list that may mix SolveResult
+                and SolveFailure objects — failures are skipped, so solve
+                outputs can be passed straight through without filtering.
             centroids: Matching centroids (list of Centroid lists, or single list).
             image_width: Image width in pixels.
             image_height: Image height in pixels.

@@ -532,7 +532,9 @@ impl PySolverDatabase {
     ///   distortion is symmetric about the optical center.
     ///
     /// Args:
-    ///     solve_results: A SolveResult or list of SolveResult objects.
+    ///     solve_results: A SolveResult, or a list that may mix SolveResult
+    ///         and SolveFailure objects — failures are skipped, so solve
+    ///         outputs can be passed straight through without filtering.
     ///     centroids: Matching centroids (list of Centroid lists, or single list).
     ///     image_width: Image width in pixels.
     ///     image_height: Image height in pixels.

@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### Upgrading from 0.8
+
+The short list — full details in the sections referenced below.
+
+- **CCL-path `sigma_threshold` now means true Gaussian sigmas** (the old
+  estimator ran ~40% low). Multiply configured values by ≈0.6 (e.g. `5.0` →
+  `3.0`) to keep your previous effective detection depth;
+  `FastCentroidConfig` is unaffected. See *Fixed — CCL-path noise estimator*.
+- **The matched filter is now on by default** (`matched_filter_sigma =
+  Some(1.5)`), with the detection threshold auto-compensated for the kernel's
+  noise suppression — no threshold retuning needed. Set `None` to opt out.
+  See *Changed — matched filter on by default*.
+- **`max_sharpness` defaults to `0.9`** — a hot-pixel / cosmic-ray gate that
+  passes any PSF spanning multiple pixels. Set `None` for severely
+  undersampled data (PSF FWHM below ~1.5 px, e.g. resampled survey cutouts).
+  See *Added — extraction quality gates*.
+- **`match_threshold` is now a per-solve false-accept budget** (sequential
+  correction over candidates actually tested), and `SolveResult.prob` is the
+  corrected p-value. Weakly-evidenced solves that previously passed only on
+  the old arithmetic's optimism may now fail — raise `match_threshold` (e.g.
+  `1e-3`) to accept them explicitly. See *Changed — verification statistics
+  recalibrated*.
+- **Breaking (Rust):** `CentroidExtractionConfig.use_8_connectivity` is
+  removed — detection is 8-connected by construction. Python is unaffected.
+  See *Changed (breaking) — one run-length detection core*.
+- **Serialized artifacts:** Python `SolveResult` pickles saved by 0.8.0 do
+  not load — the `Solution` wire format changed (the write-only
+  `image_width` / `image_height` fields were removed; the same values live in
+  `Solution.camera_model`). Re-pickle after upgrading. Saved solver databases
+  are unaffected. See *Changed (breaking)*.
+
 ### Changed (breaking) — one run-length detection core; `use_8_connectivity` removed
 
 Both extraction paths now detect through a single run-length union-find core
@@ -91,6 +122,15 @@ parabola refinement guarded against (by falling back to that biased CoM).
   flat-topped or bloomed profile has no meaningful maximum) and keep the
   center-of-mass position. Off by default.
 
+### Fixed — Python `calibrate_camera` accepts `SolveFailure` items
+
+The Rust calibrate API accepts failed solves in its input slice and skips
+them; the Python binding raised `TypeError` on any `SolveFailure` in the
+list, forcing callers to filter (and mis-align their centroid lists). Mixed
+lists now pass straight through. (Latent until this release — under the
+recalibrated verification statistics, marginal solves can legitimately fail,
+so mixed lists are the norm for the tiered calibration workflow.)
+
 ### Fixed — CCL-path noise estimator (`sigma_threshold` semantics)
 
 `extract_centroids_from_raw` / `extract_centroids_from_image` (the CCL path)
@@ -154,17 +194,13 @@ barely exceeds chance — may now fail or time out; raise `match_threshold`
 (e.g. `1e-3`) to accept such weak evidence explicitly, or calibrate the
 distortion first (the tiered calibration flow does this automatically).
 
-> **Note on serialized artifacts.** The `Solution` wire format changed (the
-> write-only `image_width`/`image_height` fields were removed — the same values
-> live in `Solution.camera_model`), so Python `SolveResult` pickles saved by
-> 0.8.0 do not load in this version. Re-pickle after upgrading; saved solver
-> databases are unaffected.
-
 ### Changed (breaking)
 
 - **`Solution.image_width` / `Solution.image_height` removed.** They were
   never read — `Solution.camera_model.image_width/height` carries the same
-  values. This changes the postcard pickle wire format (see note above).
+  values. This changes the postcard pickle wire format, so Python
+  `SolveResult` pickles saved by 0.8.0 do not load; re-pickle after upgrading
+  (see *Upgrading from 0.8*). Saved solver databases are unaffected.
 
 - **`calibrate_camera` now returns `Result<CalibrateResult>`** (was
   `CalibrateResult`). It returns `Error::InvalidInput` instead of fabricating a

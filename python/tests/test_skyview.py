@@ -49,8 +49,10 @@ class TestSkyViewSolve:
             max_elongation=3.0,
             # DSS cutouts at 17.6"/px have a sub-pixel PSF: real stars are
             # indistinguishable from hot pixels, so the sharpness gate must
-            # be off for this (edge-case) plate scale.
+            # be off for this (edge-case) plate scale — and the matched
+            # filter stays off too (mirrors the Rust skyview test).
             max_sharpness=None,
+            matched_filter_sigma=None,
         )
         assert len(result.centroids) >= 4, (
             f"Only {len(result.centroids)} centroids extracted"
