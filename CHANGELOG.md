@@ -55,6 +55,14 @@ second moments inline (merged through union-find), so it also populates
 absorbs structure larger than a block (~64 px) before these filters see it;
 `max_pixels` matters for sharp bloomed regions, `max_elongation` for trails.
 
+### Added — `border_margin`
+
+Both extraction configs gain `border_margin` (default 0 = off): drop blobs
+whose bounding box comes within the margin of an image edge. A star cut off
+by the frame boundary has a truncated PSF, biasing its center-of-mass toward
+the interior — a plausible but wrong position that previously only the 3×3
+parabola refinement guarded against (by falling back to that biased CoM).
+
 ### Added — opt-in deblending, centroid-accuracy characterization
 
 - **`deblend: DeblendMode`** (CCL path, default `Off`): a blended star pair

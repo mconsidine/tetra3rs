@@ -178,6 +178,15 @@ pub struct CentroidExtractionConfig {
     ///
     /// Default: [`DeblendMode::Off`]
     pub deblend: DeblendMode,
+
+    /// Drop blobs whose bounding box comes within this many pixels of an
+    /// image edge. A star cut off by the frame boundary has a truncated PSF,
+    /// which biases its center-of-mass toward the interior — a plausible but
+    /// wrong position (only the 3×3 parabola was border-gated before).
+    /// A couple of PSF widths (e.g. 3-5 px) is a sensible setting.
+    ///
+    /// Default: 0 (disabled)
+    pub border_margin: u32,
 }
 
 impl Default for CentroidExtractionConfig {
@@ -195,6 +204,7 @@ impl Default for CentroidExtractionConfig {
             max_sharpness: Some(0.9),
             saturation_level: None,
             deblend: DeblendMode::Off,
+            border_margin: 0,
         }
     }
 }
@@ -916,6 +926,46 @@ mod tests {
                 "phase ({px}, {py}): error ({ex:.4}, {ey:.4}) px"
             );
         }
+    }
+
+    #[test]
+    fn test_border_margin() {
+        // A star half-off the frame edge centroids to a biased interior
+        // position; border_margin drops it while keeping the interior star.
+        let (width, height) = (64u32, 64u32);
+        let pixels = render_stars(
+            width,
+            height,
+            100.0,
+            0.0,
+            2.0,
+            1.5,
+            &[(1.0, 30.0, 1000.0), (40.0, 30.0, 1000.0)],
+        );
+        let base = CentroidExtractionConfig {
+            sigma_threshold: 5.0,
+            local_bg_block_size: None,
+            ..Default::default()
+        };
+        let all = extract_centroids_from_raw(&pixels, width, height, &base).unwrap();
+        assert_eq!(all.centroids.len(), 2, "margin off: both detected");
+
+        let gated = CentroidExtractionConfig {
+            border_margin: 4,
+            ..base
+        };
+        let res = extract_centroids_from_raw(&pixels, width, height, &gated).unwrap();
+        assert_eq!(res.centroids.len(), 1, "edge-truncated star dropped");
+        assert!((res.centroids[0].x - (40.0 - 31.5)).abs() < 0.5);
+
+        // Fast path honors the same knob.
+        let fast = FastCentroidConfig {
+            sigma_threshold: 5.0,
+            border_margin: 4,
+            ..Default::default()
+        };
+        let res = extract_centroids_fast(&pixels, width, height, &fast).unwrap();
+        assert_eq!(res.centroids.len(), 1, "fast path drops the edge star");
     }
 
     #[test]

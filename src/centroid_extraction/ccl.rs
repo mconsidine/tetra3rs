@@ -383,6 +383,13 @@ fn compute_blob_centroids(
             max_col = max_col.max(run.c1 as usize);
         }
 
+        // Border gate: a star cut by the frame edge has a truncated PSF and
+        // a CoM biased toward the interior — a plausible but wrong position.
+        let m = config.border_margin as usize;
+        if m > 0 && (min_row < m || min_col < m || max_row >= h - m || max_col >= w - m) {
+            continue;
+        }
+
         // Reference pixel = bbox top-left, to keep moments numerically stable.
         let ref_col = min_col;
         let ref_row = min_row;

@@ -1090,6 +1090,7 @@ def extract_centroids(
     max_sharpness: Optional[float] = 0.9,
     saturation_level: Optional[float] = None,
     deblend: str = "off",
+    border_margin: int = 0,
 ) -> ExtractionResult:
     """Extract star centroids from a 2D image array.
 
@@ -1124,6 +1125,9 @@ def extract_centroids(
             peak (blended pairs centroid to a wrong midpoint position).
             "off" keeps them merged; "reject" drops them — the safe choice
             for plate solving. Saturated blobs are exempt.
+        border_margin: Drop blobs whose bounding box comes within this many
+            pixels of an image edge (truncated PSFs bias the center-of-mass
+            inward).
 
     Returns:
         ExtractionResult with centroids and image statistics.
@@ -1140,6 +1144,7 @@ def extract_centroids_fast(
     saturation_level: Optional[float] = None,
     max_pixels: int = 10000,
     max_elongation: Optional[float] = None,
+    border_margin: int = 0,
 ) -> ExtractionResult:
     """Fast single-pass centroid extraction — the "adequate star tracker" path.
 
@@ -1175,6 +1180,9 @@ def extract_centroids_fast(
             intensity-weighted second moments — rejects streaks too small
             for max_pixels. Off by default (noisy for few-pixel regions);
             enable (3.0-5.0) with min_pixels raised to ~5+. None = disabled.
+        border_margin: Drop regions whose bounding box comes within this
+            many pixels of an image edge (truncated PSFs bias the
+            center-of-mass inward).
 
     Returns:
         ExtractionResult with centroids and image statistics.

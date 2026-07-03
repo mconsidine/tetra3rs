@@ -212,6 +212,9 @@ impl PyExtractionResult {
 ///         (blended star pairs centroid to a wrong midpoint position).
 ///         "off" keeps them merged; "reject" drops them — the safe choice
 ///         for plate solving. Saturated blobs are exempt. Default "off".
+///     border_margin: Drop blobs whose bounding box comes within this many
+///         pixels of an image edge (truncated PSFs bias the center-of-mass
+///         inward). Default 0 (disabled).
 ///
 /// Returns:
 ///     ExtractionResult with centroids and image statistics.
@@ -228,6 +231,7 @@ impl PyExtractionResult {
     max_sharpness = Some(0.9),
     saturation_level = None,
     deblend = "off",
+    border_margin = 0,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_centroids(
@@ -242,6 +246,7 @@ pub(crate) fn extract_centroids(
     max_sharpness: Option<f32>,
     saturation_level: Option<f32>,
     deblend: &str,
+    border_margin: u32,
 ) -> PyResult<PyExtractionResult> {
     let (pixels, width, height) = image_to_f32(image)?;
 
@@ -268,6 +273,7 @@ pub(crate) fn extract_centroids(
         max_sharpness,
         saturation_level,
         deblend,
+        border_margin,
     };
 
     let result =
@@ -319,6 +325,9 @@ pub(crate) fn extract_centroids(
 ///         max_pixels. Off by default: moment-based elongation is noisy for
 ///         regions of a few pixels; enable (3.0-5.0) with min_pixels raised
 ///         to ~5+. None = disabled.
+///     border_margin: Drop regions whose bounding box comes within this many
+///         pixels of an image edge (truncated PSFs bias the center-of-mass
+///         inward). Default 0 (disabled).
 ///
 /// Returns:
 ///     ExtractionResult with centroids and image statistics.
@@ -333,6 +342,7 @@ pub(crate) fn extract_centroids(
     saturation_level = None,
     max_pixels = 10000,
     max_elongation = None,
+    border_margin = 0,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_centroids_fast(
@@ -345,6 +355,7 @@ pub(crate) fn extract_centroids_fast(
     saturation_level: Option<f32>,
     max_pixels: usize,
     max_elongation: Option<f32>,
+    border_margin: u32,
 ) -> PyResult<PyExtractionResult> {
     let (pixels, width, height) = image_to_f32(image)?;
 
@@ -357,6 +368,7 @@ pub(crate) fn extract_centroids_fast(
         saturation_level,
         max_pixels,
         max_elongation,
+        border_margin,
     };
 
     let result =

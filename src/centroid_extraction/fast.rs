@@ -73,6 +73,11 @@ pub struct FastCentroidConfig {
     /// is raised enough (≳5) for the moments to be meaningful.
     /// Default: None (disabled)
     pub max_elongation: Option<f32>,
+
+    /// Drop regions whose bounding box comes within this many pixels of an
+    /// image edge (truncated PSFs bias the center-of-mass inward).
+    /// Default: 0 (disabled)
+    pub border_margin: u32,
 }
 
 impl Default for FastCentroidConfig {
@@ -86,6 +91,7 @@ impl Default for FastCentroidConfig {
             saturation_level: None,
             max_pixels: 10000,
             max_elongation: None,
+            border_margin: 0,
         }
     }
 }
@@ -179,6 +185,26 @@ pub fn extract_centroids_fast(
             .sum();
         if npix < config.min_pixels || npix > config.max_pixels {
             continue;
+        }
+
+        // Border gate on the run-list bounding box (truncated PSFs bias the
+        // CoM inward).
+        if config.border_margin > 0 {
+            let m = config.border_margin as usize;
+            let mut min_row = usize::MAX;
+            let mut max_row = 0usize;
+            let mut min_col = usize::MAX;
+            let mut max_col = 0usize;
+            for &i in region_runs {
+                let run = regions.runs[i as usize];
+                min_row = min_row.min(run.row as usize);
+                max_row = max_row.max(run.row as usize);
+                min_col = min_col.min(run.c0 as usize);
+                max_col = max_col.max(run.c1 as usize);
+            }
+            if min_row < m || min_col < m || max_row >= h - m || max_col >= w - m {
+                continue;
+            }
         }
 
         // Intensity-weighted moments over the run list, background
