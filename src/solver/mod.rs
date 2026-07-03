@@ -578,10 +578,6 @@ pub struct Solution {
     pub matched_catalog_ids: Vec<i64>,
     /// Indices into the input centroid slice for each match.
     pub matched_centroid_indices: Vec<usize>,
-    /// Image width in pixels (used for coordinate transforms).
-    pub image_width: u32,
-    /// Image height in pixels (used for coordinate transforms).
-    pub image_height: u32,
     /// WCS CD matrix: `[[CD11, CD12], [CD21, CD22]]` in tangent-plane radians per pixel.
     ///
     /// Maps pixel offsets from the optical center (CRPIX) to gnomonic tangent-plane

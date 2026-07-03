@@ -2,7 +2,17 @@
 
 ## Unreleased
 
+> **Note on serialized artifacts.** The `Solution` wire format changed (the
+> write-only `image_width`/`image_height` fields were removed — the same values
+> live in `Solution.camera_model`), so Python `SolveResult` pickles saved by
+> 0.8.0 do not load in this version. Re-pickle after upgrading; saved solver
+> databases are unaffected.
+
 ### Changed (breaking)
+
+- **`Solution.image_width` / `Solution.image_height` removed.** They were
+  never read — `Solution.camera_model.image_width/height` carries the same
+  values. This changes the postcard pickle wire format (see note above).
 
 - **`calibrate_camera` now returns `Result<CalibrateResult>`** (was
   `CalibrateResult`). It returns `Error::InvalidInput` instead of fabricating a

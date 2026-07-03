@@ -851,8 +851,6 @@ impl SolverDatabase {
             parity_flip,
             matched_catalog_ids: matched_cat_ids,
             matched_centroid_indices: matched_cent_inds,
-            image_width: config.image_width(),
-            image_height: config.image_height(),
             cd_matrix: wcs_result.cd_matrix,
             crval_rad: wcs_result.crval_rad,
             camera_model: result_cam,
