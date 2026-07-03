@@ -17,12 +17,15 @@
 
 use std::time::Instant;
 
-use numeris::{Matrix3, Vector3};
+use numeris::Vector3;
 use tracing::debug;
 
 use crate::{Centroid, Quaternion};
 
-use super::solve::{diagonal_factor, failure, find_centroid_matches};
+use super::solve::{
+    centroid_unit_vectors, diagonal_factor, failure, find_centroid_matches,
+    sort_indices_by_brightness, wahba_rotation,
+};
 use super::{SolveConfig, SolveResult, SolveStatus, SolverDatabase};
 
 /// Minimum unique correspondences required to attempt the SVD step.
@@ -88,28 +91,15 @@ impl SolverDatabase {
         }
 
         // ── Sort centroids by brightness (mirrors LIS path) ──
-        let mut sorted_indices: Vec<usize> = (0..preprocessed.len()).collect();
-        sorted_indices.sort_by(|&a, &b| {
-            let ma = preprocessed[a].mass.unwrap_or(f32::MIN);
-            let mb = preprocessed[b].mass.unwrap_or(f32::MIN);
-            mb.partial_cmp(&ma).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        let sorted_indices = sort_indices_by_brightness(preprocessed);
 
         // Trim to verification limit (same as LIS).
         let verification_stars = self.props.verification_stars_per_fov as usize;
         let match_centroid_count = preprocessed.len().min(verification_stars);
 
         // ── Build centroid unit vectors in the camera frame, parity-applied ──
-        let centroid_vectors: Vec<[f32; 3]> = sorted_indices
-            .iter()
-            .map(|&i| {
-                let x = parity_sign * preprocessed[i].x * pixel_scale;
-                let y = preprocessed[i].y * pixel_scale;
-                let z = 1.0f32;
-                let norm = (x * x + y * y + z * z).sqrt();
-                [x / norm, y / norm, z / norm]
-            })
-            .collect();
+        let centroid_vectors =
+            centroid_unit_vectors(preprocessed, &sorted_indices, pixel_scale, parity_sign);
 
         // ── Project candidate catalog stars to camera-plane angles via the hint ──
         // Note: r_hint maps ICRS→camera, so cam_v = r_hint * icrs_v.
@@ -156,10 +146,18 @@ impl SolverDatabase {
         }
 
         // ── Wahba SVD on the initial correspondence set ──
-        let (rotation_matrix, det_sign_ok) =
-            wahba_svd_dynamic(&centroid_vectors, star_vectors, &initial_matches);
-        if !det_sign_ok {
-            // Parity mismatch — bail (caller may still fall back to LIS).
+        // A failed SVD (degenerate cross-covariance) or a negative determinant
+        // (likely parity mismatch) both bail — the caller may still fall back
+        // to LIS.
+        let Some(rotation_matrix) = wahba_rotation(
+            initial_matches
+                .iter()
+                .map(|&(cent_idx, cat_idx)| (&centroid_vectors[cent_idx], &star_vectors[cat_idx])),
+        ) else {
+            return failure(SolveStatus::NoMatch, t0);
+        };
+        let det = rotation_matrix.det();
+        if det.is_nan() || det <= 0.0 {
             return failure(SolveStatus::NoMatch, t0);
         }
 
@@ -210,47 +208,4 @@ impl SolverDatabase {
             None => failure(SolveStatus::NoMatch, t0),
         }
     }
-}
-
-/// Run Wahba SVD on a dynamic-sized correspondence set.
-///
-/// `centroid_vectors` is indexed by sorted (brightness) centroid index;
-/// `star_vectors` by catalog star index. The match pairs are
-/// `(centroid_idx, catalog_star_idx)` in those same index spaces.
-///
-/// Returns the rotation matrix and a flag indicating whether the determinant
-/// is positive (true) or negative (false → likely parity mismatch). A failed
-/// SVD (degenerate cross-covariance) returns `(zeros, false)`, which the
-/// caller treats as a failed hint.
-fn wahba_svd_dynamic(
-    centroid_vectors: &[[f32; 3]],
-    star_vectors: &[[f32; 3]],
-    matches: &[(usize, usize)],
-) -> (Matrix3<f32>, bool) {
-    if matches.len() < MIN_HINT_MATCHES {
-        return (Matrix3::<f32>::zeros(), false);
-    }
-
-    // Build the cross-covariance directly (find_rotation_matrix is generic on
-    // a const N, which a dynamic match set doesn't have).
-    let mut h = numeris::Matrix3::<f64>::zeros();
-    for &(cent_idx, cat_idx) in matches {
-        let img = &centroid_vectors[cent_idx];
-        let cat = &star_vectors[cat_idx];
-        let img_v =
-            numeris::Vector3::<f64>::from_array([img[0] as f64, img[1] as f64, img[2] as f64]);
-        let cat_v =
-            numeris::Vector3::<f64>::from_array([cat[0] as f64, cat[1] as f64, cat[2] as f64]);
-        h += img_v.outer(&cat_v);
-    }
-
-    let Ok(svd) = h.svd() else {
-        return (Matrix3::<f32>::zeros(), false);
-    };
-    let u = svd.u();
-    let v_t = svd.vt();
-    let r64 = *u * *v_t;
-    let r = r64.cast::<f32>();
-    let det_ok = r.det() > 0.0;
-    (r, det_ok)
 }

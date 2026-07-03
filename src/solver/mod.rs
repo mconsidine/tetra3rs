@@ -26,6 +26,7 @@ macro_rules! timed {
 
 pub(crate) mod combinations;
 pub(crate) mod database;
+pub(crate) mod matching;
 pub(crate) mod pattern;
 #[cfg(feature = "profile")]
 pub mod profiling;

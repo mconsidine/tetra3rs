@@ -20,6 +20,7 @@ use crate::Centroid;
 
 use super::combinations::BreadthFirstCombinations;
 use super::database::separation_for_density;
+use super::matching;
 use super::pattern::{
     compute_edge_ratios, compute_pattern_key, compute_pattern_key_hash, compute_sorted_edge_angles,
     hash_to_index, sort_pattern_by_centroid_distance, NUM_EDGES, NUM_EDGE_RATIOS, PATTERN_SIZE,
@@ -168,15 +169,9 @@ impl SolverDatabase {
             return failure(SolveStatus::TooFew, t0);
         }
 
-        // Sort centroids by brightness (highest mass = brightest first);
-        // centroids without mass are placed last. FOV-independent, so computed
-        // once for the whole sweep.
-        let mut sorted_indices: Vec<usize> = (0..working_centroids.len()).collect();
-        sorted_indices.sort_by(|&a, &b| {
-            let ma = working_centroids[a].mass.unwrap_or(f32::MIN);
-            let mb = working_centroids[b].mass.unwrap_or(f32::MIN);
-            mb.partial_cmp(&ma).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // Sort centroids by brightness. FOV-independent, so computed once for
+        // the whole sweep.
+        let sorted_indices = sort_indices_by_brightness(working_centroids);
 
         // Build FOV sweep: exact estimate first, then spiral outward
         let fov_values = build_fov_sweep(
@@ -265,16 +260,7 @@ impl SolverDatabase {
         // ── Compute unit vectors in camera frame ──
         // Centroid (x, y) in pixels → scale to radians → uvec = normalize(x_rad, y_rad, 1)
         // Note: distortion correction (if any) was already applied in solve_from_centroids.
-        let centroid_vectors: Vec<[f32; 3]> = sorted_indices
-            .iter()
-            .map(|&i| {
-                let x = centroids[i].x * pixel_scale;
-                let y = centroids[i].y * pixel_scale;
-                let z = 1.0f32;
-                let norm = (x * x + y * y + z * z).sqrt();
-                [x / norm, y / norm, z / norm]
-            })
-            .collect();
+        let centroid_vectors = centroid_unit_vectors(centroids, sorted_indices, pixel_scale, 1.0);
 
         // Lazily-created x-flipped copy for parity-flipped images.
         // Built on first use, cached for subsequent pattern attempts.
@@ -516,7 +502,7 @@ impl SolverDatabase {
                     // centroids) fails the SVD — skip the candidate, don't panic.
                     let Some(mut rotation_matrix) = timed!(
                         buckets::SVD,
-                        find_rotation_matrix(&matched_img, &matched_cat)
+                        wahba_rotation(matched_img.iter().zip(matched_cat.iter()))
                     ) else {
                         continue;
                     };
@@ -961,31 +947,60 @@ fn enumerate_key_range_recursive(
     }
 }
 
-/// Compute the least-squares rotation matrix from image vectors to catalog vectors.
+/// Brightness-sorted centroid index order: highest mass (brightest) first,
+/// centroids without mass last. Shared by the LIS and tracking front-ends.
+pub(super) fn sort_indices_by_brightness(centroids: &[Centroid]) -> Vec<usize> {
+    let mut sorted_indices: Vec<usize> = (0..centroids.len()).collect();
+    sorted_indices.sort_by(|&a, &b| {
+        let ma = centroids[a].mass.unwrap_or(f32::MIN);
+        let mb = centroids[b].mass.unwrap_or(f32::MIN);
+        mb.partial_cmp(&ma).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    sorted_indices
+}
+
+/// Camera-frame unit vectors for brightness-ordered centroids:
+/// `normalize(parity·x·ps, y·ps, 1)`. The LIS path passes `parity_sign = 1.0`
+/// (it detects parity later from the rotation determinant); tracking applies
+/// the camera model's parity up front.
+pub(super) fn centroid_unit_vectors(
+    centroids: &[Centroid],
+    sorted_indices: &[usize],
+    pixel_scale: f32,
+    parity_sign: f32,
+) -> Vec<[f32; 3]> {
+    sorted_indices
+        .iter()
+        .map(|&i| {
+            let x = parity_sign * centroids[i].x * pixel_scale;
+            let y = centroids[i].y * pixel_scale;
+            let z = 1.0f32;
+            let norm = (x * x + y * y + z * z).sqrt();
+            [x / norm, y / norm, z / norm]
+        })
+        .collect()
+}
+
+/// Compute the least-squares rotation matrix from paired image/catalog unit
+/// vectors (Wahba's problem).
 ///
 /// Uses SVD of the cross-covariance matrix H = Σ(img_i ⊗ cat_i).
 /// The resulting R satisfies: camera_vec ≈ R * icrs_vec.
 ///
 /// The SVD is computed in f64 for precision, then the result is converted back
 /// to f32. Returns `None` if the SVD fails (degenerate cross-covariance from
-/// pathological input vectors).
-pub(super) fn find_rotation_matrix<const N: usize>(
-    image_vectors: &[[f32; 3]; N],
-    catalog_vectors: &[[f32; 3]; N],
+/// pathological input vectors). Serves both the fixed-size 4-star LIS pattern
+/// and the tracking path's dynamic correspondence sets.
+pub(super) fn wahba_rotation<'a>(
+    pairs: impl IntoIterator<Item = (&'a [f32; 3], &'a [f32; 3])>,
 ) -> Option<Matrix3<f32>> {
     let mut h = numeris::Matrix3::<f64>::zeros();
-    for i in 0..N {
-        let img = numeris::Vector3::<f64>::from_array([
-            image_vectors[i][0] as f64,
-            image_vectors[i][1] as f64,
-            image_vectors[i][2] as f64,
-        ]);
-        let cat = numeris::Vector3::<f64>::from_array([
-            catalog_vectors[i][0] as f64,
-            catalog_vectors[i][1] as f64,
-            catalog_vectors[i][2] as f64,
-        ]);
-        h += img.outer(&cat);
+    for (img, cat) in pairs {
+        let img_v =
+            numeris::Vector3::<f64>::from_array([img[0] as f64, img[1] as f64, img[2] as f64]);
+        let cat_v =
+            numeris::Vector3::<f64>::from_array([cat[0] as f64, cat[1] as f64, cat[2] as f64]);
+        h += img_v.outer(&cat_v);
     }
 
     let svd = h.svd().ok()?;
@@ -1015,38 +1030,15 @@ pub(super) fn find_centroid_matches(
         })
         .collect();
 
-    let r2 = match_radius * match_radius;
-
-    // Compute pairwise distances and find pairs within radius
-    let mut candidates: Vec<(f32, usize, usize)> = Vec::new(); // (dist², cent_idx, cat_pos_idx)
-    for (ci, &(cx, cy)) in centroid_xy.iter().enumerate() {
-        for (pi, &(_cat_idx, px, py)) in catalog_positions.iter().enumerate() {
-            let dx = cx - px;
-            let dy = cy - py;
-            let d2 = dx * dx + dy * dy;
-            if d2 < r2 {
-                candidates.push((d2, ci, pi));
-            }
-        }
-    }
-
-    // Sort by distance (best matches first)
-    candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Greedy unique 1-to-1 matching
-    let mut used_centroids = vec![false; centroid_vectors.len()];
-    let mut used_catalog = vec![false; catalog_positions.len()];
-    let mut matches = Vec::new();
-
-    for &(_, ci, pi) in &candidates {
-        if !used_centroids[ci] && !used_catalog[pi] {
-            used_centroids[ci] = true;
-            used_catalog[pi] = true;
-            matches.push((ci, catalog_positions[pi].0));
-        }
-    }
-
-    matches
+    let mut scratch = matching::MatchScratch::<f32>::default();
+    matching::greedy_unique_matches(
+        &centroid_xy,
+        centroid_xy.len(),
+        catalog_positions,
+        match_radius * match_radius,
+        &mut scratch,
+    )
+    .to_vec()
 }
 
 // ── Binomial CDF (no external dependency) ───────────────────────────────────

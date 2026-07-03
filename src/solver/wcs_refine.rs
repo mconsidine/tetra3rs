@@ -2,8 +2,10 @@
 //!
 //! After the initial 4-star pattern match provides a seed rotation via SVD (Wahba's problem),
 //! this module refines the solution by fitting 3 parameters per image:
-//! **rotation angle θ** and **tangent-plane offset (dξ₀, dη₀)**, with the pixel scale
-//! locked from the CameraModel's focal length.
+//! **rotation angle θ** and **tangent-plane offset (dξ₀, dη₀)**, with the pixel
+//! scale locked by the caller — the LIS path locks it to the pattern-match
+//! refined FOV (robust to a wrong focal-length estimate), while the tracking
+//! path locks it to the CameraModel's 1/f.
 //!
 //! This constrained approach (vs. the full 6-DOF CD matrix fit) avoids degeneracy
 //! between the linear part of the distortion polynomial and the per-image attitude,
@@ -24,6 +26,7 @@
 use numeris::{Matrix3, Vector3};
 use tracing::debug;
 
+use super::matching::{greedy_unique_matches, MatchScratch};
 use crate::starcatalog::StarCatalog;
 
 #[cfg(feature = "profile")]
@@ -184,81 +187,6 @@ fn solve_3x3(a: &[[f64; 3]; 3], b: &[f64; 3]) -> Option<[f64; 3]> {
     Some(x)
 }
 
-// ── Pixel-space matching ────────────────────────────────────────────────────
-
-/// Reusable scratch buffers for [`find_pixel_matches`]. Hoisted out of the outer
-/// refinement loop and `.clear()`ed before each call so the four allocations
-/// (candidate list + two used-flags + output) happen once per solve instead of
-/// once per outer iteration. Contents are fully overwritten each call, so reuse
-/// is behavior-identical to fresh allocation.
-#[derive(Default)]
-struct MatchScratch {
-    /// (dist_sq, cent_idx, pred_idx) candidate pairs within radius.
-    candidates: Vec<(f64, usize, usize)>,
-    /// Per-centroid "already assigned" flags.
-    used_cent: Vec<bool>,
-    /// Per-prediction "already assigned" flags.
-    used_pred: Vec<bool>,
-    /// Resulting `(centroid_idx, catalog_star_idx)` matches.
-    matches: Vec<(usize, usize)>,
-}
-
-/// Greedy 1-to-1 matching between centroid pixel positions and predicted catalog positions.
-///
-/// Writes the unique matches `(centroid_idx, catalog_star_idx)` within
-/// `radius_px` pixels into `scratch.matches` and returns a reference to it. All
-/// buffers live in `scratch` so repeated calls reuse the same allocations.
-fn find_pixel_matches<'a>(
-    centroid_pixels: &[(f64, f64)],
-    max_centroids: usize,
-    predicted: &[(usize, f64, f64)], // (catalog_star_idx, pred_x, pred_y)
-    radius_px: f64,
-    scratch: &'a mut MatchScratch,
-) -> &'a [(usize, usize)] {
-    let radius_sq = radius_px * radius_px;
-    let n_cent = centroid_pixels.len().min(max_centroids);
-
-    // Collect all candidate pairs within radius. We track the *position* in
-    // `predicted` (not the catalog id) so uniqueness can use a bitset instead of
-    // a HashSet — `predicted` holds distinct catalog stars, so position ↔ id is
-    // a bijection and the dedup result is identical.
-    let candidates = &mut scratch.candidates;
-    candidates.clear();
-    for (cent_idx, &(cx, cy)) in centroid_pixels[..n_cent].iter().enumerate() {
-        for (pred_idx, &(_cat_idx, px, py)) in predicted.iter().enumerate() {
-            let dx = cx - px;
-            let dy = cy - py;
-            let d2 = dx * dx + dy * dy;
-            if d2 <= radius_sq {
-                candidates.push((d2, cent_idx, pred_idx));
-            }
-        }
-    }
-
-    // Sort by distance (closest first)
-    candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Greedy unique 1-to-1 assignment
-    let used_cent = &mut scratch.used_cent;
-    used_cent.clear();
-    used_cent.resize(n_cent, false);
-    let used_pred = &mut scratch.used_pred;
-    used_pred.clear();
-    used_pred.resize(predicted.len(), false);
-    let matches = &mut scratch.matches;
-    matches.clear();
-
-    for &(_, cent_idx, pred_idx) in candidates.iter() {
-        if !used_cent[cent_idx] && !used_pred[pred_idx] {
-            used_cent[cent_idx] = true;
-            used_pred[pred_idx] = true;
-            matches.push((cent_idx, predicted[pred_idx].0));
-        }
-    }
-
-    matches
-}
-
 // ── Constrained prediction helpers ──────────────────────────────────────────
 
 /// Predict tangent-plane coords from pixel coords using rotation angle and pixel scale.
@@ -410,6 +338,36 @@ fn residual_median_sigma(residuals: &[(usize, f64)]) -> (f64, f64) {
     (median, MAD_SCALE * mad)
 }
 
+/// Sigma-clip factor for MAD-based outlier rejection (Phase C and the final
+/// clean-up passes share this convention).
+const CLIP_NSIGMA: f64 = 3.0;
+
+/// MAD-based outlier rejection: keep the matches whose residual is within
+/// `median + CLIP_NSIGMA·σ`.
+///
+/// Returns `Some(kept)` only when the clip actually removed something AND at
+/// least 4 matches survive (below that the 3-DOF fit is unconstrained) — the
+/// caller keeps its previous match set otherwise.
+fn mad_clip_matches(
+    residuals: &[(usize, f64)],
+    matches: &[(usize, usize)],
+    median: f64,
+    sigma_est: f64,
+) -> Option<Vec<(usize, usize)>> {
+    let clip_threshold = median + CLIP_NSIGMA * sigma_est;
+    let mut keep: Vec<(usize, usize)> = Vec::new();
+    for &(match_idx, residual) in residuals {
+        if residual <= clip_threshold {
+            keep.push(matches[match_idx]);
+        }
+    }
+    if keep.len() < matches.len() && keep.len() >= 4 {
+        Some(keep)
+    } else {
+        None
+    }
+}
+
 /// Tangent-plane residual magnitude for each match under the current
 /// `(θ, CRVAL)` fit: distance between the catalog star's TAN projection and
 /// the centroid's predicted position. Returns `(match_idx, residual_rad)`
@@ -535,7 +493,6 @@ pub fn wcs_refine(
     max_iterations: u32,
 ) -> WcsRefineResult {
     // ── Constants ────────────────────────────────────────────────────────
-    const CLIP_NSIGMA: f64 = 3.0;
     const CONVERGENCE_RAD: f64 = 1e-12; // tangent-plane offset convergence
 
     let ps = pixel_scale;
@@ -596,7 +553,7 @@ pub fn wcs_refine(
     // and reuse the star set + its precomputed `StarRaDec` until the boresight
     // drifts past the margin. The cached set is a superset of any single
     // iteration's query, and the extra (annulus) stars project well outside the
-    // image so they never enter `find_pixel_matches` — results are unchanged.
+    // image so they never enter the greedy matcher — results are unchanged.
     let requery_margin = match_radius_rad as f64 * 2.0;
     let requery_cos = requery_margin.cos();
     let mut reassoc_cache: Option<(Vector3<f64>, Vec<usize>, Vec<StarRaDec>)> = None;
@@ -685,26 +642,16 @@ pub fn wcs_refine(
 
         // ── Phase C: MAD-based outlier rejection ────────────────────────
         if let Some((median, sigma_est)) = mad_stats {
-            let clip_threshold = median + CLIP_NSIGMA * sigma_est;
-
-            let old_len = current_matches.len();
-            let mut keep_matches: Vec<(usize, usize)> = Vec::new();
-            for &(match_idx, residual) in &residuals {
-                if residual <= clip_threshold {
-                    keep_matches.push(current_matches[match_idx]);
-                }
-            }
-
-            if keep_matches.len() < old_len && keep_matches.len() >= 4 {
+            if let Some(keep) = mad_clip_matches(&residuals, &current_matches, median, sigma_est) {
                 debug!(
                     "  outer {}: MAD clip: {} → {} matches (σ={:.2e} rad, threshold={:.2e} rad)",
                     outer_iter,
-                    old_len,
-                    keep_matches.len(),
+                    current_matches.len(),
+                    keep.len(),
                     sigma_est,
-                    clip_threshold,
+                    median + CLIP_NSIGMA * sigma_est,
                 );
-                current_matches = keep_matches;
+                current_matches = keep;
             }
         }
 
@@ -794,11 +741,11 @@ pub fn wcs_refine(
 
             let new_matches: &[(usize, usize)] = timed!(
                 buckets::WCS_REASSOC_MATCH,
-                find_pixel_matches(
+                greedy_unique_matches(
                     centroids_px,
                     max_match_centroids,
                     &predicted,
-                    adaptive_radius_px,
+                    adaptive_radius_px * adaptive_radius_px,
                     &mut match_scratch,
                 )
             );
@@ -856,19 +803,11 @@ pub fn wcs_refine(
         }
 
         let (median, sigma_est) = residual_median_sigma(&residuals);
-        let clip_threshold = median + CLIP_NSIGMA * sigma_est;
-
-        let mut keep: Vec<(usize, usize)> = Vec::new();
-        for &(match_idx, residual) in &residuals {
-            if residual <= clip_threshold {
-                keep.push(current_matches[match_idx]);
-            }
-        }
-
-        let n_clipped = current_matches.len() - keep.len();
-        if n_clipped == 0 || keep.len() < 4 {
+        let Some(keep) = mad_clip_matches(&residuals, &current_matches, median, sigma_est) else {
+            // Nothing clipped, or too few survivors — the set is clean (or as
+            // clean as it can get); stop.
             break;
-        }
+        };
 
         debug!(
             "  final clip {}: {} → {} matches",
@@ -900,6 +839,10 @@ pub fn wcs_refine(
     }
 
     // ── Compute final residual statistics ────────────────────────────────
+    // The RMSE feeds `WcsRefineResult::rmse_rad`; the p90/max order statistics
+    // exist only for the debug log below, so the sort they need is skipped
+    // entirely unless DEBUG logging is enabled (this runs once per solve on the
+    // profiling-dominant path).
     let final_radec: Vec<StarRaDec> = current_matches
         .iter()
         .map(|&(_, cat_idx)| star_radec(&star_vectors[cat_idx]))
@@ -916,31 +859,33 @@ pub fn wcs_refine(
     .into_iter()
     .map(|(_, r)| r)
     .collect();
-    final_residuals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     let rmse = if final_residuals.is_empty() {
         0.0
     } else {
         (final_residuals.iter().map(|r| r * r).sum::<f64>() / final_residuals.len() as f64).sqrt()
     };
-    let p90e = if final_residuals.is_empty() {
-        0.0
-    } else {
-        final_residuals[(0.9 * (final_residuals.len() - 1) as f64) as usize]
-    };
-    let max_err = final_residuals.last().copied().unwrap_or(0.0);
 
     // Derive CD matrix from (theta, pixel_scale, parity)
     let cd = cd_from_theta(theta, ps, parity_flip);
 
-    debug!(
-        "WCS refine done: {} matches, θ={:.4}°, RMSE={:.2}\" p90={:.2}\" max={:.2}\"",
-        current_matches.len(),
-        theta.to_degrees(),
-        rmse.to_degrees() * 3600.0,
-        p90e.to_degrees() * 3600.0,
-        max_err.to_degrees() * 3600.0,
-    );
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        final_residuals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let p90e = if final_residuals.is_empty() {
+            0.0
+        } else {
+            final_residuals[(0.9 * (final_residuals.len() - 1) as f64) as usize]
+        };
+        let max_err = final_residuals.last().copied().unwrap_or(0.0);
+        debug!(
+            "WCS refine done: {} matches, θ={:.4}°, RMSE={:.2}\" p90={:.2}\" max={:.2}\"",
+            current_matches.len(),
+            theta.to_degrees(),
+            rmse.to_degrees() * 3600.0,
+            p90e.to_degrees() * 3600.0,
+            max_err.to_degrees() * 3600.0,
+        );
+    }
 
     WcsRefineResult {
         cd_matrix: cd,
