@@ -444,7 +444,7 @@ fn test_tess_fits_solve() {
         // TESS images have high background (~150-200 DN). Saturated stars
         // create elongated blobs, so max_elongation is set high (30.0).
         let extract_config = CentroidExtractionConfig {
-            sigma_threshold: 250.0,
+            sigma_threshold: 150.0,
             min_pixels: 3,
             max_pixels: 10000,
             max_centroids: None,
@@ -599,7 +599,7 @@ fn bench_fast_vs_ccl_extraction() {
         let true_boresight = radec_to_uvec(b_ra, b_dec);
 
         let ccl_config = CentroidExtractionConfig {
-            sigma_threshold: 250.0,
+            sigma_threshold: 150.0,
             min_pixels: 3,
             max_pixels: 10000,
             local_bg_block_size: Some(128),
@@ -765,7 +765,7 @@ fn test_tess_distortion_fit_and_center_accuracy() {
 
         // ── Extract centroids ──
         let extract_config = CentroidExtractionConfig {
-            sigma_threshold: 250.0,
+            sigma_threshold: 150.0,
             min_pixels: 3,
             max_pixels: 10000,
             max_centroids: None,
@@ -966,7 +966,7 @@ fn test_tess_multi_image_calibration() {
 
     // ── Extract centroids from all images up front ──
     let extract_config = CentroidExtractionConfig {
-        sigma_threshold: 300.0,
+        sigma_threshold: 180.0,
         min_pixels: 3,
         max_pixels: 10000,
         max_centroids: None,

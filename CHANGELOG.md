@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Fixed — CCL-path noise estimator (`sigma_threshold` semantics)
+
+`extract_centroids_from_raw` / `extract_centroids_from_image` (the CCL path)
+underestimated the background noise by ~40%: sigma was computed as the RMS of
+below-median pixels about their *own mean* — for Gaussian noise the lower
+half-distribution has std ≈ 0.60σ — instead of about the *median*, whose
+lower-half second moment equals the full variance (the estimator the
+docstring described, and the one the fast path already used). In practice a
+configured `sigma_threshold: 5.0` was really a ~3σ cut, the two extraction
+paths applied materially different effective thresholds for the same setting,
+and `ExtractionResult.background_sigma` was wrong as a diagnostic.
+
+**Migration:** the CCL path's `sigma_threshold` now means true Gaussian
+sigmas. To keep your previous effective detection depth, multiply configured
+values by ≈0.6 (e.g. `5.0` → `3.0`); leave them unchanged to get the
+threshold you had nominally been asking for. `FastCentroidConfig` is
+unaffected (it was already correct).
+
 ### Changed — verification statistics recalibrated (solve-acceptance semantics)
 
 The lost-in-space acceptance test was rebuilt around honest statistics; no

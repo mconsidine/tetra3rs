@@ -41,7 +41,7 @@ class TestSkyViewSolve:
         # Extract centroids
         result = tetra3rs.extract_centroids(
             image,
-            sigma_threshold=10.0,
+            sigma_threshold=6.0,
             min_pixels=3,
             max_pixels=10000,
             max_centroids=200,

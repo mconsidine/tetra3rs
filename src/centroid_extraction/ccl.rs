@@ -341,9 +341,9 @@ fn estimate_local_background(pixels: &[f32], width: u32, height: u32, block_size
 /// lower half of the pixel distribution (below the median). This is robust
 /// to contamination from stars and nebulosity, which only bias upward.
 ///
-/// The noise estimate uses sigma-clipping on the below-median pixels to
-/// further reject any remaining outliers, then mirrors the lower-half RMS
-/// to get the full Gaussian sigma.
+/// The noise estimate sigma-clips the below-median tail to reject remaining
+/// outliers, then mirrors the lower-half RMS **about the median** to get the
+/// full Gaussian sigma (`E[(v−m)² | v ≤ m] = σ²`).
 pub(super) fn estimate_background(
     gray: &[f32],
     _width: u32,
@@ -358,30 +358,34 @@ pub(super) fn estimate_background(
     // Median as robust background level (O(n) selection; see `median_f32`).
     let median = median_f32(&mut values);
 
-    // Estimate noise from pixels at or below the median (uncontaminated by stars).
-    // These represent the "dark side" of the noise distribution.
+    // Estimate noise from pixels at or below the median (uncontaminated by
+    // stars, which only push the distribution upward). For Gaussian noise the
+    // second moment of the lower half about the *median* equals the full
+    // variance — E[(v−m)² | v ≤ m] = σ² — so the lower-half RMS about the
+    // median mirrors directly into the full Gaussian sigma. This matches the
+    // fast path's `coarse_background`. (Historically this computed the RMS
+    // about the lower half's own mean, which for a half-normal is only
+    // ≈0.60σ — silently turning a nominal 5σ threshold into a ~3σ one.)
     let mut low_half: Vec<f32> = values.iter().copied().filter(|&v| v <= median).collect();
 
-    // Sigma-clip the lower half to reject any remaining outliers
+    // Sigma-clip the lower tail to reject remaining outliers (dead or
+    // negative pixels), re-estimating about the median each pass.
     let mut sigma = 0.0_f32;
     for _ in 0..config.sigma_clip_iterations {
         if low_half.is_empty() {
             break;
         }
-        let sum: f64 = low_half.iter().map(|&v| v as f64).sum();
-        let mean_low = (sum / low_half.len() as f64) as f32;
         let var_sum: f64 = low_half
             .iter()
-            .map(|&v| ((v - mean_low) as f64).powi(2))
+            .map(|&v| ((v - median) as f64).powi(2))
             .sum();
         sigma = (var_sum / low_half.len() as f64).sqrt() as f32;
         if sigma < 1e-10 {
             break;
         }
-        let lo = mean_low - config.sigma_clip_factor * sigma;
-        let hi = mean_low + config.sigma_clip_factor * sigma;
+        let lo = median - config.sigma_clip_factor * sigma;
         let before = low_half.len();
-        low_half.retain(|&v| v >= lo && v <= hi);
+        low_half.retain(|&v| v >= lo);
         if low_half.len() == before {
             break; // converged
         }

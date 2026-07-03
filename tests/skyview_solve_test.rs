@@ -387,7 +387,7 @@ fn test_skyview_fits_solve() {
         // sigma threshold. After local BG subtraction the residual is
         // mostly noise + point sources.
         let extract_config = CentroidExtractionConfig {
-            sigma_threshold: 10.0,
+            sigma_threshold: 6.0,
             min_pixels: 3,
             max_pixels: 10000,
             max_centroids: Some(200),
