@@ -615,16 +615,7 @@ impl PySolverDatabase {
         )
         .map_err(crate::helpers::map_tetra3_err)?;
 
-        Ok(PyCalibrateResult {
-            camera_model: PyCameraModel {
-                inner: result.camera_model,
-            },
-            rmse_before_px: result.rmse_before_px,
-            rmse_after_px: result.rmse_after_px,
-            n_inliers: result.n_inliers,
-            n_outliers: result.n_outliers,
-            iterations: result.iterations,
-        })
+        Ok(PyCalibrateResult { inner: result })
     }
 }
 
@@ -633,7 +624,7 @@ impl PySolverDatabase {
 /// Accepts either a 4-element quaternion `[w, x, y, z]` (list or 1D ndarray)
 /// or a 3×3 rotation matrix (2D ndarray).
 fn parse_attitude_hint(obj: &Bound<'_, pyo3::PyAny>) -> PyResult<tetra3::Quaternion> {
-    use numpy::{PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
+    use numpy::{PyReadonlyArray2, PyUntypedArrayMethods};
     use pyo3::exceptions::PyValueError;
 
     // Build a unit quaternion from raw [w, x, y, z], rejecting a degenerate
@@ -654,24 +645,12 @@ fn parse_attitude_hint(obj: &Bound<'_, pyo3::PyAny>) -> PyResult<tetra3::Quatern
         ))
     };
 
-    // Try 1D [w, x, y, z] quaternion.
-    if let Ok(arr) = obj.extract::<PyReadonlyArray1<f64>>() {
-        let slice = arr
-            .as_slice()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        if slice.len() != 4 {
-            return Err(PyValueError::new_err(format!(
-                "attitude_hint 1D array must have 4 elements [w, x, y, z], got {}",
-                slice.len()
-            )));
-        }
-        return quat_from_wxyz(slice[0], slice[1], slice[2], slice[3]);
-    }
-    // Try a plain Python list / tuple of length 4.
+    // Try a 4-element [w, x, y, z] sequence: list, tuple, or 1D ndarray (the
+    // Vec extraction accepts any f64 sequence, so no separate ndarray branch).
     if let Ok(vec) = obj.extract::<Vec<f64>>() {
         if vec.len() != 4 {
             return Err(PyValueError::new_err(format!(
-                "attitude_hint list must have 4 elements [w, x, y, z], got {}",
+                "attitude_hint sequence must have 4 elements [w, x, y, z], got {}",
                 vec.len()
             )));
         }

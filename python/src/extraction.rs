@@ -1,14 +1,16 @@
 use numpy::PyReadonlyArray2;
-use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
-use tetra3::centroid_extraction::{CentroidExtractionConfig, FastCentroidConfig};
+use tetra3::centroid_extraction::{
+    CentroidExtractionConfig, CentroidExtractionResult, FastCentroidConfig,
+};
 
 use crate::centroid::PyCentroid;
 
-/// Serializable mirror of PyExtractionResult for pickle support.
+/// The extraction result payload. Serde-derived, so it doubles as the pickle
+/// wire format (layout unchanged from the former separate mirror struct).
 #[derive(serde::Serialize, serde::Deserialize)]
-struct ExtractionResultSer {
+pub(crate) struct ExtractionData {
     centroids: Vec<tetra3::Centroid>,
     image_width: u32,
     image_height: u32,
@@ -16,6 +18,20 @@ struct ExtractionResultSer {
     background_sigma: f64,
     threshold: f64,
     num_blobs_raw: u64,
+}
+
+impl From<CentroidExtractionResult> for ExtractionData {
+    fn from(result: CentroidExtractionResult) -> Self {
+        Self {
+            centroids: result.centroids,
+            image_width: result.image_width,
+            image_height: result.image_height,
+            background_mean: result.background_mean as f64,
+            background_sigma: result.background_sigma as f64,
+            threshold: result.threshold as f64,
+            num_blobs_raw: result.num_blobs_raw as u64,
+        }
+    }
 }
 
 /// Convert a 2D numpy array of any supported dtype to Vec<f32>.
@@ -53,42 +69,24 @@ fn image_to_f32(image: &Bound<'_, pyo3::PyAny>) -> PyResult<(Vec<f32>, u32, u32)
     let kind: String = dtype.getattr("kind")?.extract()?;
     let itemsize: usize = dtype.getattr("itemsize")?.extract()?;
 
+    /// Extract one supported dtype and convert element-wise to f32.
+    fn arr_to_f32<T: numpy::Element + Copy>(
+        image: &Bound<'_, pyo3::PyAny>,
+        to_f32: impl Fn(T) -> f32,
+    ) -> PyResult<(Vec<f32>, u32, u32)> {
+        let arr: PyReadonlyArray2<T> = image.extract()?;
+        let a = arr.as_array();
+        let h = a.shape()[0] as u32;
+        let w = a.shape()[1] as u32;
+        Ok((a.iter().map(|&v| to_f32(v)).collect(), w, h))
+    }
+
     match (kind.as_str(), itemsize) {
-        ("f", 8) => {
-            let arr: PyReadonlyArray2<f64> = image.extract()?;
-            let a = arr.as_array();
-            let h = a.shape()[0] as u32;
-            let w = a.shape()[1] as u32;
-            Ok((a.iter().map(|&v| v as f32).collect(), w, h))
-        }
-        ("f", 4) => {
-            let arr: PyReadonlyArray2<f32> = image.extract()?;
-            let a = arr.as_array();
-            let h = a.shape()[0] as u32;
-            let w = a.shape()[1] as u32;
-            Ok((a.iter().copied().collect(), w, h))
-        }
-        ("u", 1) => {
-            let arr: PyReadonlyArray2<u8> = image.extract()?;
-            let a = arr.as_array();
-            let h = a.shape()[0] as u32;
-            let w = a.shape()[1] as u32;
-            Ok((a.iter().map(|&v| v as f32).collect(), w, h))
-        }
-        ("u", 2) => {
-            let arr: PyReadonlyArray2<u16> = image.extract()?;
-            let a = arr.as_array();
-            let h = a.shape()[0] as u32;
-            let w = a.shape()[1] as u32;
-            Ok((a.iter().map(|&v| v as f32).collect(), w, h))
-        }
-        ("i", 2) => {
-            let arr: PyReadonlyArray2<i16> = image.extract()?;
-            let a = arr.as_array();
-            let h = a.shape()[0] as u32;
-            let w = a.shape()[1] as u32;
-            Ok((a.iter().map(|&v| v as f32).collect(), w, h))
-        }
+        ("f", 8) => arr_to_f32::<f64>(image, |v| v as f32),
+        ("f", 4) => arr_to_f32::<f32>(image, |v| v),
+        ("u", 1) => arr_to_f32::<u8>(image, |v| v as f32),
+        ("u", 2) => arr_to_f32::<u16>(image, |v| v as f32),
+        ("i", 2) => arr_to_f32::<i16>(image, |v| v as f32),
         _ => {
             let dtype_str: String = dtype.str()?.extract()?;
             Err(pyo3::exceptions::PyTypeError::new_err(format!(
@@ -102,13 +100,7 @@ fn image_to_f32(image: &Bound<'_, pyo3::PyAny>) -> PyResult<(Vec<f32>, u32, u32)
 /// Result of centroid extraction from an image.
 #[pyclass(name = "ExtractionResult", module = "tetra3rs", frozen)]
 pub(crate) struct PyExtractionResult {
-    centroids: Vec<PyCentroid>,
-    image_width: u32,
-    image_height: u32,
-    background_mean: f64,
-    background_sigma: f64,
-    threshold: f64,
-    num_blobs_raw: usize,
+    inner: ExtractionData,
 }
 
 #[pymethods]
@@ -116,92 +108,69 @@ impl PyExtractionResult {
     /// List of detected centroids, sorted by brightness (brightest first).
     #[getter]
     fn centroids(&self) -> Vec<PyCentroid> {
-        self.centroids.clone()
+        self.inner
+            .centroids
+            .iter()
+            .map(|c| PyCentroid { inner: c.clone() })
+            .collect()
     }
 
     /// Width of the input image in pixels.
     #[getter]
     fn image_width(&self) -> u32 {
-        self.image_width
+        self.inner.image_width
     }
 
     /// Height of the input image in pixels.
     #[getter]
     fn image_height(&self) -> u32 {
-        self.image_height
+        self.inner.image_height
     }
 
     /// Estimated background mean.
     #[getter]
     fn background_mean(&self) -> f64 {
-        self.background_mean
+        self.inner.background_mean
     }
 
     /// Estimated background standard deviation.
     #[getter]
     fn background_sigma(&self) -> f64 {
-        self.background_sigma
+        self.inner.background_sigma
     }
 
     /// Detection threshold used.
     #[getter]
     fn threshold(&self) -> f64 {
-        self.threshold
+        self.inner.threshold
     }
 
     /// Number of raw blobs before filtering.
     #[getter]
     fn num_blobs_raw(&self) -> usize {
-        self.num_blobs_raw
+        self.inner.num_blobs_raw as usize
     }
 
     fn __reduce__(slf: &Bound<'_, Self>) -> PyResult<(Py<PyAny>, (Vec<u8>,))> {
-        let b = slf.borrow();
-        let ser = ExtractionResultSer {
-            centroids: b.centroids.iter().map(|c| c.inner.clone()).collect(),
-            image_width: b.image_width,
-            image_height: b.image_height,
-            background_mean: b.background_mean,
-            background_sigma: b.background_sigma,
-            threshold: b.threshold,
-            num_blobs_raw: b.num_blobs_raw as u64,
-        };
-        let bytes =
-            postcard::to_allocvec(&ser).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let from_bytes = slf.get_type().getattr("_from_pickle_bytes")?;
-        Ok((from_bytes.unbind(), (bytes,)))
+        crate::helpers::pickle_reduce(slf, &slf.borrow().inner)
     }
 
     #[staticmethod]
     fn _from_pickle_bytes(data: &[u8]) -> PyResult<Self> {
-        let ser = postcard::from_bytes::<ExtractionResultSer>(data)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let centroids = ser
-            .centroids
-            .into_iter()
-            .map(|cs| PyCentroid { inner: cs })
-            .collect();
-        Ok(Self {
-            centroids,
-            image_width: ser.image_width,
-            image_height: ser.image_height,
-            background_mean: ser.background_mean,
-            background_sigma: ser.background_sigma,
-            threshold: ser.threshold,
-            num_blobs_raw: ser.num_blobs_raw as usize,
-        })
+        let inner = crate::helpers::from_postcard_bytes::<ExtractionData>(data)?;
+        Ok(Self { inner })
     }
 
     fn __repr__(&self) -> String {
         format!(
             "ExtractionResult(centroids={}, image={}x{}, bg_mean={:.1}, bg_sigma={:.1}, threshold={:.1}, raw_blobs={})",
-            self.centroids.len(),
-            self.image_width,
-            self.image_height,
-            self.background_mean,
-            self.background_sigma,
-            self.threshold,
-            self.num_blobs_raw,
+            self.inner.centroids.len(),
+            self.inner.image_width,
+            self.inner.image_height,
+            self.inner.background_mean,
+            self.inner.background_sigma,
+            self.inner.threshold,
+            self.inner.num_blobs_raw,
         )
     }
 }
@@ -271,20 +240,8 @@ pub(crate) fn extract_centroids(
         tetra3::centroid_extraction::extract_centroids_from_raw(&pixels, width, height, &config)
             .map_err(crate::helpers::map_tetra3_err)?;
 
-    let py_centroids: Vec<PyCentroid> = result
-        .centroids
-        .into_iter()
-        .map(|c| PyCentroid { inner: c })
-        .collect();
-
     Ok(PyExtractionResult {
-        centroids: py_centroids,
-        image_width: width,
-        image_height: height,
-        background_mean: result.background_mean as f64,
-        background_sigma: result.background_sigma as f64,
-        threshold: result.threshold as f64,
-        num_blobs_raw: result.num_blobs_raw,
+        inner: result.into(),
     })
 }
 
@@ -343,19 +300,7 @@ pub(crate) fn extract_centroids_fast(
         tetra3::centroid_extraction::extract_centroids_fast(&pixels, width, height, &config)
             .map_err(crate::helpers::map_tetra3_err)?;
 
-    let py_centroids: Vec<PyCentroid> = result
-        .centroids
-        .into_iter()
-        .map(|c| PyCentroid { inner: c })
-        .collect();
-
     Ok(PyExtractionResult {
-        centroids: py_centroids,
-        image_width: width,
-        image_height: height,
-        background_mean: result.background_mean as f64,
-        background_sigma: result.background_sigma as f64,
-        threshold: result.threshold as f64,
-        num_blobs_raw: result.num_blobs_raw,
+        inner: result.into(),
     })
 }

@@ -126,6 +126,21 @@ pub(crate) fn to_postcard_bytes<T: Serialize>(value: &T) -> PyResult<Vec<u8>> {
     postcard::to_allocvec(value).map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
+/// The shared `__reduce__` body for every pickled wrapper type: postcard-encode
+/// the inner value and pair it with the type's `_from_pickle_bytes`
+/// reconstructor. Each `#[pymethods]` block delegates here so the pickle
+/// plumbing exists once. (A macro emitting whole `#[pymethods]` blocks would
+/// need pyo3's `multiple-pymethods` feature and its `inventory` dependency,
+/// which isn't worth it for this.)
+pub(crate) fn pickle_reduce<T: Serialize>(
+    slf: &Bound<'_, impl pyo3::PyClass>,
+    inner: &T,
+) -> PyResult<(Py<PyAny>, (Vec<u8>,))> {
+    let bytes = to_postcard_bytes(inner)?;
+    let from_bytes = slf.as_any().get_type().getattr("_from_pickle_bytes")?;
+    Ok((from_bytes.unbind(), (bytes,)))
+}
+
 /// Deserialize a value from postcard bytes, mapping any error to a Python
 /// `RuntimeError`. Counterpart to [`to_postcard_bytes`].
 pub(crate) fn from_postcard_bytes<T: DeserializeOwned>(data: &[u8]) -> PyResult<T> {
