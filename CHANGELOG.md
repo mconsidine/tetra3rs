@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+### Changed — verification statistics recalibrated (solve-acceptance semantics)
+
+The lost-in-space acceptance test was rebuilt around honest statistics; no
+public API changed, but what the solver accepts (and how fast it fails) did:
+
+- **Null model measured, not assumed.** The false-positive probability of a
+  match count now uses the *measured* density of projected catalog stars over
+  the frame with the correct π·r² disc area. The previous `num_nearby·mr²`
+  under-predicted coincidence rates 2-3× per match — compounding to a latent
+  false-accept vulnerability in dense fields (a wrong-attitude TESS candidate
+  matching 113 stars by pure coincidence scored as a 10⁻¹⁴ certainty; it is
+  now correctly rejected at p≈1).
+- **Hypothesis stars aren't evidence.** The 4 pattern stars that formed the
+  candidate are excluded from the binomial trials and successes (upstream
+  tetra3's flat "−2" heuristic dropped). Tracking verification, whose hint is
+  independent of the centroids, no longer takes any discount.
+- **Sequential multiple-comparison correction.** Candidate `k` is accepted at
+  `p·k < match_threshold` — a Bonferroni correction over candidates *actually
+  tested* rather than the old division by the database pattern count, which
+  over-corrected by 4-7 orders of magnitude and made clean sparse fields
+  (< ~7 stars) mathematically unsolvable at any signal quality.
+  `match_threshold` is now a per-solve false-accept budget (the total for a
+  full search is bounded by a small logarithmic multiple);
+  `Solution.prob` reports the corrected p-value.
+- **Post-refinement re-verification.** Acceptance is decided by re-verifying
+  the *refined* attitude at a radius tied to the refined RMSE. A true
+  candidate's matches sit within a few RMSE (its p-value collapses by tens of
+  orders when the radius tightens); a false candidate's coincidences are
+  uniform across the search radius and cannot be aligned by the 3-DOF fit.
+- **Robust to wrong FOV estimates at full speed.** Candidate vectors are
+  rebuilt at the FOV measured from each matched pattern, so the FOV sweep
+  collapses to a pattern-tolerance-derived step (usually a single value):
+  a 15%-wrong FOV estimate now solves in ~36 µs instead of ~21-40 ms, and
+  unsolvable fields fail in ~1.6 ms instead of ~12-29 ms (10° defaults).
+
+Measured consequences (synthetic 10° harness, 1000 fields each): 6-star
+fields 71% solvable and 8-star fields 92% (both 0% before by construction),
+zero wrong-attitude accepts across 1500 pure-noise fields and all solved
+scenarios. Real-sky solves that previously passed only by the old
+arithmetic's optimism — e.g. heavily distorted TESS frames solved with an
+uncalibrated camera model at tight `match_radius`, where the true-match rate
+barely exceeds chance — may now fail or time out; raise `match_threshold`
+(e.g. `1e-3`) to accept such weak evidence explicitly, or calibrate the
+distortion first (the tiered calibration flow does this automatically).
+
 > **Note on serialized artifacts.** The `Solution` wire format changed (the
 > write-only `image_width`/`image_height` fields were removed — the same values
 > live in `Solution.camera_model`), so Python `SolveResult` pickles saved by

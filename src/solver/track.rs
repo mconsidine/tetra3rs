@@ -162,6 +162,9 @@ impl SolverDatabase {
         }
 
         // ── Verification (same path as LIS) ──
+        // `hypothesis_matches = 0`: the attitude hypothesis comes from the
+        // caller's hint, not from any of the tested centroids, so every match
+        // is independent evidence.
         let (verify_matches, prob_mismatch) = self.verify_attitude(
             &rotation_matrix,
             &centroid_vectors,
@@ -169,10 +172,12 @@ impl SolverDatabase {
             fov_rad,
             config,
             star_vectors,
+            0,
+            None,
         );
 
-        // Same false-positive probability test as LIS, but without the
-        // /num_patterns Bonferroni division (no pattern-hash trials happened).
+        // Same false-positive probability test as LIS, but without any
+        // multiple-comparison correction (a single candidate is tested).
         if prob_mismatch >= config.match_threshold {
             debug!(
                 "Tracking: verification rejected (matches={}, prob={:.2e})",

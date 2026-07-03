@@ -149,7 +149,11 @@ impl PySolverDatabase {
     ///         Can be used instead of image_width/image_height.
     ///     fov_max_error: Maximum FOV error in degrees. None = no filtering.
     ///     match_radius: Match distance as fraction of FOV. Default 0.01.
-    ///     match_threshold: False-positive probability threshold. Default 1e-5.
+    ///     match_threshold: False-positive probability budget for accepting a
+    ///         solution (candidate p-values are tested against this with a
+    ///         sequential multiple-comparison correction). Raising it (e.g. 1e-3)
+    ///         accepts weaker evidence — useful for very sparse fields at
+    ///         increased false-positive risk. Default 1e-5.
     ///     solve_timeout_ms: Timeout in milliseconds. None = no timeout.
     ///     match_max_error: Maximum edge-ratio error. None = use database value.
     ///         Values below the database's pattern quantization error are clamped up to it.

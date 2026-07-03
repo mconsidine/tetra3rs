@@ -177,8 +177,14 @@ impl SolverDatabase {
         let fov_values = build_fov_sweep(
             config.fov_estimate_rad(),
             config.fov_max_error_rad,
-            config.match_radius,
+            self.props.pattern_max_error,
+            diagonal_factor(config),
         );
+
+        // Number of candidate attitudes verified so far across the whole
+        // sweep — the divisor of the sequential multiple-comparison
+        // correction in `solve_at_fov`.
+        let mut candidates_tested: u64 = 0;
 
         debug!(
             "FOV sweep: {} values from {:.2}° to {:.2}°",
@@ -214,6 +220,7 @@ impl SolverDatabase {
                 config,
                 fov_try,
                 &star_vecs,
+                &mut candidates_tested,
                 t0,
             );
             match result {
@@ -233,7 +240,10 @@ impl SolverDatabase {
     ///
     /// `sorted_indices` is the brightness-sorted centroid index order, computed
     /// once by the caller (it does not depend on the FOV). The caller also
-    /// guarantees at least `PATTERN_SIZE` centroids.
+    /// guarantees at least `PATTERN_SIZE` centroids. `candidates_tested`
+    /// accumulates the number of verified candidates across the caller's
+    /// whole FOV sweep (see the acceptance test in the candidate loop).
+    #[allow(clippy::too_many_arguments)]
     fn solve_at_fov(
         &self,
         centroids: &[Centroid],
@@ -241,6 +251,7 @@ impl SolverDatabase {
         config: &SolveConfig,
         fov_estimate: f32,
         star_vectors: &[[f32; 3]],
+        candidates_tested: &mut u64,
         t0: Instant,
     ) -> SolveResult {
         #[cfg(feature = "profile")]
@@ -265,6 +276,11 @@ impl SolverDatabase {
         // Lazily-created x-flipped copy for parity-flipped images.
         // Built on first use, cached for subsequent pattern attempts.
         let mut flipped_vectors: Option<Vec<[f32; 3]>> = None;
+
+        // Scratch buffer for centroid vectors rebuilt at a candidate's
+        // measured FOV (see the rebuild step in the candidate loop). Reused
+        // across candidates to avoid per-candidate allocation.
+        let mut rebuilt_vectors: Vec<[f32; 3]> = Vec::new();
 
         // ── Cluster-buster thinning ──
         // Apply the same separation constraint as database generation to avoid
@@ -341,13 +357,11 @@ impl SolverDatabase {
         } else {
             p_max_err
         };
-        let match_threshold = config.match_threshold / self.props.num_patterns as f64;
         let timeout_ms = config.solve_timeout_ms;
 
-        // Guard against a corrupt or placeholder database. An empty table makes
-        // the hash-probe arithmetic below divide by zero; `num_patterns == 0`
-        // (with a non-empty table) makes `match_threshold` above `+inf`, so
-        // every candidate would pass verification and produce a bogus solution.
+        // Guard against a corrupt or placeholder database. An empty table
+        // makes the hash-probe arithmetic below divide by zero; a non-empty
+        // table claiming zero generated patterns is inconsistent.
         let table_len = self.pattern_catalog.len() as u64;
         if table_len == 0 || self.props.num_patterns == 0 {
             return failure(SolveStatus::NoMatch, t0);
@@ -484,14 +498,54 @@ impl SolverDatabase {
                     // Refine FOV estimate from this match
                     let fov = cat_largest_edge / image_largest_edge * fov_estimate;
 
+                    // ── Rebuild vectors at the measured scale when the sweep
+                    // value is meaningfully off ──
+                    // Edge-ratio keys cancel a pixel-scale error to first
+                    // order, but the SVD attitude and verification residuals
+                    // do not: vectors built at a wrong scale stretch the field
+                    // radially by ε·θ, which overwhelms the verification match
+                    // radius (match_radius·fov) long before the ratio
+                    // tolerance is threatened. Rebuilding at this candidate's
+                    // measured FOV makes a single sweep pass robust to any
+                    // FOV-estimate error within `fov_max_error` (this is what
+                    // lets `build_fov_sweep` use a coarse, pattern-tolerance-
+                    // derived step).
+                    //
+                    // Rebuilding also *registers* accepted solutions better —
+                    // even at sub-percent mismatches the measured scale beats
+                    // the swept one for the match set handed to refinement
+                    // (measured on the TESS multi-sector calibration: pass-1
+                    // fits are ~2× tighter with the rebuild than without).
+                    // Skipped only when the mismatch is negligible — at
+                    // threshold, the residual at the half-diagonal (~0.7·fov)
+                    // is ≲ 0.2 of the match radius — so a well-estimated
+                    // field pays nothing.
+                    let scale_mismatch = (fov / fov_estimate - 1.0).abs();
+                    let rebuild = scale_mismatch > 0.25 * config.match_radius;
+                    let (pat_vecs, ps_meas): ([[f32; 3]; 4], f32) = if rebuild {
+                        let ps = pixel_scale_from_fov(config.image_width(), fov as f64) as f32;
+                        (
+                            std::array::from_fn(|k| {
+                                unit_vector_from_pixels(
+                                    &centroids[sorted_indices[image_pattern_local[k]]],
+                                    ps,
+                                    1.0,
+                                )
+                            }),
+                            ps,
+                        )
+                    } else {
+                        (image_vecs, pixel_scale)
+                    };
+
                     // Sort image pattern by centroid distance (canonical ordering)
                     let mut img_order: [usize; 4] = [0, 1, 2, 3];
-                    sort_pattern_by_centroid_distance(&mut img_order, |i| image_vecs[i]);
+                    sort_pattern_by_centroid_distance(&mut img_order, |i| pat_vecs[i]);
 
                     // Catalog pattern is already pre-sorted during database generation.
                     // Build matched vector pairs.
                     let matched_img: [[f32; 3]; 4] =
-                        std::array::from_fn(|i| image_vecs[img_order[i]]);
+                        std::array::from_fn(|i| pat_vecs[img_order[i]]);
                     let matched_cat: [[f32; 3]; 4] = std::array::from_fn(|i| cat_vecs[i]);
 
                     #[cfg(feature = "profile")]
@@ -536,20 +590,41 @@ impl SolverDatabase {
                         rotation_matrix[(0, 0)] = -rotation_matrix[(0, 0)];
                         rotation_matrix[(0, 1)] = -rotation_matrix[(0, 1)];
                         rotation_matrix[(0, 2)] = -rotation_matrix[(0, 2)];
+                    } else {
+                        parity_flip = false;
+                    }
+                    if rebuild {
+                        // Rebuild the full verification set at the measured
+                        // scale (parity applied directly via the x-sign).
+                        let sign = if parity_flip { -1.0f32 } else { 1.0 };
+                        rebuilt_vectors.clear();
+                        rebuilt_vectors.extend(
+                            sorted_indices
+                                .iter()
+                                .map(|&i| unit_vector_from_pixels(&centroids[i], ps_meas, sign)),
+                        );
+                        working_vectors = &rebuilt_vectors;
+                    } else if parity_flip {
                         // Lazily create flipped centroid vectors for matching
-                        let fv = flipped_vectors.get_or_insert_with(|| {
+                        working_vectors = flipped_vectors.get_or_insert_with(|| {
                             centroid_vectors
                                 .iter()
                                 .map(|v| [-v[0], v[1], v[2]])
                                 .collect()
                         });
-                        working_vectors = fv;
                     } else {
-                        parity_flip = false;
                         working_vectors = &centroid_vectors;
                     }
 
                     // ── Verify by matching nearby catalog stars ──
+                    // The pattern stars that fall inside the tested
+                    // (brightest `match_centroid_count`) set are
+                    // hypothesis-forming, not evidence — exclude them from
+                    // the binomial (see `verify_attitude`).
+                    let hypothesis = image_pattern_local
+                        .iter()
+                        .filter(|&&i| i < match_centroid_count)
+                        .count();
                     let (current_matches, prob_mismatch) = self.verify_attitude(
                         &rotation_matrix,
                         working_vectors,
@@ -557,16 +632,28 @@ impl SolverDatabase {
                         fov,
                         config,
                         star_vectors,
+                        hypothesis,
+                        None,
                     );
 
-                    if prob_mismatch >= match_threshold {
+                    // ── Pre-gate ──
+                    // Every verified candidate consumes one unit of the
+                    // multiple-comparison budget (`candidates_tested` is the
+                    // sequential-Bonferroni divisor of the acceptance test
+                    // below). The pre-gate itself is deliberately *uncorrected*:
+                    // it only decides whether the candidate is promising
+                    // enough to refine — acceptance happens after
+                    // re-verification of the refined attitude.
+                    *candidates_tested += 1;
+                    if prob_mismatch >= config.match_threshold {
                         continue;
                     }
 
                     debug!(
-                        "MATCH: {} matches, prob={:.2e}, fov={:.3}°",
+                        "Candidate {}: {} matches, p={:.2e}, fov={:.3}° — refining",
+                        *candidates_tested,
                         current_matches.len(),
-                        prob_mismatch * self.props.num_patterns as f64,
+                        prob_mismatch,
                         fov.to_degrees()
                     );
 
@@ -579,7 +666,7 @@ impl SolverDatabase {
                     // match measures the true scale, and the model's f is only
                     // a search seed here. Fewer than 4 surviving matches → try
                     // next candidate.
-                    if let Some(result) = self.refine_and_finalize(
+                    let Some(mut result) = self.refine_and_finalize(
                         &rotation_matrix,
                         &current_matches,
                         centroids,
@@ -591,11 +678,81 @@ impl SolverDatabase {
                         pixel_scale_from_fov(config.image_width(), fov as f64),
                         match_centroid_count,
                         4,
-                        prob_mismatch * self.props.num_patterns as f64,
+                        prob_mismatch,
                         t0,
-                    ) {
-                        return Ok(result);
+                    ) else {
+                        continue;
+                    };
+
+                    // ── Post-refinement verification (the acceptance test) ──
+                    // A 4-star SVD attitude can be several match-radii off at
+                    // the field edges (small quads amplify centroid noise), so
+                    // a *true* candidate in a dense field may verify weakly
+                    // (e.g. 14 of 50) — indistinguishable from a lucky false
+                    // candidate by p-value alone. Re-verify with the refined
+                    // attitude: the 3-DOF fit converges to the true attitude
+                    // from those matches and the match count jumps (its
+                    // p-value collapses by tens of orders), while a false
+                    // candidate's coincidences cannot be aligned by 3 DOF and
+                    // its p-value stays ~1. Acceptance applies the sequential
+                    // Bonferroni correction over all candidates tested this
+                    // solve: p·k < match_threshold. The total false-accept
+                    // probability of a full search is bounded by
+                    // match_threshold·ln(k), while early candidates face a
+                    // threshold 5-7 orders looser than the previous
+                    // `/ num_patterns` over-correction, which made clean
+                    // sparse fields (< ~7 stars) mathematically unsolvable.
+                    let refined_rotation = wcs_refine::rotation_from_theta_crval(
+                        result.theta_rad,
+                        result.crval_rad[0],
+                        result.crval_rad[1],
+                    );
+                    // Re-verify at a radius tied to the refined fit quality
+                    // instead of the (coarse) search radius: true matches sit
+                    // within a few RMSE of the refined attitude, while a
+                    // false candidate's coincidences are uniform across the
+                    // search radius, so tightening the radius multiplies each
+                    // match's evidence by (search/refined)² — this is what
+                    // separates a true 14-of-50 dense-field candidate (many
+                    // bright centroids simply absent from the catalog) from a
+                    // lucky false one. Floored at 2.5 px (the refinement's own
+                    // adaptive-radius floor) and never looser than the search
+                    // radius.
+                    let ps_refined = (1.0 / result.camera_model.focal_length_px) as f32;
+                    let refined_radius = (5.0 * result.rmse_rad)
+                        .max(2.5 * ps_refined)
+                        .min(config.match_radius * result.fov_rad);
+                    let (refined_matches, p_refined) = self.verify_attitude(
+                        &refined_rotation,
+                        working_vectors,
+                        match_centroid_count,
+                        result.fov_rad,
+                        config,
+                        star_vectors,
+                        hypothesis,
+                        Some(refined_radius),
+                    );
+                    let corrected_prob = p_refined * *candidates_tested as f64;
+                    if corrected_prob >= config.match_threshold {
+                        debug!(
+                            "Candidate {} rejected after refinement: {} → {} matches, corrected p={:.2e}",
+                            *candidates_tested,
+                            current_matches.len(),
+                            refined_matches.len(),
+                            corrected_prob,
+                        );
+                        continue;
                     }
+
+                    debug!(
+                        "MATCH: {} verified matches (candidate {}), corrected p={:.2e}, fov={:.3}°",
+                        refined_matches.len(),
+                        *candidates_tested,
+                        corrected_prob,
+                        result.fov_rad.to_degrees()
+                    );
+                    result.prob = corrected_prob;
+                    return Ok(result);
                 }
             }
         }
@@ -614,8 +771,23 @@ impl SolverDatabase {
     /// is unchanged by aberration.
     ///
     /// Returns the matches `(centroid_local_idx, catalog_star_idx)` and the
-    /// binomial false-positive probability of the match count (before any
-    /// Bonferroni correction for the number of pattern trials).
+    /// binomial false-positive probability of the match count (a per-candidate
+    /// p-value, before any multiple-comparison correction by the caller).
+    ///
+    /// `hypothesis_matches` is the number of *tested* centroids that were used
+    /// to form the attitude hypothesis (LIS passes the pattern stars that fall
+    /// inside the tested set; tracking passes 0 — its hint is independent of
+    /// the centroids). Those stars match by construction — with the
+    /// measured-FOV rebuild they fit near-exactly, handing every
+    /// ratio-passing candidate "free" matches — so they are excluded from
+    /// both the binomial trials and successes rather than counted as
+    /// evidence. This replaces the upstream-tetra3 heuristic of discounting a
+    /// flat 2 matches.
+    /// `match_radius_rad_override` replaces the default matching radius
+    /// (`config.match_radius · fov`) — the false-positive model scales with
+    /// it, so a tighter radius (e.g. derived from a refined fit's RMSE) makes
+    /// every true match worth quadratically more evidence.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn verify_attitude(
         &self,
         rotation_matrix: &Matrix3<f32>,
@@ -624,9 +796,11 @@ impl SolverDatabase {
         fov: f32,
         config: &SolveConfig,
         star_vectors: &[[f32; 3]],
+        hypothesis_matches: usize,
+        match_radius_rad_override: Option<f32>,
     ) -> (Vec<(usize, usize)>, f64) {
         let fov_diagonal = fov * diagonal_factor(config);
-        let match_radius_rad = config.match_radius * fov;
+        let match_radius_rad = match_radius_rad_override.unwrap_or(config.match_radius * fov);
 
         // Find catalog stars within the diagonal FOV
         let image_center_icrs = rotation_matrix.transpose() * Vector3::from_array([0.0, 0.0, 1.0]);
@@ -653,7 +827,6 @@ impl SolverDatabase {
         }
         // Limit to 2x the number of image centroids (like tetra3)
         nearby_cam_positions.truncate(2 * match_centroid_count);
-        let num_nearby = nearby_cam_positions.len();
 
         // Match image centroids to projected catalog stars
         let matches = timed!(
@@ -665,11 +838,40 @@ impl SolverDatabase {
             )
         );
 
-        // False-positive probability of this match count
-        let prob_single = num_nearby as f64 * (config.match_radius as f64).powi(2);
+        // False-positive probability of this match count.
+        //
+        // `prob_single` is the chance that a *coincidental* (wrong-attitude)
+        // centroid lands within `match_radius_rad` of some projected catalog
+        // star. Each projected star owns a disc of area π·r², and the
+        // prediction density is *measured* rather than modeled: count the
+        // predictions that could match an in-frame centroid (inside the frame
+        // plus a match-radius margin) and divide by that region's area, all
+        // in tangent-plane units. Measuring the density avoids two opposite
+        // errors that both showed up empirically: upstream tetra3's
+        // `num_nearby·mr²` (no π, cone counted as if spread over the frame)
+        // under-predicts the coincidence rate ~2-3× per match — false
+        // dense-field candidates scored as near-certainties — while
+        // π·num_nearby·mr² over-predicts it by the cone/frame area ratio,
+        // rejecting true candidates in catalog-saturated fields where the
+        // expected coincidence count is a large fraction of the centroids.
+        let half_x = ((fov as f64) / 2.0).tan();
+        let half_y = half_x * (config.image_height() as f64 / config.image_width().max(1) as f64);
+        let margin = match_radius_rad as f64;
+        let n_in = nearby_cam_positions
+            .iter()
+            .filter(|&&(_, x, y)| {
+                (x as f64).abs() <= half_x + margin && (y as f64).abs() <= half_y + margin
+            })
+            .count();
+        let region_area = (2.0 * (half_x + margin)) * (2.0 * (half_y + margin));
+        let prob_single = n_in as f64 * std::f64::consts::PI * margin * margin / region_area;
+        // Exclude hypothesis stars from trials and successes (see doc above).
+        let h = hypothesis_matches.min(match_centroid_count);
+        let trials = match_centroid_count - h;
+        let evidence = matches.len().saturating_sub(h).min(trials);
         let prob_mismatch = binomial_cdf(
-            (match_centroid_count as i64 - (matches.len() as i64 - 2)).max(0) as u32,
-            match_centroid_count as u32,
+            (trials - evidence) as u32,
+            trials as u32,
             1.0 - prob_single.min(1.0),
         );
 
@@ -849,25 +1051,46 @@ impl SolverDatabase {
 
 /// Build FOV values to try: exact estimate first, then spiraling outward.
 ///
-/// Step size is chosen so that the verification match_radius can tolerate the
-/// worst-case scale error at the midpoint between steps.
-fn build_fov_sweep(fov_estimate: f32, fov_max_error: Option<f32>, match_radius: f32) -> Vec<f32> {
+/// The swept value only enters the pattern search through the pixel scale
+/// used to build centroid unit vectors, and pattern keys are *edge ratios*,
+/// so a scale error cancels to first order. Everything downstream
+/// self-corrects: the FOV-consistency filter compares the implied FOV (nearly
+/// independent of the swept value) against the full `fov_max_error`, and the
+/// SVD/verification/refinement all run on vectors rebuilt at the FOV
+/// *measured* from each matched pattern (`cat_largest/image_largest ·
+/// fov_try` — see the rebuild step in the candidate loop).
+///
+/// What remains is the second-order tangent-plane nonlinearity: a relative
+/// scale error ε perturbs edge ratios by ≈ (θ_hd²/3)·ε, where θ_hd is the
+/// half-diagonal angle. The step is sized so that at the midpoint between
+/// sweep values this drift stays within the database's ratio quantization
+/// tolerance:
+///
+///   step ≈ pattern_max_error / (θ_hd²/3) · fov_estimate
+///
+/// (midpoint drift ≤ pattern_max_error/2, leaving the other half of the
+/// search tolerance for centroid noise). At 10° FOV with the default 0.003
+/// tolerance this gives step ≈ 0.6·fov — a single sweep value covers ±2° —
+/// while at very wide FOV (θ_hd large) the sweep stays fine enough to keep
+/// quantization drift bounded.
+fn build_fov_sweep(
+    fov_estimate: f32,
+    fov_max_error: Option<f32>,
+    pattern_max_error: f32,
+    diag_factor: f32,
+) -> Vec<f32> {
     let mut values = vec![fov_estimate];
 
     if let Some(max_error) = fov_max_error {
         if max_error > 0.0 {
-            // Step = 4 * match_radius * fov_estimate.
-            // At the midpoint between steps the relative scale error is
-            // step/(2·fov) = 2·mr. A star at the field edge then has position
-            // error ≈ 2·mr · (fov/2) = mr·fov — right at the verification
-            // match radius (match_radius_rad = mr·fov) — and every star
-            // inboard of the edge proportionally less, so verification still
-            // matches most of the field. Measured on the profile harness
-            // (10° FOV, mr = 0.01, `T3_FOV_BIAS`): a 2% scale error solves
-            // 100% of fields and 3% solves 99%, so the 2·mr = 2% midpoint
-            // keeps full solve rate while halving the sweep length (the sweep
-            // multiplies no-match / wrong-FOV latency).
-            let step = (4.0 * match_radius * fov_estimate).max(0.001_f32.to_radians());
+            // Half-diagonal angle at the estimated FOV (fov is width-referenced).
+            let theta_hd = ((fov_estimate as f64 / 2.0).tan() * diag_factor as f64).atan();
+            // Second-order ratio-drift coefficient; guarded so a degenerate
+            // (near-zero) FOV yields one huge step rather than a division
+            // blowup.
+            let curvature = (theta_hd * theta_hd / 3.0).max(1e-12);
+            let step_rel = pattern_max_error as f64 / curvature;
+            let step = ((step_rel * fov_estimate as f64) as f32).max(0.001_f32.to_radians());
             let mut offset = step;
             while offset <= max_error {
                 values.push(fov_estimate + offset);
@@ -993,14 +1216,23 @@ pub(super) fn centroid_unit_vectors(
 ) -> Vec<[f32; 3]> {
     sorted_indices
         .iter()
-        .map(|&i| {
-            let x = parity_sign * centroids[i].x * pixel_scale;
-            let y = centroids[i].y * pixel_scale;
-            let z = 1.0f32;
-            let norm = (x * x + y * y + z * z).sqrt();
-            [x / norm, y / norm, z / norm]
-        })
+        .map(|&i| unit_vector_from_pixels(&centroids[i], pixel_scale, parity_sign))
         .collect()
+}
+
+/// Unit vector in the camera frame for a single centroid at the given pixel
+/// scale (rad/px), with optional x-negation for parity-flipped images.
+#[inline]
+pub(super) fn unit_vector_from_pixels(
+    centroid: &Centroid,
+    pixel_scale: f32,
+    parity_sign: f32,
+) -> [f32; 3] {
+    let x = parity_sign * centroid.x * pixel_scale;
+    let y = centroid.y * pixel_scale;
+    let z = 1.0f32;
+    let norm = (x * x + y * y + z * z).sqrt();
+    [x / norm, y / norm, z / norm]
 }
 
 /// Compute the least-squares rotation matrix from paired image/catalog unit

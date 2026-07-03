@@ -395,7 +395,18 @@ pub struct SolveConfig {
     // ── Matching & verification (both modes) ──
     /// Maximum match distance as a fraction of the FOV. Default 0.01.
     pub match_radius: f32,
-    /// False-positive probability threshold. Default 1e-5.
+    /// False-positive probability budget for accepting a solution.
+    /// Default 1e-5.
+    ///
+    /// Each candidate attitude's verification yields a binomial p-value (the
+    /// probability that a wrong attitude would coincidentally match as many
+    /// stars); candidate `k` of a lost-in-space search is accepted when
+    /// `p·k < match_threshold` — a sequential Bonferroni correction over the
+    /// candidates actually tested, so the total false-accept probability of a
+    /// full search stays within a small (logarithmic) multiple of this
+    /// budget. Tracking tests a single hinted candidate against the budget
+    /// directly. Raising this (e.g. `1e-3`) accepts weaker evidence — useful
+    /// for very sparse fields (≲7 stars) at increased false-positive risk.
     pub match_threshold: f64,
     /// Timeout in milliseconds. None = no timeout. Default 5000.
     pub solve_timeout_ms: Option<u64>,
@@ -566,7 +577,9 @@ pub struct Solution {
     pub p90e_rad: f32,
     /// Maximum angular residual (radians).
     pub max_err_rad: f32,
-    /// False-positive probability (lower is better).
+    /// False-positive probability of the accepted match (lower is better):
+    /// the verification p-value after the multiple-comparison correction
+    /// that was tested against [`SolveConfig::match_threshold`].
     pub prob: f64,
     /// Wall-clock time spent solving, in milliseconds.
     pub solve_time_ms: f32,
