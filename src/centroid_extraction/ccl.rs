@@ -161,11 +161,9 @@ pub(super) fn extract_from_gray(
     let gray: Cow<[f32]>;
     let bg_mean: f32;
     let bg_sigma: f32;
-    let local_bg: bool;
     let mut filter_input: Option<DynMatrix<f32>> = None;
 
     if let Some(block_size) = config.local_bg_block_size {
-        local_bg = true;
         let (grid, nx, ny) = background_grid(gray_input, width, height, block_size);
         let bs = block_size as usize;
 
@@ -199,7 +197,6 @@ pub(super) fn extract_from_gray(
         }
         gray = Cow::Owned(clamped);
     } else {
-        local_bg = false;
         (bg_mean, bg_sigma) = estimate_background(gray_input, width, height, config);
         gray = Cow::Borrowed(gray_input);
         if filter_sigma.is_some() {
@@ -251,23 +248,7 @@ pub(super) fn extract_from_gray(
     let (labels, components) = connected_components_with_label_buffer(&mask, connectivity, 0u8);
 
     // ── Step 4: compute centroids ──
-    // Use the local-background-subtracted image for centroid weighting so that
-    // the intensity weights reflect only the stellar signal, not the gradient.
-    let bg_for_centroids = if local_bg {
-        // Already subtracted — use 0 as the level
-        0.0
-    } else {
-        bg_mean
-    };
-    let raw_centroids = compute_blob_centroids(
-        gray,
-        &labels,
-        &components,
-        width,
-        height,
-        bg_for_centroids,
-        config,
-    );
+    let raw_centroids = compute_blob_centroids(gray, &labels, &components, width, height, config);
     // "Raw" blob count = connected components before the size/elongation/mass
     // filters, matching the field's documented meaning and the fast path's
     // pre-`min_pixels` region count.
@@ -557,11 +538,11 @@ struct RawCentroid {
 ///
 /// When `max_elongation` is set in config, blobs with elongation ratio
 /// (major/minor axis) exceeding the threshold are rejected as non-stellar.
-/// The elongation test uses **intensity-weighted** second moments (with the
-/// global background subtracted), matching the original behavior — geometric
-/// moments admit a slightly different set of marginal blobs (saturated stars
-/// with large halos, etc.), which destabilizes downstream calibration on
-/// dense fields like TESS.
+/// The elongation test uses the **intensity-weighted** second moments —
+/// the very same moments reported as `cov` (geometric moments admit a
+/// slightly different set of marginal blobs — saturated stars with large
+/// halos, etc. — which destabilizes downstream calibration on dense fields
+/// like TESS).
 ///
 /// This loop is ~2% of extraction wall-clock, so it is left sequential even
 /// under the `parallel` feature — the threading overhead would not pay off and
@@ -572,12 +553,10 @@ fn compute_blob_centroids(
     components: &[Component],
     width: u32,
     height: u32,
-    bg_level: f32,
     config: &CentroidExtractionConfig,
 ) -> Vec<RawCentroid> {
     let w = width as usize;
     let h = height as usize;
-    let bg_level_f64 = bg_level as f64;
 
     // Reused across blobs to avoid a fresh allocation per component (dense
     // fields can have thousands). The closure is `FnMut`, so it may borrow and
@@ -604,7 +583,30 @@ fn compute_blob_centroids(
             let ref_col = min_col;
             let ref_row = min_row;
 
-            // --- Pass 1: intensity-weighted moments with global bg + peak ---
+            // --- Per-blob local background from annulus ---
+            // Expand bounding box by margin, collect non-blob pixels
+            const ANNULUS_MARGIN: usize = 5;
+            let r0 = min_row.saturating_sub(ANNULUS_MARGIN);
+            let r1 = (max_row + ANNULUS_MARGIN + 1).min(h);
+            let c0 = min_col.saturating_sub(ANNULUS_MARGIN);
+            let c1 = (max_col + ANNULUS_MARGIN + 1).min(w);
+
+            annulus_vals.clear();
+            for r in r0..r1 {
+                let row_off = r * w;
+                for c in c0..c1 {
+                    let i = row_off + c;
+                    if labels[i] == 0 {
+                        annulus_vals.push(gray[i]);
+                    }
+                }
+            }
+
+            // Median of annulus (residual local background in bg-subtracted image).
+            let local_bg = median_f32(&mut annulus_vals) as f64;
+
+            // --- Single moment pass: intensity-weighted moments with the
+            // annulus-local background, tracking the peak in the same sweep ---
             let mut sum_x = 0.0_f64;
             let mut sum_y = 0.0_f64;
             let mut sum_xx = 0.0_f64;
@@ -628,72 +630,7 @@ fn compute_blob_centroids(
                         peak_col = c;
                         peak_row = r;
                     }
-                    let intensity = (raw as f64 - bg_level_f64).max(0.0);
-                    let dx = c as f64 - ref_col as f64;
-                    let dy = r as f64 - ref_row as f64;
-                    sum_x += dx * intensity;
-                    sum_y += dy * intensity;
-                    sum_xx += dx * dx * intensity;
-                    sum_yy += dy * dy * intensity;
-                    sum_xy += dx * dy * intensity;
-                    sum_i += intensity;
-                }
-            }
-
-            if sum_i <= 0.0 {
-                return None;
-            }
-
-            // Elongation filter on intensity-weighted moments
-            if let Some(max_elong) = config.max_elongation {
-                let dx_bar = sum_x / sum_i;
-                let dy_bar = sum_y / sum_i;
-                let cxx = sum_xx / sum_i - dx_bar * dx_bar;
-                let cyy = sum_yy / sum_i - dy_bar * dy_bar;
-                let cxy = sum_xy / sum_i - dx_bar * dy_bar;
-                if elongation_from_cov(cxx, cyy, cxy) > max_elong {
-                    return None;
-                }
-            }
-
-            // --- Per-blob local background from annulus ---
-            // Expand bounding box by margin, collect non-blob pixels
-            const ANNULUS_MARGIN: usize = 5;
-            let r0 = min_row.saturating_sub(ANNULUS_MARGIN);
-            let r1 = (max_row + ANNULUS_MARGIN + 1).min(h);
-            let c0 = min_col.saturating_sub(ANNULUS_MARGIN);
-            let c1 = (max_col + ANNULUS_MARGIN + 1).min(w);
-
-            annulus_vals.clear();
-            for r in r0..r1 {
-                let row_off = r * w;
-                for c in c0..c1 {
-                    let i = row_off + c;
-                    if labels[i] == 0 {
-                        annulus_vals.push(gray[i]);
-                    }
-                }
-            }
-
-            // Median of annulus (residual local background in bg-subtracted image).
-            let local_bg = median_f32(&mut annulus_vals) as f64;
-
-            // --- Pass 2: re-accumulate intensity-weighted moments with local bg ---
-            sum_x = 0.0;
-            sum_y = 0.0;
-            sum_xx = 0.0;
-            sum_yy = 0.0;
-            sum_xy = 0.0;
-            sum_i = 0.0;
-
-            for r in min_row..=max_row {
-                let row_off = r * w;
-                for c in min_col..=max_col {
-                    let i = row_off + c;
-                    if labels[i] != blob_label {
-                        continue;
-                    }
-                    let intensity = (gray[i] as f64 - local_bg).max(0.0);
+                    let intensity = (raw as f64 - local_bg).max(0.0);
                     let dx = c as f64 - ref_col as f64;
                     let dy = r as f64 - ref_row as f64;
                     sum_x += dx * intensity;
@@ -716,6 +653,16 @@ fn compute_blob_centroids(
             let cxx = sum_xx / sum_i - dx_bar * dx_bar;
             let cyy = sum_yy / sum_i - dy_bar * dy_bar;
             let cxy = sum_xy / sum_i - dx_bar * dy_bar;
+
+            // Elongation filter — judged on the same intensity-weighted
+            // moments reported as `cov` (they were historically computed
+            // against the *global* background in a separate first pass,
+            // so elongation and cov could disagree on marginal blobs).
+            if let Some(max_elong) = config.max_elongation {
+                if elongation_from_cov(cxx, cyy, cxy) > max_elong {
+                    return None;
+                }
+            }
 
             let (pc, pr) = (peak_col, peak_row);
             // 3x3 grid of background-subtracted values around the peak
