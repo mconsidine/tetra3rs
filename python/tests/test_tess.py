@@ -43,7 +43,7 @@ class TestTessMultiImageCalibration:
             ext = tetra3rs.extract_centroids(
                 image,
                 sigma_threshold=180.0,
-                min_pixels=4,
+                min_pixels=3,
                 max_pixels=10000,
                 local_bg_block_size=16,
                 max_elongation=6.0,
@@ -124,7 +124,7 @@ class TestTessMultiImageCalibration:
                 f'vs WCS={sep:.2f}"'
             )
 
-            assert rmse < 25.0, f'Sector {sector}: RMSE {rmse:.1f}" exceeds 25"'
+            assert rmse < 15.0, f'Sector {sector}: RMSE {rmse:.1f}" exceeds 15"'
             assert sep < 10.0, f'Sector {sector}: WCS separation {sep:.1f}" exceeds 10"'
 
     def test_radial_calibration(self, tess_db, tess_image_paths):
@@ -166,7 +166,7 @@ class TestTessMultiImageCalibration:
             ext = tetra3rs.extract_centroids(
                 image,
                 sigma_threshold=180.0,
-                min_pixels=4,
+                min_pixels=3,
                 max_pixels=10000,
                 local_bg_block_size=16,
                 max_elongation=6.0,
