@@ -1,0 +1,30 @@
+# Allowlist for mypy.stubtest against the tetra3rs stub:
+#
+#     python -m mypy.stubtest tetra3rs --allowlist python/stubtest-allowlist.txt
+#
+# Each line is a regex matched (fullmatch) against a stubtest error's object
+# path. Everything here is a benign PyO3/stubtest-convention mismatch, not real
+# stub drift. Note: allowlisting a path suppresses ALL stubtest errors for that
+# object, so keep entries as specific as possible.
+
+# PyO3 renders optional-argument defaults in __text_signature__ as `...` (it
+# cannot express the real value), so stubtest sees a runtime default of `...`
+# and flags it as different from the concrete default in the stub
+# (e.g. max_sharpness=0.9, solve_timeout_ms=5000). The concrete defaults are
+# kept deliberately — they drive accurate editor hints and are strictly more
+# informative than `...` — so the mismatch is accepted for these constructors
+# and functions.
+tetra3rs.RadialDistortion.__new__
+tetra3rs.SolverDatabase.generate_from_gaia
+tetra3rs.SolverDatabase.solve_from_centroids
+tetra3rs.extract_centroids
+tetra3rs.extract_centroids_fast
+
+# The runtime module defines __all__; the stub omits it. Every public name is
+# already declared in the stub, so re-listing them in an __all__ would only add
+# a second thing to keep in sync.
+tetra3rs.__all__
+
+# The compiled extension submodule (the .so) has no separate stub of its own;
+# the public API is re-exported and stubbed at the package level.
+tetra3rs.tetra3rs

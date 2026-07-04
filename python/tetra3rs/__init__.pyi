@@ -13,8 +13,9 @@ __git_hash__: str
 import datetime
 import numpy as np
 import numpy.typing as npt
-from typing import Optional, Union, overload
+from typing import Optional, Union, final, overload
 
+@final
 class CameraModel:
     """Camera intrinsics model: focal length, optical center, parity, and distortion.
 
@@ -134,6 +135,7 @@ class CameraModel:
         ...
 
 
+@final
 class CalibrateResult:
     """Result of camera calibration.
 
@@ -176,6 +178,7 @@ class CalibrateResult:
         ...
 
 
+@final
 class SolveResult:
     """Result of a successful plate-solve.
 
@@ -363,6 +366,7 @@ class SolveResult:
         """
         ...
 
+@final
 class SolveFailure:
     """A failed plate-solve attempt: why it failed and how long it took.
 
@@ -401,6 +405,7 @@ class SolveFailure:
         """Wall-clock time spent before giving up, in milliseconds."""
         ...
 
+@final
 class CatalogStar:
     """A star from the solver catalog.
 
@@ -427,6 +432,7 @@ class CatalogStar:
         """Visual magnitude."""
         ...
 
+@final
 class ExtractionResult:
     """Result of centroid extraction from an image.
 
@@ -473,6 +479,7 @@ class ExtractionResult:
         """Number of raw blobs before filtering."""
         ...
 
+@final
 class Centroid:
     """A detected star centroid with position, brightness, and shape.
 
@@ -546,6 +553,7 @@ class Centroid:
         """
         ...
 
+@final
 class SolverDatabase:
     """A star pattern database for plate solving.
 
@@ -883,6 +891,7 @@ class SolverDatabase:
         """
         ...
 
+@final
 class RadialDistortion:
     """Brown-Conrady radial+tangential distortion model.
 
@@ -971,6 +980,7 @@ class RadialDistortion:
         """Inverse distortion: distorted → ideal."""
         ...
 
+@final
 class PolynomialDistortion:
     """SIP-like polynomial distortion model with independent x,y correction terms.
 
