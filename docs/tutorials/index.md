@@ -22,5 +22,5 @@ Demonstrates multi-image camera calibration using 10 TESS images from the same C
 
 - Solving multiple images with shared camera parameters
 - Iterative calibration passes with progressively tighter match radius and higher polynomial order
-- Achieving sub-10″ RMSE and sub-3″ agreement with FITS WCS
+- Achieving ~1–2″ per-sector solve RMSE and sub-3″ agreement with FITS WCS
 - Visualization of matched centroids across all images

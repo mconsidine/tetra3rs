@@ -26,6 +26,7 @@ macro_rules! timed {
 
 pub(crate) mod combinations;
 pub(crate) mod database;
+pub(crate) mod matching;
 pub(crate) mod pattern;
 #[cfg(feature = "profile")]
 pub mod profiling;
@@ -297,6 +298,59 @@ impl Default for GenerateDatabaseConfig {
     }
 }
 
+impl GenerateDatabaseConfig {
+    /// Validate that the generation parameters are self-consistent, before they
+    /// drive index arithmetic that would otherwise overflow, divide by zero, or
+    /// silently corrupt every pattern key. Returns [`crate::Error::InvalidInput`]
+    /// with a specific message for the first offending field.
+    pub fn validate(&self) -> crate::Result<()> {
+        use crate::Error::InvalidInput;
+        if !(self.max_fov_deg.is_finite() && self.max_fov_deg > 0.0 && self.max_fov_deg < 180.0) {
+            return Err(InvalidInput(format!(
+                "max_fov_deg must be in (0, 180), got {}",
+                self.max_fov_deg
+            )));
+        }
+        if let Some(min_fov) = self.min_fov_deg {
+            if !(min_fov.is_finite() && min_fov > 0.0 && min_fov <= self.max_fov_deg) {
+                return Err(InvalidInput(format!(
+                    "min_fov_deg must be in (0, max_fov_deg={}], got {}",
+                    self.max_fov_deg, min_fov
+                )));
+            }
+        }
+        // bins = round(0.25 / pattern_max_error). Values above 0.25 round to a
+        // single bin (degenerate hash — every key dimension collapses), so the
+        // documented valid range is (0, 0.25].
+        if !(self.pattern_max_error.is_finite()
+            && self.pattern_max_error > 0.0
+            && self.pattern_max_error <= 0.25)
+        {
+            return Err(InvalidInput(format!(
+                "pattern_max_error must be finite and in (0, 0.25], got {}",
+                self.pattern_max_error
+            )));
+        }
+        // fov_divisions uses ln(multiscale_step) as a divisor; step <= 1 gives a
+        // zero/negative log and an infinite/NaN division count.
+        if !(self.multiscale_step.is_finite() && self.multiscale_step > 1.0) {
+            return Err(InvalidInput(format!(
+                "multiscale_step must be finite and > 1.0, got {}",
+                self.multiscale_step
+            )));
+        }
+        if self.verification_stars_per_fov == 0 {
+            return Err(InvalidInput(
+                "verification_stars_per_fov must be >= 1".into(),
+            ));
+        }
+        if self.catalog_nside == 0 {
+            return Err(InvalidInput("catalog_nside must be >= 1".into()));
+        }
+        Ok(())
+    }
+}
+
 // ── Configuration for plate solving ─────────────────────────────────────────
 
 /// Parameters controlling the plate-solve attempt.
@@ -343,7 +397,18 @@ pub struct SolveConfig {
     // ── Matching & verification (both modes) ──
     /// Maximum match distance as a fraction of the FOV. Default 0.01.
     pub match_radius: f32,
-    /// False-positive probability threshold. Default 1e-5.
+    /// False-positive probability budget for accepting a solution.
+    /// Default 1e-5.
+    ///
+    /// Each candidate attitude's verification yields a binomial p-value (the
+    /// probability that a wrong attitude would coincidentally match as many
+    /// stars); candidate `k` of a lost-in-space search is accepted when
+    /// `p·k < match_threshold` — a sequential Bonferroni correction over the
+    /// candidates actually tested, so the total false-accept probability of a
+    /// full search stays within a small (logarithmic) multiple of this
+    /// budget. Tracking tests a single hinted candidate against the budget
+    /// directly. Raising this (e.g. `1e-3`) accepts weaker evidence — useful
+    /// for very sparse fields (≲7 stars) at increased false-positive risk.
     pub match_threshold: f64,
     /// Timeout in milliseconds. None = no timeout. Default 5000.
     pub solve_timeout_ms: Option<u64>,
@@ -374,7 +439,7 @@ pub struct SolveConfig {
     /// lost-in-space pattern-hash search unless [`SolveConfig::strict_hint`]
     /// is set.
     ///
-    /// The quaternion uses the same convention as [`SolveResult::qicrs2cam`]:
+    /// The quaternion uses the same convention as [`Solution::qicrs2cam`]:
     /// it rotates ICRS vectors into the camera frame. Pass the previous
     /// frame's `qicrs2cam` to chain solves at video rate.
     ///
@@ -479,8 +544,10 @@ impl SolveConfig {
     /// Pixel scale in radians per pixel (horizontal): `1 / focal_length_px`.
     ///
     /// Returns `0.0` when the camera model is the unconfigured
-    /// `Default::default()` placeholder (zero image width).
-    pub fn pixel_scale(&self) -> f32 {
+    /// `Default::default()` placeholder (zero image width). Crate-internal: the
+    /// `0.0`-means-unconfigured sentinel is an implementation detail (Python
+    /// exposes pixel scale via `CameraModel.pixel_scale`).
+    pub(crate) fn pixel_scale(&self) -> f32 {
         if self.camera_model.image_width > 0 && self.camera_model.focal_length_px > 0.0 {
             self.camera_model.pixel_scale() as f32
         } else {
@@ -512,7 +579,9 @@ pub struct Solution {
     pub p90e_rad: f32,
     /// Maximum angular residual (radians).
     pub max_err_rad: f32,
-    /// False-positive probability (lower is better).
+    /// False-positive probability of the accepted match (lower is better):
+    /// the verification p-value after the multiple-comparison correction
+    /// that was tested against [`SolveConfig::match_threshold`].
     pub prob: f64,
     /// Wall-clock time spent solving, in milliseconds.
     pub solve_time_ms: f32,
@@ -525,10 +594,6 @@ pub struct Solution {
     pub matched_catalog_ids: Vec<i64>,
     /// Indices into the input centroid slice for each match.
     pub matched_centroid_indices: Vec<usize>,
-    /// Image width in pixels (used for coordinate transforms).
-    pub image_width: u32,
-    /// Image height in pixels (used for coordinate transforms).
-    pub image_height: u32,
     /// WCS CD matrix: `[[CD11, CD12], [CD21, CD22]]` in tangent-plane radians per pixel.
     ///
     /// Maps pixel offsets from the optical center (CRPIX) to gnomonic tangent-plane
@@ -610,4 +675,30 @@ pub(crate) fn focal_length_from_fov(image_width: u32, fov_rad: f64) -> f64 {
 /// `pixel_scale = 1 / focal_length_from_fov(...)`.
 pub(crate) fn pixel_scale_from_fov(image_width: u32, fov_rad: f64) -> f64 {
     1.0 / focal_length_from_fov(image_width, fov_rad)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_config_validate_accepts_default() {
+        assert!(GenerateDatabaseConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn generate_config_validate_rejects_bad_values() {
+        let bad = |f: fn(&mut GenerateDatabaseConfig)| {
+            let mut c = GenerateDatabaseConfig::default();
+            f(&mut c);
+            assert!(c.validate().is_err());
+        };
+        bad(|c| c.multiscale_step = 1.0); // ln(1) == 0 → infinite divisions
+        bad(|c| c.pattern_max_error = 0.0); // bins → ∞
+        bad(|c| c.pattern_max_error = -0.001);
+        bad(|c| c.verification_stars_per_fov = 0); // divide by zero
+        bad(|c| c.catalog_nside = 0);
+        bad(|c| c.max_fov_deg = 0.0);
+        bad(|c| c.min_fov_deg = Some(40.0)); // > max_fov_deg (30)
+    }
 }

@@ -1,6 +1,301 @@
 # Changelog
 
-## Unreleased
+## 0.9.0
+
+### Upgrading from 0.8
+
+The short list — full details in the sections referenced below.
+
+- **CCL-path `sigma_threshold` now means true Gaussian sigmas** (the old
+  estimator ran ~40% low). Multiply configured values by ≈0.6 (e.g. `5.0` →
+  `3.0`) to keep your previous effective detection depth;
+  `FastCentroidConfig` is unaffected. See *Fixed — CCL-path noise estimator*.
+- **The matched filter is now on by default** (`matched_filter_sigma =
+  Some(1.5)`), with the detection threshold auto-compensated for the kernel's
+  noise suppression — no threshold retuning needed. Set `None` to opt out.
+  See *Changed — matched filter on by default*.
+- **`max_sharpness` defaults to `0.9`** — a hot-pixel / cosmic-ray gate that
+  passes any PSF spanning multiple pixels. Set `None` for severely
+  undersampled data (PSF FWHM below ~1.5 px, e.g. resampled survey cutouts).
+  See *Added — extraction quality gates*.
+- **`match_threshold` is now a per-solve false-accept budget** (sequential
+  correction over candidates actually tested), and `SolveResult.prob` is the
+  corrected p-value. Weakly-evidenced solves that previously passed only on
+  the old arithmetic's optimism may now fail — raise `match_threshold` (e.g.
+  `1e-3`) to accept them explicitly. See *Changed — verification statistics
+  recalibrated*.
+- **Breaking (Rust):** `CentroidExtractionConfig.use_8_connectivity` is
+  removed — detection is 8-connected by construction. Python is unaffected.
+  See *Changed (breaking) — one run-length detection core*.
+- **Serialized artifacts:** Python `SolveResult` pickles saved by 0.8.0 do
+  not load — the `Solution` wire format changed (the write-only
+  `image_width` / `image_height` fields were removed; the same values live in
+  `Solution.camera_model`). Re-pickle after upgrading. Saved solver databases
+  are unaffected. See *Changed (breaking)*.
+
+### Changed (breaking) — one run-length detection core; `use_8_connectivity` removed
+
+Both extraction paths now detect through a single run-length union-find core
+(`sweep_runs`): a raster sweep turns the threshold predicate into horizontal
+runs, merges 8-connected runs across rows, and hands each caller its regions
+as run lists. The quality path no longer materializes a u8 mask or a u32
+labels buffer (~10 MB at 2 Mpix) and its per-blob stages iterate run lists
+in the same row-major order as before (moment sums bit-identical; TESS
+calibration metrics unchanged to the last digit). Measured on 2048² TESS
+frames: CCL extraction ~42 → ~26 ms (cumulative 71.5 → 26 ms this release),
+fast path ~23 → ~15-20 ms.
+
+**Breaking:** `CentroidExtractionConfig.use_8_connectivity` is removed —
+run merging is 8-connected by construction (4-connectivity was never useful
+for stars). The Python API is unaffected (it always used 8-connectivity).
+
+### Changed — matched filter on by default, threshold auto-compensated
+
+- **`matched_filter_sigma` defaults to `Some(1.5)`** (was `None`): every
+  serious point-source detector convolves before thresholding; for a
+  σ≈1.5 px PSF the peak-SNR gain is ~2× (≈0.75 mag more detection depth at
+  the same false-positive rate), with a broad optimum (σ within ~2× of the
+  true PSF width). Set `None` to threshold unfiltered.
+- **The detection threshold is now scaled by the kernel's noise-suppression
+  factor** (Σk² of the separable blur), so `sigma_threshold` means "sigmas
+  of the noise actually present in the thresholded image" with the filter on
+  or off — toggling the filter no longer requires retuning the threshold.
+  `ExtractionResult.threshold` reports the threshold actually applied.
+- **The filter now convolves the unclamped residual.** Previously it blurred
+  the zero-clamped background-subtracted image, rectifying negative noise
+  into a positive DC offset that silently loosened the effective threshold.
+
+### Changed — sub-pixel peak refinement fits log intensity
+
+The 3×3 parabola refinement (both extraction paths) now fits **log**
+intensity when all nine background-subtracted samples are positive: a
+Gaussian PSF is exactly quadratic in `ln(v)`, which removes the linear fit's
+S-curve bias (~0.05–0.1 px at quarter-pixel peak phases). Blobs with
+non-positive samples in the window keep the linear fit. Measured on the TESS
+10-image multi-sector calibration: pooled fit residual 0.132 → 0.077 px
+(−42%) and typical per-sector solve RMSE 2.5–2.9″ → 1.0–1.7″.
+
+### Added — fast-path trail/streak rejection and covariance
+
+`FastCentroidConfig` gains `max_pixels` (default 10000 — without it a
+satellite trail or bloomed region becomes the *brightest* centroid handed to
+the solver) and `max_elongation` (opt-in; moment-based elongation is noisy
+for few-pixel regions). The fast path now accumulates intensity-weighted
+second moments inline (merged through union-find), so it also populates
+`Centroid.cov` like the CCL path. Note the coarse background grid already
+absorbs structure larger than a block (~64 px) before these filters see it;
+`max_pixels` matters for sharp bloomed regions, `max_elongation` for trails.
+
+### Added — `border_margin`
+
+Both extraction configs gain `border_margin` (default 0 = off): drop blobs
+whose bounding box comes within the margin of an image edge. A star cut off
+by the frame boundary has a truncated PSF, biasing its center-of-mass toward
+the interior — a plausible but wrong position that previously only the 3×3
+parabola refinement guarded against (by falling back to that biased CoM).
+
+### Added — opt-in deblending, centroid-accuracy characterization
+
+- **`deblend: DeblendMode`** (CCL path, default `Off`): a blended star pair
+  produces one centroid at the flux-weighted midpoint — a wrong position the
+  pattern hash will consume. `Reject` drops blobs with more than one distinct
+  intensity peak (strict 8-neighborhood maxima above 30% of the blob peak,
+  > 2 px apart); saturated blobs are exempt (plateau noise fakes maxima on a
+  genuinely single star). Python: `deblend="off" | "reject"`.
+- A deterministic ensemble test characterizes centroid accuracy across
+  sub-pixel phases (bright stars: ~0.004–0.006 px RMSE at PSF σ 0.9–1.5 px)
+  and guards against sub-pixel regressions.
+
+### Added — extraction quality gates
+
+- **`max_sharpness`** (both extraction configs): DAOFIND-style hot-pixel /
+  cosmic-ray gate — rejects blobs whose peak sharpness
+  `(peak − mean(8 neighbors))/peak` exceeds the limit, measured on the
+  unfiltered background-subtracted image (so a matched-filter-smeared hot
+  pixel is still caught). **Defaults to 0.9**, which passes any system whose
+  PSF spans multiple pixels (a critically sampled PSF scores ~0.5, a strongly
+  undersampled one ~0.85, a hot pixel ~1.0). Set `None` for severely
+  undersampled data (PSF FWHM below ~1.5 px, e.g. resampled survey cutouts),
+  where real stars are geometrically indistinguishable from hot pixels.
+- **`saturation_level`** (both extraction configs): blobs whose peak reaches
+  the sensor's saturation level skip quadratic sub-pixel peak refinement (a
+  flat-topped or bloomed profile has no meaningful maximum) and keep the
+  center-of-mass position. Off by default.
+
+### Fixed — Python `calibrate_camera` accepts `SolveFailure` items
+
+The Rust calibrate API accepts failed solves in its input slice and skips
+them; the Python binding raised `TypeError` on any `SolveFailure` in the
+list, forcing callers to filter (and mis-align their centroid lists). Mixed
+lists now pass straight through. (Latent until this release — under the
+recalibrated verification statistics, marginal solves can legitimately fail,
+so mixed lists are the norm for the tiered calibration workflow.)
+
+### Fixed — CCL-path noise estimator (`sigma_threshold` semantics)
+
+`extract_centroids_from_raw` / `extract_centroids_from_image` (the CCL path)
+underestimated the background noise by ~40%: sigma was computed as the RMS of
+below-median pixels about their *own mean* — for Gaussian noise the lower
+half-distribution has std ≈ 0.60σ — instead of about the *median*, whose
+lower-half second moment equals the full variance (the estimator the
+docstring described, and the one the fast path already used). In practice a
+configured `sigma_threshold: 5.0` was really a ~3σ cut, the two extraction
+paths applied materially different effective thresholds for the same setting,
+and `ExtractionResult.background_sigma` was wrong as a diagnostic.
+
+**Migration:** the CCL path's `sigma_threshold` now means true Gaussian
+sigmas. To keep your previous effective detection depth, multiply configured
+values by ≈0.6 (e.g. `5.0` → `3.0`); leave them unchanged to get the
+threshold you had nominally been asking for. `FastCentroidConfig` is
+unaffected (it was already correct).
+
+### Changed — verification statistics recalibrated (solve-acceptance semantics)
+
+The lost-in-space acceptance test was rebuilt around honest statistics; no
+public API changed, but what the solver accepts (and how fast it fails) did:
+
+- **Null model measured, not assumed.** The false-positive probability of a
+  match count now uses the *measured* density of projected catalog stars over
+  the frame with the correct π·r² disc area. The previous `num_nearby·mr²`
+  under-predicted coincidence rates 2-3× per match — compounding to a latent
+  false-accept vulnerability in dense fields (a wrong-attitude TESS candidate
+  matching 113 stars by pure coincidence scored as a 10⁻¹⁴ certainty; it is
+  now correctly rejected at p≈1).
+- **Hypothesis stars aren't evidence.** The 4 pattern stars that formed the
+  candidate are excluded from the binomial trials and successes (upstream
+  tetra3's flat "−2" heuristic dropped). Tracking verification, whose hint is
+  independent of the centroids, no longer takes any discount.
+- **Sequential multiple-comparison correction.** Candidate `k` is accepted at
+  `p·k < match_threshold` — a Bonferroni correction over candidates *actually
+  tested* rather than the old division by the database pattern count, which
+  over-corrected by 4-7 orders of magnitude and made clean sparse fields
+  (< ~7 stars) mathematically unsolvable at any signal quality.
+  `match_threshold` is now a per-solve false-accept budget (the total for a
+  full search is bounded by a small logarithmic multiple);
+  `Solution.prob` reports the corrected p-value.
+- **Post-refinement re-verification.** Acceptance is decided by re-verifying
+  the *refined* attitude at a radius tied to the refined RMSE. A true
+  candidate's matches sit within a few RMSE (its p-value collapses by tens of
+  orders when the radius tightens); a false candidate's coincidences are
+  uniform across the search radius and cannot be aligned by the 3-DOF fit.
+- **Robust to wrong FOV estimates at full speed.** Candidate vectors are
+  rebuilt at the FOV measured from each matched pattern, so the FOV sweep
+  collapses to a pattern-tolerance-derived step (usually a single value):
+  a 15%-wrong FOV estimate now solves in ~36 µs instead of ~21-40 ms, and
+  unsolvable fields fail in ~1.6 ms instead of ~12-29 ms (10° defaults).
+
+Measured consequences (synthetic 10° harness, 1000 fields each): 6-star
+fields 71% solvable and 8-star fields 92% (both 0% before by construction),
+zero wrong-attitude accepts across 1500 pure-noise fields and all solved
+scenarios. Real-sky solves that previously passed only by the old
+arithmetic's optimism — e.g. heavily distorted TESS frames solved with an
+uncalibrated camera model at tight `match_radius`, where the true-match rate
+barely exceeds chance — may now fail or time out; raise `match_threshold`
+(e.g. `1e-3`) to accept such weak evidence explicitly, or calibrate the
+distortion first (the tiered calibration flow does this automatically).
+
+### Changed (breaking)
+
+- **`Solution.image_width` / `Solution.image_height` removed.** They were
+  never read — `Solution.camera_model.image_width/height` carries the same
+  values. This changes the postcard pickle wire format, so Python
+  `SolveResult` pickles saved by 0.8.0 do not load; re-pickle after upgrading
+  (see *Upgrading from 0.8*). Saved solver databases are unaffected.
+
+- **`calibrate_camera` now returns `Result<CalibrateResult>`** (was
+  `CalibrateResult`). It returns `Error::InvalidInput` instead of fabricating a
+  camera model when the input has no successful solves, no parity consensus, or
+  too few matched points for any fit to complete (previously these produced an
+  identity model with a `0.1 rad` invented FOV or an `f64::MAX` RMSE, or
+  panicked). Rust callers must handle the `Result`; the Python
+  `SolverDatabase.calibrate_camera` now raises `ValueError` in these cases.
+- **`PolynomialDistortion::new` takes 4 arguments** `(order, scale, a, b)`
+  instead of 6 — the legacy inverse `ap`/`bp` coefficients are zero-filled
+  (the model inverts numerically via Newton). The Python constructor keeps
+  `ap_coeffs` / `bp_coeffs` as optional, ignored keyword arguments for
+  backward compatibility. The struct fields persist for binary-format
+  compatibility.
+- **`solve_from_centroids` (Python)** no longer requires `fov_estimate_*` or
+  `image_*` when a `camera_model` is given — the model already carries that
+  geometry. They remain required when `camera_model` is omitted.
+- Narrowed the public surface: `star_from_gaia` / `star_from_hipparcos`,
+  `SolveConfig::pixel_scale`, and the `StarCatalog` spatial-index fields are
+  now crate-private; `StarCatalog::{from_slice, query_stars_from_uvec}`,
+  `query_stars` (now test-only), and `PolynomialDistortion::is_zero` were
+  removed. `GaiaStar::{pmra, pmdec}` are now `f32` (were always-`Some`
+  `Option`s). Unused `HipparcosStar` uncertainty/parallax/`v_i` fields dropped.
+
+### Performance
+
+- **CCL extraction ~40% faster** (71.5 → ~42 ms on 2048² TESS frames,
+  matched filter on). Block medians are computed from a phase-staggered
+  stride subsample; the materialized full-image background buffer and its
+  separate subtraction passes are replaced by one fused pass that
+  interpolates the block grid on the fly (writing the filter's unclamped
+  input directly into the blur matrix); noise statistics run on subsampled
+  bilinear residuals with the same estimator. The fast path hoists the
+  row-constant half of its per-pixel bilinear out of the sweep (~10%).
+- **Faster no-match / wrong-FOV solves.** The FOV sweep step doubled to
+  `4·match_radius·fov` — measurements show verification tolerates the full
+  match radius of midpoint scale error, so half the sweep values cover the
+  same `fov_max_error` with identical solve rates. No-match fields drop
+  28.6 → 12.8 ms and a 15%-wrong FOV estimate 40.8 → 21.1 ms on the profiling
+  harness (10° FOV, ±2°).
+- **Faster refinement (~14% off easy-solve latency).** Phase-D re-association
+  projects catalog stars with a per-iteration rotation matrix instead of
+  per-star TAN trig (mathematically identical), and prunes its cached cone
+  list to stars that can still match while the cache is valid.
+- Candidate-key enumeration skips key tuples that violate the catalog's
+  ascending-ratio invariant (they can never hit); bounds the worst case for
+  wide `match_max_error` settings.
+
+### Fixed — 0.9 review pass
+
+- **`matched_centroid_indices` now always index the caller's input slice.**
+  When the solver dropped non-finite centroids it compacted the working list,
+  so every reported index at or beyond a drop point was shifted — silently
+  pairing wrong observed positions with catalog stars (and corrupting a
+  `calibrate_camera` distortion fit built from them). Indices are now
+  translated back through the drop map on both the LIS and tracking paths.
+- **Lost-in-space now requires ≥ 5 centroids** (was ≥ 4). A 4-centroid field
+  is all pattern stars with zero independent verification evidence, so it could
+  never pass acceptance at any `match_threshold`; it now returns `TooFew`
+  immediately instead of burning the whole FOV sweep to a silent `NoMatch`. The
+  tracking (attitude-hint) path is unchanged.
+- **`saturation_level` is compared against the raw sensor value on the default
+  CCL path**, not the background-subtracted residual. A clipped star's residual
+  peak sits below the clip level, so the saturation exemption never fired:
+  `deblend = Reject` could split genuinely single bright stars on plateau
+  noise, and the sub-pixel parabola ran on flat tops. Both extraction paths now
+  behave identically for a given `saturation_level`.
+- **The Gaia binary loader tolerates trailing bytes again.** The corrupt-header
+  guard now requires *at least* `num_stars × 36` data bytes rather than exactly
+  that — a `.bin` with padding/appended metadata (which 0.8 read fine) loads
+  instead of failing with `InvalidCatalog`; the truncation guard is preserved.
+- **`pattern_max_error` validation matches its documented `(0, 0.25]` range.**
+  Values in `(0.25, 0.5]` previously passed and quantized every key dimension
+  into a single degenerate bin; they are now rejected.
+- **Python numpy centroid parsing is zero-copy for native-`f64` arrays** again
+  (the common case): it tries a borrow first and only falls back to an
+  `astype("float64")` copy for other dtypes.
+
+### Fixed
+
+- **Robustness sweep** — hardened panics, OOM, and silent-garbage paths
+  reachable from ordinary input: centroid extraction rejects degenerate images
+  / bad config instead of panicking; NaN-safe medians throughout; the solver
+  caps the candidate-key enumeration (a large `match_max_error` could allocate
+  gigabytes), bounds the hash-probe walk on corrupt databases, and drops
+  non-finite centroids; `GenerateDatabaseConfig::validate` rejects
+  index-corrupting parameters; the Gaia loader validates its header before
+  allocating. Python bindings raise typed exceptions (`ValueError` / `IOError`
+  / `TypeError`) instead of aborting, accept big-endian (FITS) and non-`f64`
+  arrays, and normalize/validate `attitude_hint` quaternions and matrices.
+- **Type stubs** reconciled with the bindings: removed the phantom
+  `undistort_centroids` / `distort_centroids` functions and the nonexistent
+  `SolveResult.distortion` property (added the real `camera_model`), fixed the
+  `crpix` dtype and `@overload` forms, and added `SolveFailure` /
+  `extract_centroids_fast` to `__all__`. `CatalogStar` now pickles.
 
 ## 0.8.0
 

@@ -74,29 +74,23 @@ pub struct PolynomialDistortion {
 }
 
 impl PolynomialDistortion {
-    /// Create a new polynomial distortion model.
+    /// Create a new polynomial distortion model from the forward coefficients.
     ///
-    /// All coefficient vectors must have exactly `num_coeffs(order)` elements.
-    pub fn new(
-        order: u32,
-        scale: f64,
-        a_coeffs: Vec<f64>,
-        b_coeffs: Vec<f64>,
-        ap_coeffs: Vec<f64>,
-        bp_coeffs: Vec<f64>,
-    ) -> Self {
+    /// `a_coeffs` and `b_coeffs` must each have exactly `num_coeffs(order)`
+    /// elements. The legacy inverse (`ap`/`bp`) coefficients are zero-filled —
+    /// this crate inverts numerically (Newton) rather than storing an inverse
+    /// polynomial; the fields persist only for binary-format compatibility.
+    pub fn new(order: u32, scale: f64, a_coeffs: Vec<f64>, b_coeffs: Vec<f64>) -> Self {
         let n = num_coeffs(order);
         assert_eq!(a_coeffs.len(), n, "a_coeffs length mismatch");
         assert_eq!(b_coeffs.len(), n, "b_coeffs length mismatch");
-        assert_eq!(ap_coeffs.len(), n, "ap_coeffs length mismatch");
-        assert_eq!(bp_coeffs.len(), n, "bp_coeffs length mismatch");
         Self {
             order,
             scale,
             a_coeffs,
             b_coeffs,
-            ap_coeffs,
-            bp_coeffs,
+            ap_coeffs: vec![0.0; n],
+            bp_coeffs: vec![0.0; n],
         }
     }
 
@@ -186,14 +180,6 @@ impl PolynomialDistortion {
         }
 
         (x, y)
-    }
-
-    /// Returns `true` if all coefficients are zero.
-    pub fn is_zero(&self) -> bool {
-        self.a_coeffs.iter().all(|&c| c == 0.0)
-            && self.b_coeffs.iter().all(|&c| c == 0.0)
-            && self.ap_coeffs.iter().all(|&c| c == 0.0)
-            && self.bp_coeffs.iter().all(|&c| c == 0.0)
     }
 }
 
@@ -370,7 +356,7 @@ mod tests {
         b[coeff_index(0, 2)] = 0.012;
         b[coeff_index(3, 0)] = 0.001;
 
-        let d = PolynomialDistortion::new(4, 1024.0, a, b, vec![0.0; n], vec![0.0; n]);
+        let d = PolynomialDistortion::new(4, 1024.0, a, b);
 
         // Forward then back must roundtrip to within numerical precision.
         for &(x, y) in &[(0.0, 0.0), (100.0, -200.0), (500.0, 400.0), (-800.0, 100.0)] {
@@ -404,15 +390,7 @@ mod tests {
         a[coeff_index(2, 0)] = 0.01; // x² → dx
         b[coeff_index(0, 2)] = -0.005; // y² → dy
 
-        // Compute inverse from a grid (simple test)
-        let d = PolynomialDistortion::new(
-            4,
-            1024.0,
-            a,
-            b,
-            vec![0.0; n], // ap (inverse) not set here
-            vec![0.0; n], // bp
-        );
+        let d = PolynomialDistortion::new(4, 1024.0, a, b);
 
         // Forward: distort(0, 0) = (0, 0)
         let (xd, yd) = d.distort(0.0, 0.0);

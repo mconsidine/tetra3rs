@@ -8,7 +8,7 @@ use tetra3::solver::SolveResult;
 use tetra3::Centroid;
 
 use crate::centroid::PyCentroid;
-use crate::solve_result::PySolveResult;
+use crate::solve_result::{PySolveFailure, PySolveResult};
 
 /// Parse solve_results and centroids from Python objects.
 ///
@@ -17,20 +17,29 @@ pub(crate) fn parse_solve_results_and_centroids(
     solve_results: &Bound<'_, pyo3::PyAny>,
     centroids: &Bound<'_, pyo3::PyAny>,
 ) -> PyResult<(Vec<SolveResult>, Vec<Vec<Centroid>>)> {
-    // Try to extract as a single SolveResult first. Python-side results are
-    // always successful solves, so wrap each as `Ok` for the Rust API.
+    // Try to extract as a single SolveResult first. Lists may mix
+    // SolveResult and SolveFailure items — the Rust calibrate API accepts
+    // failures and skips them, so a caller can pass its solve outputs
+    // straight through without filtering.
     let sr_vec: Vec<SolveResult> = if let Ok(single) = solve_results.extract::<PySolveResult>() {
         vec![Ok(single.inner)]
     } else if let Ok(list) = solve_results.cast::<pyo3::types::PyList>() {
         list.iter()
             .map(|item| {
-                let sr: PySolveResult = item.extract()?;
-                Ok(Ok(sr.inner))
+                if let Ok(sr) = item.extract::<PySolveResult>() {
+                    Ok(Ok(sr.inner))
+                } else if let Ok(fail) = item.extract::<PySolveFailure>() {
+                    Ok(Err(fail.inner))
+                } else {
+                    Err(pyo3::exceptions::PyTypeError::new_err(
+                        "solve_results items must be SolveResult or SolveFailure objects",
+                    ))
+                }
             })
             .collect::<PyResult<Vec<SolveResult>>>()?
     } else {
         return Err(pyo3::exceptions::PyTypeError::new_err(
-            "solve_results must be a SolveResult or list of SolveResult objects",
+            "solve_results must be a SolveResult or list of SolveResult / SolveFailure objects",
         ));
     };
 
@@ -62,13 +71,32 @@ pub(crate) fn parse_centroids_single(
     centroids: &Bound<'_, pyo3::PyAny>,
 ) -> PyResult<Vec<Centroid>> {
     if let Ok(list) = centroids.cast::<pyo3::types::PyList>() {
-        list.iter()
+        return list
+            .iter()
             .map(|item| {
                 let c: PyCentroid = item.extract()?;
                 Ok(c.inner)
             })
-            .collect()
-    } else if let Ok(arr) = centroids.extract::<PyReadonlyArray2<f64>>() {
+            .collect();
+    }
+    // numpy array path. Accept any numeric 2-D dtype (float32, ints, big-endian
+    // FITS data, …). Extract a native-float64 array zero-copy when the caller
+    // already passed one (the documented common case); only fall back to an
+    // `astype("float64")` copy for other dtypes.
+    if centroids.hasattr("dtype").unwrap_or(false) {
+        // `converted` outlives the borrow so `arr` can reference it in the
+        // non-f64 fallback branch.
+        let converted;
+        let arr = if let Ok(arr) = centroids.extract::<PyReadonlyArray2<f64>>() {
+            arr
+        } else {
+            converted = centroids.call_method1("astype", ("float64",))?;
+            converted.extract::<PyReadonlyArray2<f64>>().map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err(
+                    "centroids array must be a 2-D numeric numpy array (Nx2 or Nx3)",
+                )
+            })?
+        };
         let a = arr.as_array();
         let ncols = a.shape()[1];
         if ncols < 2 {
@@ -76,7 +104,7 @@ pub(crate) fn parse_centroids_single(
                 "centroids array must have at least 2 columns (x, y)",
             ));
         }
-        Ok((0..a.shape()[0])
+        return Ok((0..a.shape()[0])
             .map(|i| Centroid {
                 x: a[[i, 0]] as f32,
                 y: a[[i, 1]] as f32,
@@ -87,11 +115,23 @@ pub(crate) fn parse_centroids_single(
                 },
                 cov: None,
             })
-            .collect())
-    } else {
-        Err(pyo3::exceptions::PyTypeError::new_err(
-            "centroids must be a list of Centroid objects or an Nx2/Nx3 numpy array",
-        ))
+            .collect());
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "centroids must be a list of Centroid objects or an Nx2/Nx3 numpy array",
+    ))
+}
+
+/// Map a `tetra3::Error` to the most appropriate Python exception type, so
+/// callers get `ValueError` for bad input, `IOError` for file problems, etc.,
+/// instead of an undifferentiated `RuntimeError`.
+pub(crate) fn map_tetra3_err(e: tetra3::Error) -> PyErr {
+    use pyo3::exceptions::{PyIOError, PyValueError};
+    match e {
+        tetra3::Error::InvalidInput(m) => PyValueError::new_err(m),
+        tetra3::Error::InvalidCatalog(m) => PyValueError::new_err(format!("invalid catalog: {m}")),
+        tetra3::Error::Io(e) => PyIOError::new_err(e.to_string()),
+        tetra3::Error::Postcard(e) => PyRuntimeError::new_err(format!("postcard error: {e}")),
     }
 }
 
@@ -101,6 +141,21 @@ pub(crate) fn parse_centroids_single(
 /// its error conversion are written once rather than per type.
 pub(crate) fn to_postcard_bytes<T: Serialize>(value: &T) -> PyResult<Vec<u8>> {
     postcard::to_allocvec(value).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+
+/// The shared `__reduce__` body for every pickled wrapper type: postcard-encode
+/// the inner value and pair it with the type's `_from_pickle_bytes`
+/// reconstructor. Each `#[pymethods]` block delegates here so the pickle
+/// plumbing exists once. (A macro emitting whole `#[pymethods]` blocks would
+/// need pyo3's `multiple-pymethods` feature and its `inventory` dependency,
+/// which isn't worth it for this.)
+pub(crate) fn pickle_reduce<T: Serialize>(
+    slf: &Bound<'_, impl pyo3::PyClass>,
+    inner: &T,
+) -> PyResult<(Py<PyAny>, (Vec<u8>,))> {
+    let bytes = to_postcard_bytes(inner)?;
+    let from_bytes = slf.as_any().get_type().getattr("_from_pickle_bytes")?;
+    Ok((from_bytes.unbind(), (bytes,)))
 }
 
 /// Deserialize a value from postcard bytes, mapping any error to a Python

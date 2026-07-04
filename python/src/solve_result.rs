@@ -256,9 +256,7 @@ impl PySolveResult {
     }
 
     fn __reduce__(slf: &Bound<'_, Self>) -> PyResult<(Py<PyAny>, (Vec<u8>,))> {
-        let bytes = crate::helpers::to_postcard_bytes(&slf.borrow().inner)?;
-        let from_bytes = slf.get_type().getattr("_from_pickle_bytes")?;
-        Ok((from_bytes.unbind(), (bytes,)))
+        crate::helpers::pickle_reduce(slf, &slf.borrow().inner)
     }
 
     #[staticmethod]
@@ -470,9 +468,7 @@ impl PySolveFailure {
     }
 
     fn __reduce__(slf: &Bound<'_, Self>) -> PyResult<(Py<PyAny>, (Vec<u8>,))> {
-        let bytes = crate::helpers::to_postcard_bytes(&slf.borrow().inner)?;
-        let from_bytes = slf.get_type().getattr("_from_pickle_bytes")?;
-        Ok((from_bytes.unbind(), (bytes,)))
+        crate::helpers::pickle_reduce(slf, &slf.borrow().inner)
     }
 
     #[staticmethod]

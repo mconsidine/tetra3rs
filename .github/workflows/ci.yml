@@ -10,6 +10,42 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Formatting + clippy, mirroring the .githooks/pre-push gate so every PR is
+  # checked (the hook only runs locally, on pushes to main). Separate job: no
+  # test data needed, runs in parallel with `test`.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-lint-
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (all targets, all features, warnings as errors)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Rustdoc (warnings as errors)
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -80,3 +116,73 @@ jobs:
 
       - name: Run Python tests
         run: pytest python/tests/ -v
+
+  # SemVer compatibility of the published `tetra3` crate against its last
+  # crates.io release. For 0.x, a breaking change requires a minor bump
+  # (0.8 -> 0.9); this job fails a PR that breaks the public API without one,
+  # catching the "forgot to bump" trap before publish. The PyO3 crate is
+  # publish=false, so only `tetra3` is checked.
+  semver:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check semver (tetra3 crate)
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          package: tetra3
+          feature-group: all-features
+
+  # Dependency advisories (RUSTSEC), license allow-list, and source checks
+  # for the whole tree. Configured by deny.toml at the repo root.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  # Verify the hand-written .pyi stub matches the compiled extension.
+  # mypy is PINNED: stubtest's error set is mypy-version-sensitive, and the
+  # allowlist (python/stubtest-allowlist.txt) is calibrated to this version.
+  # Bumping mypy is a deliberate step — change the pin, re-run, and update the
+  # allowlist if the error set moved. `--ignore-unused-allowlist` keeps a
+  # now-stale entry from failing CI on its own.
+  stubtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-stubtest-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-stubtest-
+            ${{ runner.os }}-cargo-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package + pinned mypy
+        run: |
+          pip install -e .
+          pip install 'mypy==2.1.0'
+
+      - name: stubtest
+        run: >
+          python -m mypy.stubtest tetra3rs
+          --allowlist python/stubtest-allowlist.txt
+          --ignore-unused-allowlist

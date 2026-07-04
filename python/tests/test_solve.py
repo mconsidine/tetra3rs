@@ -76,6 +76,14 @@ class TestCatalogAccess:
         mags = [s.magnitude for s in stars]
         assert mags == sorted(mags), "Cone search should return brightest first"
 
+    def test_catalog_star_pickle(self, skyview_db):
+        star = skyview_db.cone_search(83.0, -1.0, 5.0)[0]
+        star2 = pickle.loads(pickle.dumps(star))
+        assert star2.id == star.id
+        assert star2.ra_deg == star.ra_deg
+        assert star2.dec_deg == star.dec_deg
+        assert star2.magnitude == star.magnitude
+
 
 # ---------------------------------------------------------------------------
 # Solve from synthetic centroids
@@ -139,6 +147,57 @@ class TestSolveFromCentroids:
         )
         assert result
         assert result.status == "match_found"
+
+    def test_solve_with_camera_model_only(self, skyview_db):
+        """A CameraModel alone suffices — fov_estimate/image_* are optional."""
+        ra, dec = 83.0, -1.0
+        fov_deg = 10.0
+        image_size = 2048
+        f_px = image_size / (2.0 * math.tan(math.radians(fov_deg / 2.0)))
+
+        stars = skyview_db.cone_search(ra, dec, fov_deg)
+        centroids = project_stars_tan(stars[:50], ra, dec, f_px, image_size)
+
+        cam = tetra3rs.CameraModel.from_fov(fov_deg, image_size, image_size)
+        # No fov_estimate_* and no image_* — the model carries all geometry.
+        result = skyview_db.solve_from_centroids(
+            centroids, camera_model=cam, fov_max_error_deg=3.0
+        )
+        assert result, f"camera-model-only solve failed ({result})"
+        assert result.status == "match_found"
+
+    def test_solve_with_float32_centroid_array(self, skyview_db):
+        """An Nx2 float32 array is accepted (not just float64)."""
+        ra, dec = 83.0, -1.0
+        fov_deg = 10.0
+        image_size = 2048
+        f_px = image_size / (2.0 * math.tan(math.radians(fov_deg / 2.0)))
+
+        stars = skyview_db.cone_search(ra, dec, fov_deg)
+        centroid_objs = project_stars_tan(stars[:50], ra, dec, f_px, image_size)
+        arr = np.array([[c.x, c.y] for c in centroid_objs], dtype=np.float32)
+
+        result = skyview_db.solve_from_centroids(
+            arr,
+            fov_estimate_deg=fov_deg,
+            image_width=image_size,
+            image_height=image_size,
+            fov_max_error_deg=3.0,
+        )
+        assert result
+        assert result.status == "match_found"
+
+    def test_bad_attitude_hint_raises(self, skyview_db):
+        """A degenerate (zero-norm) quaternion hint raises ValueError."""
+        centroids = np.zeros((5, 2), dtype=np.float64)
+        with pytest.raises(ValueError):
+            skyview_db.solve_from_centroids(
+                centroids,
+                fov_estimate_deg=10.0,
+                image_width=2048,
+                image_height=2048,
+                attitude_hint=[0.0, 0.0, 0.0, 0.0],
+            )
 
     def test_solve_with_numpy_array_3col(self, skyview_db):
         """Verify centroids can be passed as Nx3 numpy array (x, y, brightness)."""

@@ -1,0 +1,36 @@
+# cargo-deny configuration. Enforced in CI (see .github/workflows/ci.yml).
+# Run locally with `cargo deny check`.
+
+[advisories]
+# Fail on security vulnerabilities in the dependency tree; specific
+# unmaintained-crate advisories with no available fix are ignored below.
+ignore = [
+    # atomic-polyfill is unmaintained (deprecation notice, not a
+    # vulnerability). Pulled in transitively via postcard -> heapless 0.7;
+    # there is no safe upgrade available. Re-evaluate when postcard/heapless
+    # drop the dependency.
+    "RUSTSEC-2023-0089",
+]
+
+[licenses]
+# Every license currently present in the dependency tree — all permissive
+# (`cargo deny list` enumerates them). Adding a dependency under a license not
+# in this list fails CI, forcing a conscious decision.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[bans]
+# Duplicate versions of a crate are a warning, not a hard failure — they are
+# common in transitive trees and not worth blocking a PR over.
+multiple-versions = "warn"
+
+[sources]
+# Only crates.io (and the workspace path deps) are expected.
+unknown-registry = "deny"
+unknown-git = "deny"

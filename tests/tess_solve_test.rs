@@ -444,16 +444,16 @@ fn test_tess_fits_solve() {
         // TESS images have high background (~150-200 DN). Saturated stars
         // create elongated blobs, so max_elongation is set high (30.0).
         let extract_config = CentroidExtractionConfig {
-            sigma_threshold: 250.0,
+            sigma_threshold: 150.0,
             min_pixels: 3,
             max_pixels: 10000,
             max_centroids: None,
             sigma_clip_iterations: 5,
             sigma_clip_factor: 3.0,
-            use_8_connectivity: true,
             local_bg_block_size: Some(128),
             max_elongation: Some(30.0),
             matched_filter_sigma: None,
+            ..Default::default()
         };
 
         let extraction = tetra3::extract_centroids_from_raw(
@@ -599,7 +599,7 @@ fn bench_fast_vs_ccl_extraction() {
         let true_boresight = radec_to_uvec(b_ra, b_dec);
 
         let ccl_config = CentroidExtractionConfig {
-            sigma_threshold: 250.0,
+            sigma_threshold: 150.0,
             min_pixels: 3,
             max_pixels: 10000,
             local_bg_block_size: Some(128),
@@ -613,6 +613,7 @@ fn bench_fast_vs_ccl_extraction() {
             bg_grid: 128,
             min_pixels: 3,
             max_centroids: None,
+            ..Default::default()
         };
 
         let best = |f: &dyn Fn() -> usize| -> (f64, usize) {
@@ -765,16 +766,16 @@ fn test_tess_distortion_fit_and_center_accuracy() {
 
         // ── Extract centroids ──
         let extract_config = CentroidExtractionConfig {
-            sigma_threshold: 250.0,
+            sigma_threshold: 150.0,
             min_pixels: 3,
             max_pixels: 10000,
             max_centroids: None,
             sigma_clip_iterations: 5,
             sigma_clip_factor: 3.0,
-            use_8_connectivity: true,
             local_bg_block_size: Some(128),
             max_elongation: Some(30.0),
             matched_filter_sigma: None,
+            ..Default::default()
         };
 
         let extraction = tetra3::extract_centroids_from_raw(
@@ -824,7 +825,8 @@ fn test_tess_distortion_fit_and_center_accuracy() {
                 model: DistortionModelType::Polynomial { order: 4 },
                 ..CalibrateConfig::default()
             },
-        );
+        )
+        .expect("calibration should succeed");
         println!(
             "  Calibration: RMSE {:.3} -> {:.3} px, {} inliers, {} outliers",
             cal_result.rmse_before_px,
@@ -965,16 +967,16 @@ fn test_tess_multi_image_calibration() {
 
     // ── Extract centroids from all images up front ──
     let extract_config = CentroidExtractionConfig {
-        sigma_threshold: 300.0,
+        sigma_threshold: 180.0,
         min_pixels: 3,
         max_pixels: 10000,
         max_centroids: None,
         sigma_clip_iterations: 5,
         sigma_clip_factor: 3.0,
-        use_8_connectivity: true,
         local_bg_block_size: Some(16),
         max_elongation: Some(6.0),
         matched_filter_sigma: None,
+        ..Default::default()
     };
 
     struct ImageData {
@@ -1142,7 +1144,8 @@ fn test_tess_multi_image_calibration() {
                 },
                 ..CalibrateConfig::default()
             },
-        );
+        )
+        .expect("calibration should succeed");
 
         println!(
             "    Calibration: RMSE {:.3} -> {:.3} px, {} inliers, {} outliers",

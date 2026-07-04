@@ -10,24 +10,19 @@
 //! as of 2025-11-15.
 
 /// A star from the Hipparcos catalog.
+///
+/// Only the fields the solver consumes (position, proper motion, and the
+/// magnitude/colour used for the Hp→V transform) are parsed and stored; the
+/// catalog's per-field uncertainties, parallax, and V−I colour are skipped.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HipparcosStar {
     pub hip: u32,
     pub ra_rad: f64,
     pub dec_rad: f64,
-    pub plx: f64,
     pub pm_ra: f64,
     pub pm_dec: f64,
-    pub e_ra_rad: f64,
-    pub e_dec_rad: f64,
-    pub e_plx: f64,
-    pub e_pm_ra: f64,
-    pub e_pm_dec: f64,
     pub hpmag: f32,
-    pub e_hpmag: f32,
     pub b_v: f32,
-    pub e_b_v: f32,
-    pub v_i: f32,
 }
 
 impl HipparcosStar {
@@ -47,7 +42,8 @@ impl HipparcosStar {
 
 /// Parse a single Hipparcos catalog record into a `HipparcosStar`.
 fn parse_hipparcos_star(record: &str) -> Option<HipparcosStar> {
-    if record.len() < 171 {
+    // Highest column offset the parser reads is the B−V field ending at 158.
+    if record.len() < 158 {
         return None;
     }
 
@@ -55,19 +51,10 @@ fn parse_hipparcos_star(record: &str) -> Option<HipparcosStar> {
         hip: record[0..6].trim().parse().ok()?,
         ra_rad: record[15..28].trim().parse().ok()?,
         dec_rad: record[29..42].trim().parse().ok()?,
-        plx: record[43..50].trim().parse().ok()?,
         pm_ra: record[51..59].trim().parse().ok()?,
         pm_dec: record[60..68].trim().parse().ok()?,
-        e_ra_rad: record[69..75].trim().parse().ok()?,
-        e_dec_rad: record[76..82].trim().parse().ok()?,
-        e_plx: record[83..89].trim().parse().ok()?,
-        e_pm_ra: record[90..96].trim().parse().ok()?,
-        e_pm_dec: record[97..103].trim().parse().ok()?,
         hpmag: record[129..136].trim().parse().ok()?,
-        e_hpmag: record[137..143].trim().parse().ok()?,
         b_v: record[152..158].trim().parse().ok()?,
-        e_b_v: record[159..164].trim().parse().ok()?,
-        v_i: record[165..171].trim().parse().ok()?,
     })
 }
 
@@ -80,7 +67,20 @@ pub fn load_hipparcos_catalog_from_file<P: AsRef<std::path::Path>>(
     path: P,
 ) -> crate::Result<Vec<HipparcosStar>> {
     let data = std::fs::read_to_string(path)?;
-    Ok(load_hipparcos_catalog(&data))
+    let total_lines = data.lines().filter(|l| !l.trim().is_empty()).count();
+    let stars = load_hipparcos_catalog(&data);
+    // A wrong-format file parses to zero stars but would otherwise build a
+    // useless (empty) database without any error; surface that here.
+    if total_lines > 0 && stars.is_empty() {
+        return Err(crate::error::Error::InvalidCatalog(format!(
+            "Hipparcos catalog: parsed 0 stars from {total_lines} non-empty lines (wrong format?)"
+        )));
+    }
+    let dropped = total_lines - stars.len();
+    if dropped > 0 {
+        tracing::warn!("Hipparcos catalog: skipped {dropped} unparseable line(s)");
+    }
+    Ok(stars)
 }
 
 #[cfg(test)]

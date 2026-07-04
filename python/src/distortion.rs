@@ -119,9 +119,7 @@ impl PyRadialDistortion {
     }
 
     fn __reduce__(slf: &Bound<'_, Self>) -> PyResult<(Py<PyAny>, (Vec<u8>,))> {
-        let bytes = crate::helpers::to_postcard_bytes(&slf.borrow().inner)?;
-        let from_bytes = slf.get_type().getattr("_from_pickle_bytes")?;
-        Ok((from_bytes.unbind(), (bytes,)))
+        crate::helpers::pickle_reduce(slf, &slf.borrow().inner)
     }
 
     #[staticmethod]
@@ -155,7 +153,7 @@ impl PyRadialDistortion {
 
 /// SIP-like polynomial distortion model with independent x,y correction terms.
 ///
-/// Forward:  x_d = x + Σ A_pq · (x/s)^p · (y/s)^q   (2 ≤ p+q ≤ order)
+/// Forward:  x_d = x + Σ A_pq · (x/s)^p · (y/s)^q   (0 ≤ p+q ≤ order)
 /// Inverse:  x_i = x_d + Σ AP_pq · (x_d/s)^p · (y_d/s)^q
 ///
 /// Where s = scale = image_width/2.
@@ -189,39 +187,39 @@ pub(crate) struct PyPolynomialDistortion {
 
 #[pymethods]
 impl PyPolynomialDistortion {
-    /// Create a polynomial distortion model from coefficient arrays.
+    /// Create a polynomial distortion model from forward coefficient arrays.
     ///
     /// Args:
     ///     order: Polynomial order (2–6 typical).
     ///     scale: Normalization scale (typically image_width / 2).
     ///     a_coeffs: Forward A coefficients (x correction, ideal → distorted).
     ///     b_coeffs: Forward B coefficients (y correction, ideal → distorted).
-    ///     ap_coeffs: Inverse AP coefficients (x correction, distorted → ideal).
-    ///     bp_coeffs: Inverse BP coefficients (y correction, distorted → ideal).
+    ///     ap_coeffs: Deprecated and ignored — the model inverts numerically
+    ///         (Newton). Accepted only for backward compatibility.
+    ///     bp_coeffs: Deprecated and ignored. See ap_coeffs.
     #[new]
+    #[pyo3(signature = (order, scale, a_coeffs, b_coeffs, ap_coeffs=None, bp_coeffs=None))]
     fn new(
         order: u32,
         scale: f64,
         a_coeffs: Vec<f64>,
         b_coeffs: Vec<f64>,
-        ap_coeffs: Vec<f64>,
-        bp_coeffs: Vec<f64>,
+        ap_coeffs: Option<Vec<f64>>,
+        bp_coeffs: Option<Vec<f64>>,
     ) -> PyResult<Self> {
+        let _ = (ap_coeffs, bp_coeffs); // legacy inverse coeffs are no longer used
         let n = poly_num_coeffs(order);
-        if a_coeffs.len() != n
-            || b_coeffs.len() != n
-            || ap_coeffs.len() != n
-            || bp_coeffs.len() != n
-        {
+        if a_coeffs.len() != n || b_coeffs.len() != n {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Each coefficient array must have {} elements for order {} (got a={}, b={}, ap={}, bp={})",
-                n, order, a_coeffs.len(), b_coeffs.len(), ap_coeffs.len(), bp_coeffs.len()
+                "a_coeffs and b_coeffs must each have {} elements for order {} (got a={}, b={})",
+                n,
+                order,
+                a_coeffs.len(),
+                b_coeffs.len()
             )));
         }
         Ok(Self {
-            inner: PolynomialDistortion::new(
-                order, scale, a_coeffs, b_coeffs, ap_coeffs, bp_coeffs,
-            ),
+            inner: PolynomialDistortion::new(order, scale, a_coeffs, b_coeffs),
         })
     }
 
@@ -276,9 +274,7 @@ impl PyPolynomialDistortion {
     }
 
     fn __reduce__(slf: &Bound<'_, Self>) -> PyResult<(Py<PyAny>, (Vec<u8>,))> {
-        let bytes = crate::helpers::to_postcard_bytes(&slf.borrow().inner)?;
-        let from_bytes = slf.get_type().getattr("_from_pickle_bytes")?;
-        Ok((from_bytes.unbind(), (bytes,)))
+        crate::helpers::pickle_reduce(slf, &slf.borrow().inner)
     }
 
     #[staticmethod]
