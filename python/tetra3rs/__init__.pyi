@@ -31,15 +31,15 @@ class CameraModel:
     @staticmethod
     def _from_pickle_bytes(data: bytes) -> "CameraModel": ...
 
-    def __init__(
-        self,
+    def __new__(
+        cls,
         focal_length_px: float,
         image_width: int,
         image_height: int,
         crpix: Optional[list[float]] = None,
         parity_flip: bool = False,
         distortion: Optional[Union["RadialDistortion", "PolynomialDistortion"]] = None,
-    ) -> None:
+    ) -> "CameraModel":
         """Create a camera model with explicit parameters.
 
         Args:
@@ -485,7 +485,7 @@ class Centroid:
     @staticmethod
     def _from_pickle_bytes(data: bytes) -> "Centroid": ...
 
-    def __init__(self, x: float, y: float, brightness: Optional[float] = None) -> None:
+    def __new__(cls, x: float, y: float, brightness: Optional[float] = None) -> "Centroid":
         """Create a new Centroid.
 
         Args:
@@ -923,15 +923,15 @@ class RadialDistortion:
     @staticmethod
     def _from_pickle_bytes(data: bytes) -> "RadialDistortion": ...
 
-    def __init__(
-        self,
+    def __new__(
+        cls,
         k1: float = 0.0,
         k2: float = 0.0,
         k3: float = 0.0,
         p1: float = 0.0,
         p2: float = 0.0,
         center: tuple[float, float] = (0.0, 0.0),
-    ) -> None: ...
+    ) -> "RadialDistortion": ...
     @property
     def k1(self) -> float:
         """First radial coefficient."""
@@ -1012,15 +1012,15 @@ class PolynomialDistortion:
     @staticmethod
     def _from_pickle_bytes(data: bytes) -> "PolynomialDistortion": ...
 
-    def __init__(
-        self,
+    def __new__(
+        cls,
         order: int,
         scale: float,
         a_coeffs: list[float],
         b_coeffs: list[float],
         ap_coeffs: Optional[list[float]] = None,
         bp_coeffs: Optional[list[float]] = None,
-    ) -> None:
+    ) -> "PolynomialDistortion":
         """Create a polynomial distortion model from forward coefficient arrays.
 
         a_coeffs and b_coeffs must each have exactly (order+1)(order+2)/2
