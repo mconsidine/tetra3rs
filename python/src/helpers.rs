@@ -80,15 +80,23 @@ pub(crate) fn parse_centroids_single(
             .collect();
     }
     // numpy array path. Accept any numeric 2-D dtype (float32, ints, big-endian
-    // FITS data, …) by casting to native float64 — not just the float64 the
-    // caller might not have built.
+    // FITS data, …). Extract a native-float64 array zero-copy when the caller
+    // already passed one (the documented common case); only fall back to an
+    // `astype("float64")` copy for other dtypes.
     if centroids.hasattr("dtype").unwrap_or(false) {
-        let arr_obj = centroids.call_method1("astype", ("float64",))?;
-        let arr = arr_obj.extract::<PyReadonlyArray2<f64>>().map_err(|_| {
-            pyo3::exceptions::PyTypeError::new_err(
-                "centroids array must be a 2-D numeric numpy array (Nx2 or Nx3)",
-            )
-        })?;
+        // `converted` outlives the borrow so `arr` can reference it in the
+        // non-f64 fallback branch.
+        let converted;
+        let arr = if let Ok(arr) = centroids.extract::<PyReadonlyArray2<f64>>() {
+            arr
+        } else {
+            converted = centroids.call_method1("astype", ("float64",))?;
+            converted.extract::<PyReadonlyArray2<f64>>().map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err(
+                    "centroids array must be a 2-D numeric numpy array (Nx2 or Nx3)",
+                )
+            })?
+        };
         let a = arr.as_array();
         let ncols = a.shape()[1];
         if ncols < 2 {

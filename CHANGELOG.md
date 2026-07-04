@@ -249,6 +249,36 @@ distortion first (the tiered calibration flow does this automatically).
   ascending-ratio invariant (they can never hit); bounds the worst case for
   wide `match_max_error` settings.
 
+### Fixed — 0.9 review pass
+
+- **`matched_centroid_indices` now always index the caller's input slice.**
+  When the solver dropped non-finite centroids it compacted the working list,
+  so every reported index at or beyond a drop point was shifted — silently
+  pairing wrong observed positions with catalog stars (and corrupting a
+  `calibrate_camera` distortion fit built from them). Indices are now
+  translated back through the drop map on both the LIS and tracking paths.
+- **Lost-in-space now requires ≥ 5 centroids** (was ≥ 4). A 4-centroid field
+  is all pattern stars with zero independent verification evidence, so it could
+  never pass acceptance at any `match_threshold`; it now returns `TooFew`
+  immediately instead of burning the whole FOV sweep to a silent `NoMatch`. The
+  tracking (attitude-hint) path is unchanged.
+- **`saturation_level` is compared against the raw sensor value on the default
+  CCL path**, not the background-subtracted residual. A clipped star's residual
+  peak sits below the clip level, so the saturation exemption never fired:
+  `deblend = Reject` could split genuinely single bright stars on plateau
+  noise, and the sub-pixel parabola ran on flat tops. Both extraction paths now
+  behave identically for a given `saturation_level`.
+- **The Gaia binary loader tolerates trailing bytes again.** The corrupt-header
+  guard now requires *at least* `num_stars × 36` data bytes rather than exactly
+  that — a `.bin` with padding/appended metadata (which 0.8 read fine) loads
+  instead of failing with `InvalidCatalog`; the truncation guard is preserved.
+- **`pattern_max_error` validation matches its documented `(0, 0.25]` range.**
+  Values in `(0.25, 0.5]` previously passed and quantized every key dimension
+  into a single degenerate bin; they are now rejected.
+- **Python numpy centroid parsing is zero-copy for native-`f64` arrays** again
+  (the common case): it tries a borrow first and only falls back to an
+  `astype("float64")` copy for other dtypes.
+
 ### Fixed
 
 - **Robustness sweep** — hardened panics, OOM, and silent-garbage paths

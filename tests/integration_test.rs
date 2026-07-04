@@ -171,6 +171,144 @@ fn test_generate_and_solve() {
     );
 }
 
+/// Regression test: `Solution.matched_centroid_indices` must index the
+/// *caller's* input slice, even when the solver drops non-finite centroids up
+/// front. Dropping compacts the working list, shifting every index at or
+/// beyond the drop point; without a remap, `matched_centroid_indices` would be
+/// off by the number of dropped centroids ahead of each match, silently
+/// pairing the wrong observed positions with catalog stars (e.g. corrupting a
+/// `calibrate_camera` distortion fit).
+#[test]
+fn test_matched_indices_survive_dropped_centroid() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+
+    let config = GenerateDatabaseConfig {
+        max_fov_deg: 20.0,
+        min_fov_deg: None,
+        star_max_magnitude: Some(6.0),
+        pattern_max_error: 0.005,
+        lattice_field_oversampling: 30,
+        patterns_per_lattice_field: 25,
+        verification_stars_per_fov: 50,
+        multiscale_step: 1.5,
+        epoch_proper_motion_year: Some(2025.0),
+        catalog_nside: 8,
+    };
+    let db = SolverDatabase::generate_from_gaia(&gaia_catalog_path(), &config)
+        .expect("Failed to generate database");
+
+    // Same Orion's-belt pointing as `test_generate_and_solve`.
+    let target_ra = 83.0_f32.to_radians();
+    let target_dec = (-1.0_f32).to_radians();
+    let boresight_icrs = Vector3::from_array([
+        target_dec.cos() * target_ra.cos(),
+        target_dec.cos() * target_ra.sin(),
+        target_dec.sin(),
+    ]);
+    let cam_z = boresight_icrs.normalize();
+    let cam_x = Vector3::from_array([0.0, 0.0, 1.0])
+        .cross(&cam_z)
+        .normalize();
+    let cam_y = cam_z.cross(&cam_x);
+    let rot = Matrix3::new([
+        [cam_x[0], cam_x[1], cam_x[2]],
+        [cam_y[0], cam_y[1], cam_y[2]],
+        [cam_z[0], cam_z[1], cam_z[2]],
+    ]);
+
+    let fov_rad = 15.0_f32.to_radians();
+    let half_fov = fov_rad / 2.0;
+    let (image_width, image_height) = (1024u32, 1024u32);
+    let pixel_scale = 1.0 / ((image_width as f32 / 2.0) / (fov_rad / 2.0).tan());
+
+    // Project visible stars to centroids, remembering each centroid's true
+    // catalog id so we can check the reported index → id pairing.
+    let mut centroids: Vec<Centroid> = Vec::new();
+    let mut source_ids: Vec<i64> = Vec::new();
+    for &idx in &db
+        .star_catalog
+        .query_indices_from_uvec(boresight_icrs, half_fov * 1.2)
+    {
+        let sv = &db.star_vectors[idx];
+        let cam_v = rot * Vector3::from_array([sv[0], sv[1], sv[2]]);
+        if cam_v[2] > 0.01 {
+            let (cx_rad, cy_rad) = (cam_v[0] / cam_v[2], cam_v[1] / cam_v[2]);
+            if cx_rad.abs() < half_fov && cy_rad.abs() < half_fov {
+                centroids.push(Centroid {
+                    x: cx_rad / pixel_scale,
+                    y: cy_rad / pixel_scale,
+                    mass: Some(10.0 - db.star_catalog.stars()[idx].mag),
+                    cov: None,
+                });
+                source_ids.push(db.star_catalog_ids[idx]);
+            }
+        }
+    }
+    assert!(
+        centroids.len() >= 5,
+        "need >= 5 centroids, got {}",
+        centroids.len()
+    );
+
+    // Insert a NaN centroid partway through so every real centroid after it is
+    // shifted by one in the working (post-drop) frame. It sits among the
+    // bright stars (mass high) so the pre-drop brightness order would place it
+    // inside the tested set had it not been dropped.
+    let insert_at = 2;
+    centroids.insert(
+        insert_at,
+        Centroid {
+            x: f32::NAN,
+            y: 12.0,
+            mass: Some(100.0),
+            cov: None,
+        },
+    );
+    source_ids.insert(insert_at, i64::MIN); // sentinel: must never be matched
+
+    let solve_config = SolveConfig {
+        fov_max_error_rad: Some(5.0_f32.to_radians()),
+        match_radius: 0.01,
+        match_threshold: 1e-5,
+        solve_timeout_ms: Some(30_000),
+        match_max_error: None,
+        ..SolveConfig::new(fov_rad, image_width, image_height)
+    };
+
+    let solution = db
+        .solve_from_centroids(&centroids, &solve_config)
+        .expect("solve should succeed despite the dropped NaN centroid");
+
+    assert_eq!(
+        solution.matched_centroid_indices.len(),
+        solution.matched_catalog_ids.len(),
+    );
+    assert!(
+        !solution.matched_centroid_indices.is_empty(),
+        "expected matches"
+    );
+
+    for (&ci, &cat_id) in solution
+        .matched_centroid_indices
+        .iter()
+        .zip(&solution.matched_catalog_ids)
+    {
+        // Index must land in the caller's slice and never on the NaN entry.
+        assert!(ci < centroids.len(), "index {ci} out of caller range");
+        assert!(
+            centroids[ci].x.is_finite() && centroids[ci].y.is_finite(),
+            "matched index {ci} points at the dropped non-finite centroid",
+        );
+        // The reported index must identify the centroid actually generated
+        // from the matched catalog star — the core off-by-one check.
+        assert_eq!(
+            source_ids[ci], cat_id,
+            "index {ci} maps to catalog id {} but the solution paired it with {cat_id}",
+            source_ids[ci],
+        );
+    }
+}
+
 /// Solve a mirrored (parity-flipped) synthetic field end to end.
 ///
 /// Regression test: the finalize path used to rebuild the rotation with a

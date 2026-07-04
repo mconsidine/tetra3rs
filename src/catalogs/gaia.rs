@@ -1,5 +1,6 @@
 use crate::error::{Error, Result};
 use std::path::Path;
+use tracing::debug;
 
 pub struct GaiaStar {
     pub source_id: i64,
@@ -52,11 +53,21 @@ pub fn load_gaia_binary<P: AsRef<Path>>(path: P) -> Result<Vec<GaiaStar>> {
         Error::InvalidCatalog("Gaia binary: num_stars * record_size overflows".into())
     })?;
     let data_bytes = file.metadata()?.len().saturating_sub(header.len() as u64);
-    if expected_bytes as u64 != data_bytes {
+    // Require *at least* the claimed star block (guards a truncated header that
+    // would otherwise drive a multi-gigabyte allocation before `read_exact`
+    // fails). Trailing bytes — padding or appended metadata that 0.8 read past
+    // fine — are tolerated: we consume exactly `expected_bytes` below.
+    if data_bytes < expected_bytes as u64 {
         return Err(Error::InvalidCatalog(format!(
             "Gaia binary: header claims {num_stars} stars ({expected_bytes} bytes) \
-             but file has {data_bytes} data bytes"
+             but file has only {data_bytes} data bytes"
         )));
+    }
+    if data_bytes > expected_bytes as u64 {
+        debug!(
+            "Gaia binary: {} trailing byte(s) after the {num_stars}-star block; ignoring",
+            data_bytes - expected_bytes as u64
+        );
     }
     let mut buf = vec![0u8; expected_bytes];
     file.read_exact(&mut buf)?;

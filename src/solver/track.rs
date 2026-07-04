@@ -129,10 +129,18 @@ impl SolverDatabase {
         // fractional match radius. Whichever is larger.
         let hint_match_radius = (config.hint_uncertainty_rad).max(config.match_radius * fov_rad);
 
+        // Matching working buffers, shared by the initial match and the
+        // verification below (a single-shot solve, but the shared signature
+        // requires them).
+        let mut match_xy: Vec<(f32, f32)> = Vec::new();
+        let mut match_scratch = super::matching::MatchScratch::<f32>::default();
+
         let initial_matches = find_centroid_matches(
             &centroid_vectors[..match_centroid_count.min(centroid_vectors.len())],
             &projected,
             hint_match_radius,
+            &mut match_xy,
+            &mut match_scratch,
         );
 
         debug!(
@@ -174,6 +182,8 @@ impl SolverDatabase {
             star_vectors,
             0,
             None,
+            &mut match_xy,
+            &mut match_scratch,
         );
 
         // Same false-positive probability test as LIS, but without any

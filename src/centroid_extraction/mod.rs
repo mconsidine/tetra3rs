@@ -1026,6 +1026,53 @@ mod tests {
     }
 
     #[test]
+    fn test_deblend_reject_saturation_local_bg() {
+        // Same saturated-exemption case as `test_deblend_reject`, but on the
+        // default local-background path. Saturation must be judged on the RAW
+        // sensor value (== the clip level), NOT the background-subtracted
+        // residual `peak_val` (clip − background < clip): with the residual
+        // comparison the exemption never fires, plateau noise fakes multiple
+        // maxima, and the blended pair is wrongly rejected. This is the path
+        // `test_deblend_reject` (local_bg_block_size = None) cannot cover.
+        let (width, height) = (96u32, 96u32);
+        let bg = 100.0_f32;
+        let clip = 600.0_f32;
+        let mut pixels = render_stars(
+            width,
+            height,
+            bg,
+            0.0,
+            4.0,
+            1.3,
+            &[
+                (30.0, 30.0, 2000.0),
+                (34.0, 30.0, 1500.0),
+                (70.0, 70.0, 2000.0),
+            ],
+        );
+        for v in pixels.iter_mut() {
+            *v = v.min(clip);
+        }
+        // Residual peak ≈ clip − bg = 500 < 600, so a residual-based comparison
+        // would classify these clipped stars as unsaturated.
+        assert!(clip - bg < clip);
+
+        let sat = CentroidExtractionConfig {
+            deblend: DeblendMode::Reject,
+            saturation_level: Some(clip),
+            local_bg_block_size: Some(16),
+            sigma_threshold: 5.0,
+            ..Default::default()
+        };
+        let res = extract_centroids_from_raw(&pixels, width, height, &sat).unwrap();
+        assert_eq!(
+            res.centroids.len(),
+            2,
+            "saturated blobs exempt from deblend rejection on the local-bg path"
+        );
+    }
+
+    #[test]
     fn test_centroid_accuracy_ensemble() {
         // Characterization: ensemble centroid RMSE vs truth for noisy stars
         // at deterministic pseudo-random sub-pixel phases, at two PSF widths

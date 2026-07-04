@@ -33,6 +33,16 @@ pub(super) struct MatchScratch<F = f64> {
     matches: Vec<(usize, usize)>,
 }
 
+impl<F> MatchScratch<F> {
+    /// Move the last computed match set out of the scratch, leaving an empty
+    /// buffer behind for the next call. Lets a caller that needs an owned Vec
+    /// avoid the copy `.to_vec()` on the returned slice would incur, while
+    /// still reusing the (larger) candidate/flag buffers across calls.
+    pub(super) fn take_matches(&mut self) -> Vec<(usize, usize)> {
+        std::mem::take(&mut self.matches)
+    }
+}
+
 /// Greedy unique 1-to-1 matching between points and predicted catalog positions.
 ///
 /// Considers the first `max_points` entries of `points`; `predicted` entries

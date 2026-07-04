@@ -647,9 +647,12 @@ fn multi_image_calibrate(
     // Polynomial: extract crpix from order-0 terms via extract_crpix.
     // Radial: crpix stays [0, 0] (the optical-axis position lives inside the
     //         model) — no extraction needed.
+    // Match every variant explicitly (no `_ =>`) so a future variant carrying
+    // its own optical-center offset is caught by the compiler rather than
+    // silently defaulting crpix to [0, 0].
     let (crpix, distortion) = match current_distortion {
         Distortion::Polynomial(_) => extract_crpix(current_distortion),
-        _ => ([0.0, 0.0], current_distortion),
+        Distortion::None | Distortion::Radial(_) => ([0.0, 0.0], current_distortion),
     };
 
     // Tan-consistent with the ideal-point projection above, including any

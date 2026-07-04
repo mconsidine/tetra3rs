@@ -75,6 +75,13 @@ impl SolverDatabase {
     /// exact estimate first, then spiraling outward. This makes the solver robust
     /// to uncertain FOV estimates.
     ///
+    /// Lost-in-space (no attitude hint) requires **at least 5 centroids**: 4
+    /// form the geometric-hash pattern and at least one more is needed as
+    /// independent verification evidence (the 4 pattern stars match by
+    /// construction and are excluded from the acceptance statistic). A field of
+    /// 4 or fewer finite centroids returns [`SolveStatus::TooFew`]. The
+    /// tracking path (`SolveConfig::attitude_hint`) has no such floor.
+    ///
     /// Returns a `SolveResult` with the ICRS→camera quaternion on success.
     pub fn solve_from_centroids(
         &self,
@@ -115,25 +122,35 @@ impl SolverDatabase {
         // Non-finite inputs (NaN/inf) would quantize to bogus pattern keys and
         // degrade the solve to a silent NoMatch, so drop them here (and any that
         // undistort to non-finite) rather than feed them downstream.
+        // `orig_indices[i]` is the index in the caller's input slice that
+        // working centroid `i` came from. Dropping non-finite centroids
+        // compacts the list, so this map is needed to report
+        // `Solution.matched_centroid_indices` back in the caller's frame (see
+        // `remap_matched_indices` at the return points below).
         let n_input = centroids.len();
-        let preprocessed: Vec<Centroid> = centroids
-            .iter()
-            .filter(|c| c.x.is_finite() && c.y.is_finite())
-            .map(|c| {
-                // Subtract optical center offset
-                let cx = c.x as f64 - cam.crpix[0];
-                let cy = c.y as f64 - cam.crpix[1];
-                // Undistort (distorted observed → ideal pinhole)
-                let (ux, uy) = cam.distortion.undistort(cx, cy);
-                Centroid {
-                    x: ux as f32,
-                    y: uy as f32,
-                    mass: c.mass,
-                    cov: c.cov,
-                }
-            })
-            .filter(|c| c.x.is_finite() && c.y.is_finite())
-            .collect();
+        let mut preprocessed: Vec<Centroid> = Vec::with_capacity(n_input);
+        let mut orig_indices: Vec<usize> = Vec::with_capacity(n_input);
+        for (idx, c) in centroids.iter().enumerate() {
+            if !(c.x.is_finite() && c.y.is_finite()) {
+                continue;
+            }
+            // Subtract optical center offset
+            let cx = c.x as f64 - cam.crpix[0];
+            let cy = c.y as f64 - cam.crpix[1];
+            // Undistort (distorted observed → ideal pinhole)
+            let (ux, uy) = cam.distortion.undistort(cx, cy);
+            let (ux, uy) = (ux as f32, uy as f32);
+            if !(ux.is_finite() && uy.is_finite()) {
+                continue;
+            }
+            preprocessed.push(Centroid {
+                x: ux,
+                y: uy,
+                mass: c.mass,
+                cov: c.cov,
+            });
+            orig_indices.push(idx);
+        }
         if preprocessed.len() < n_input {
             debug!(
                 "Dropped {} non-finite centroid(s) before solve",
@@ -145,7 +162,8 @@ impl SolverDatabase {
         // ── Tracking-mode shortcut: if a hint is provided, try direct correspondence first ──
         if let Some(ref hint) = config.attitude_hint {
             match self.solve_with_hint(working_centroids, &star_vecs, config, hint, t0) {
-                Ok(solution) => {
+                Ok(mut solution) => {
+                    remap_matched_indices(&mut solution, &orig_indices);
                     debug!(
                         "Hinted solve succeeded in {:.1} ms ({} matches)",
                         solution.solve_time_ms, solution.num_matches
@@ -162,10 +180,17 @@ impl SolverDatabase {
             }
         }
 
-        // Too few centroids to ever form a 4-star pattern. This is
-        // FOV-independent, unlike the post-thinning TooFew inside
-        // `solve_at_fov`, so it ends the solve outright.
-        if working_centroids.len() < PATTERN_SIZE {
+        // LIS needs at least PATTERN_SIZE + 1 centroids. PATTERN_SIZE form the
+        // 4-star hypothesis pattern; verification excludes those hypothesis
+        // stars from the binomial (they match by construction — zero
+        // independent evidence), so a field of exactly PATTERN_SIZE centroids
+        // leaves zero verification trials and can never pass acceptance at any
+        // `match_threshold`. Gate it here as TooFew rather than letting it burn
+        // the whole FOV sweep only to return a silent NoMatch. (The tracking
+        // path, tried above, has no such floor — its hypothesis comes from the
+        // hint, not the centroids.) This is FOV-independent, unlike the
+        // post-thinning TooFew inside `solve_at_fov`, so it ends the solve.
+        if working_centroids.len() <= PATTERN_SIZE {
             return failure(SolveStatus::TooFew, t0);
         }
 
@@ -224,7 +249,10 @@ impl SolverDatabase {
                 t0,
             );
             match result {
-                Ok(solution) => return Ok(solution),
+                Ok(mut solution) => {
+                    remap_matched_indices(&mut solution, &orig_indices);
+                    return Ok(solution);
+                }
                 // TooFew here means cluster-buster thinning left fewer than 4
                 // pattern centroids. The thinning separation scales with the
                 // FOV being tried, so a different FOV in the sweep may still
@@ -281,6 +309,12 @@ impl SolverDatabase {
         // measured FOV (see the rebuild step in the candidate loop). Reused
         // across candidates to avoid per-candidate allocation.
         let mut rebuilt_vectors: Vec<[f32; 3]> = Vec::new();
+
+        // Matching working buffers, held across the candidate loop so
+        // `verify_attitude`/`find_centroid_matches` reuse them (see their
+        // docs) instead of allocating per candidate.
+        let mut match_xy: Vec<(f32, f32)> = Vec::new();
+        let mut match_scratch = matching::MatchScratch::<f32>::default();
 
         // ── Cluster-buster thinning ──
         // Apply the same separation constraint as database generation to avoid
@@ -634,6 +668,8 @@ impl SolverDatabase {
                         star_vectors,
                         hypothesis,
                         None,
+                        &mut match_xy,
+                        &mut match_scratch,
                     );
 
                     // ── Pre-gate ──
@@ -739,6 +775,8 @@ impl SolverDatabase {
                         star_vectors,
                         hypothesis,
                         Some(refined_radius),
+                        &mut match_xy,
+                        &mut match_scratch,
                     );
                     let corrected_prob = p_refined * *candidates_tested as f64;
                     if corrected_prob >= config.match_threshold {
@@ -796,6 +834,7 @@ impl SolverDatabase {
     /// it, so a tighter radius (e.g. derived from a refined fit's RMSE) makes
     /// every true match worth quadratically more evidence.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn verify_attitude(
         &self,
         rotation_matrix: &Matrix3<f32>,
@@ -806,6 +845,8 @@ impl SolverDatabase {
         star_vectors: &[[f32; 3]],
         hypothesis_matches: usize,
         match_radius_rad_override: Option<f32>,
+        centroid_xy: &mut Vec<(f32, f32)>,
+        scratch: &mut matching::MatchScratch<f32>,
     ) -> (Vec<(usize, usize)>, f64) {
         let fov_diagonal = fov * diagonal_factor(config);
         let match_radius_rad = match_radius_rad_override.unwrap_or(config.match_radius * fov);
@@ -843,6 +884,8 @@ impl SolverDatabase {
                 &centroid_vectors[..match_centroid_count.min(centroid_vectors.len())],
                 &nearby_cam_positions,
                 match_radius_rad,
+                centroid_xy,
+                scratch,
             )
         );
 
@@ -1116,6 +1159,20 @@ pub(super) fn elapsed_ms(t0: Instant) -> f32 {
     t0.elapsed().as_secs_f32() * 1000.0
 }
 
+/// Translate a solution's `matched_centroid_indices` from the compacted
+/// working-centroid frame back into the caller's original input slice.
+///
+/// The solve pipeline may drop non-finite centroids up front, which shifts
+/// every index at or beyond the drop point. `orig_indices[i]` is the caller
+/// index that working centroid `i` came from; without this remap, a caller
+/// (e.g. `calibrate_camera`) would pair the wrong observed positions with
+/// catalog stars. When nothing was dropped the map is the identity.
+fn remap_matched_indices(solution: &mut Solution, orig_indices: &[usize]) {
+    for idx in solution.matched_centroid_indices.iter_mut() {
+        *idx = orig_indices[*idx];
+    }
+}
+
 /// Build a failed [`SolveResult`] with the elapsed time since `t0`.
 pub(super) fn failure(status: SolveStatus, t0: Instant) -> SolveResult {
     Err(SolveFailure {
@@ -1273,33 +1330,38 @@ pub(super) fn wahba_rotation<'a>(
 
 /// Find unique 1-to-1 matches between image centroids and projected catalog positions.
 ///
-/// Returns Vec<(centroid_local_idx, catalog_star_idx)>.
+/// Returns Vec<(centroid_local_idx, catalog_star_idx)>. `centroid_xy` and
+/// `scratch` are caller-owned working buffers, held across the LIS candidate
+/// loop (this runs once per candidate, twice per refined one) so the projection
+/// buffer and the scratch's three larger candidate/flag buffers are reused
+/// instead of reallocated per candidate; their contents are fully overwritten
+/// each call. The match list is moved out via `take_matches` (no copy).
 pub(super) fn find_centroid_matches(
     centroid_vectors: &[[f32; 3]],
     catalog_positions: &[(usize, f32, f32)], // (star_idx, cam_x, cam_y) in radians
     match_radius: f32,
+    centroid_xy: &mut Vec<(f32, f32)>,
+    scratch: &mut matching::MatchScratch<f32>,
 ) -> Vec<(usize, usize)> {
     // For each centroid, project to camera-plane angular coordinates
-    let centroid_xy: Vec<(f32, f32)> = centroid_vectors
-        .iter()
-        .map(|v| {
-            if v[2] > 0.0 {
-                (v[0] / v[2], v[1] / v[2])
-            } else {
-                (f32::MAX, f32::MAX)
-            }
-        })
-        .collect();
+    centroid_xy.clear();
+    centroid_xy.extend(centroid_vectors.iter().map(|v| {
+        if v[2] > 0.0 {
+            (v[0] / v[2], v[1] / v[2])
+        } else {
+            (f32::MAX, f32::MAX)
+        }
+    }));
 
-    let mut scratch = matching::MatchScratch::<f32>::default();
+    let n = centroid_xy.len();
     matching::greedy_unique_matches(
-        &centroid_xy,
-        centroid_xy.len(),
+        centroid_xy,
+        n,
         catalog_positions,
         match_radius * match_radius,
-        &mut scratch,
-    )
-    .to_vec()
+        scratch,
+    );
+    scratch.take_matches()
 }
 
 // ── Binomial CDF (no external dependency) ───────────────────────────────────

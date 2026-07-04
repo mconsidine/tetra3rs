@@ -319,10 +319,12 @@ impl GenerateDatabaseConfig {
                 )));
             }
         }
-        // bins = round(0.25 / pattern_max_error); require it to land in [1, u32]
-        // so keys quantize correctly.
-        if !(self.pattern_max_error.is_finite() && self.pattern_max_error > 0.0)
-            || (0.25 / self.pattern_max_error).round() < 1.0
+        // bins = round(0.25 / pattern_max_error). Values above 0.25 round to a
+        // single bin (degenerate hash — every key dimension collapses), so the
+        // documented valid range is (0, 0.25].
+        if !(self.pattern_max_error.is_finite()
+            && self.pattern_max_error > 0.0
+            && self.pattern_max_error <= 0.25)
         {
             return Err(InvalidInput(format!(
                 "pattern_max_error must be finite and in (0, 0.25], got {}",

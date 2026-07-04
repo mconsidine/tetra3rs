@@ -155,6 +155,7 @@ pub(super) fn extract_from_gray(
     // ── Step 5: compute centroids ──
     let raw_centroids = compute_blob_centroids(
         gray,
+        gray_input,
         thresh_src,
         mask_threshold,
         &regions,
@@ -341,8 +342,10 @@ struct RawCentroid {
 /// This loop is ~2% of extraction wall-clock, so it is left sequential even
 /// under the `parallel` feature — the threading overhead would not pay off and
 /// keeps the two builds bit-identical here.
+#[allow(clippy::too_many_arguments)]
 fn compute_blob_centroids(
     gray: &[f32],
+    raw: &[f32],
     thresh_src: &[f32],
     mask_threshold: f32,
     regions: &runs::RunRegions,
@@ -358,6 +361,8 @@ fn compute_blob_centroids(
     // Reused across blobs to avoid a fresh allocation per region (dense
     // fields can have thousands).
     let mut annulus_vals: Vec<f32> = Vec::new();
+    let mut maxima: Vec<(f32, usize, usize)> = Vec::new();
+    let mut kept: Vec<(usize, usize)> = Vec::new();
     let mut out: Vec<RawCentroid> = Vec::new();
 
     'region: for k in 0..regions.n_regions {
@@ -473,7 +478,15 @@ fn compute_blob_centroids(
             }
         }
 
-        let saturated = config.saturation_level.is_some_and(|s| peak_val >= s);
+        // Saturation is judged on the RAW sensor value at the peak, not the
+        // background-subtracted residual `peak_val`: `saturation_level` is
+        // documented as a raw ADU level, so subtracting the (positive)
+        // background would push a clipped star's residual below the clip
+        // level and the exemption would never fire. On the no-local-bg path
+        // `gray == raw`, so this matches `peak_val` there. Mirrors the fast
+        // path, which tracks its peak on the raw image directly.
+        let raw_peak = raw[peak_row * w + peak_col];
+        let saturated = config.saturation_level.is_some_and(|s| raw_peak >= s);
 
         // --- Minimal deblending (see DeblendMode) ---
         // A blended pair centroids to the flux-weighted midpoint — a wrong
@@ -485,7 +498,7 @@ fn compute_blob_centroids(
         // genuinely single star).
         if config.deblend == DeblendMode::Reject && !saturated {
             let thresh = local_bg + 0.3 * (peak_val as f64 - local_bg);
-            let mut maxima: Vec<(f32, usize, usize)> = Vec::new();
+            maxima.clear();
             for &i in region_runs {
                 let run = regions.runs[i as usize];
                 let r = run.row as usize;
@@ -518,7 +531,7 @@ fn compute_blob_centroids(
                 }
             }
             maxima.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            let mut kept: Vec<(usize, usize)> = Vec::new();
+            kept.clear();
             for &(_, c, r) in &maxima {
                 let distinct = kept.iter().all(|&(kc, kr)| {
                     let dx = c as f64 - kc as f64;
