@@ -144,3 +144,45 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  # Verify the hand-written .pyi stub matches the compiled extension.
+  # mypy is PINNED: stubtest's error set is mypy-version-sensitive, and the
+  # allowlist (python/stubtest-allowlist.txt) is calibrated to this version.
+  # Bumping mypy is a deliberate step — change the pin, re-run, and update the
+  # allowlist if the error set moved. `--ignore-unused-allowlist` keeps a
+  # now-stale entry from failing CI on its own.
+  stubtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-stubtest-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-stubtest-
+            ${{ runner.os }}-cargo-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package + pinned mypy
+        run: |
+          pip install -e .
+          pip install 'mypy==2.1.0'
+
+      - name: stubtest
+        run: >
+          python -m mypy.stubtest tetra3rs
+          --allowlist python/stubtest-allowlist.txt
+          --ignore-unused-allowlist

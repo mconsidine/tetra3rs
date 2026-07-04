@@ -2,6 +2,10 @@
 #
 #     python -m mypy.stubtest tetra3rs --allowlist python/stubtest-allowlist.txt
 #
+# Calibrated to mypy 2.1.0 (the version pinned in the `stubtest` CI job in
+# .github/workflows/ci.yml). stubtest's error set is mypy-version-sensitive, so
+# when bumping the pin, re-run and adjust the entries below if they shift.
+#
 # Each line is a regex matched (fullmatch) against a stubtest error's object
 # path. Everything here is a benign PyO3/stubtest-convention mismatch, not real
 # stub drift. Note: allowlisting a path suppresses ALL stubtest errors for that
