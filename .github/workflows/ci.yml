@@ -111,3 +111,19 @@ jobs:
 
       - name: Run Python tests
         run: pytest python/tests/ -v
+
+  # SemVer compatibility of the published `tetra3` crate against its last
+  # crates.io release. For 0.x, a breaking change requires a minor bump
+  # (0.8 -> 0.9); this job fails a PR that breaks the public API without one,
+  # catching the "forgot to bump" trap before publish. The PyO3 crate is
+  # publish=false, so only `tetra3` is checked.
+  semver:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check semver (tetra3 crate)
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          package: tetra3
+          feature-group: all-features
