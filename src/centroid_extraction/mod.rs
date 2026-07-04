@@ -242,7 +242,7 @@ pub struct CentroidExtractionResult {
 /// Performs background subtraction, blob detection, and centroid computation
 /// on an in-memory image. Centroids are returned in pixel coordinates with the
 /// origin at the image center, suitable for use with
-/// [`SolverDatabase::solve_from_centroids`].
+/// [`SolverDatabase::solve_from_centroids`](crate::SolverDatabase::solve_from_centroids).
 ///
 /// To load from a file, decode it with `image::open(path)?` (which requires
 /// the appropriate `image` crate format features in your own `Cargo.toml`)

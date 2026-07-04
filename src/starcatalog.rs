@@ -112,8 +112,8 @@ impl StarCatalog {
     /// `dir` is normalized internally; `radius_rad` is clamped to `[0, π]`.
     /// Returns indices into the internal star storage. Each candidate star's
     /// unit vector is recomputed from its `(ra, dec)` via trigonometry; for hot
-    /// paths that already hold precomputed unit vectors, prefer
-    /// [`query_indices_from_uvec_cached`](Self::query_indices_from_uvec_cached).
+    /// paths that already hold precomputed unit vectors, prefer the internal
+    /// `query_indices_from_uvec_cached`.
     pub fn query_indices_from_uvec(&self, dir: Vector3<f32>, radius_rad: f32) -> Vec<usize> {
         self.query_impl(dir, radius_rad, None)
     }

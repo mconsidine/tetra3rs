@@ -439,7 +439,7 @@ pub struct SolveConfig {
     /// lost-in-space pattern-hash search unless [`SolveConfig::strict_hint`]
     /// is set.
     ///
-    /// The quaternion uses the same convention as [`SolveResult::qicrs2cam`]:
+    /// The quaternion uses the same convention as [`Solution::qicrs2cam`]:
     /// it rotates ICRS vectors into the camera frame. Pass the previous
     /// frame's `qicrs2cam` to chain solves at video rate.
     ///

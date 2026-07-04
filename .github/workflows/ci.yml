@@ -41,6 +41,11 @@ jobs:
       - name: Clippy (all targets, all features, warnings as errors)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      - name: Rustdoc (warnings as errors)
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
   test:
     runs-on: ubuntu-latest
     steps:

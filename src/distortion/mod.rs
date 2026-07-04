@@ -19,7 +19,7 @@
 //!
 //! 2. **Fitted** from one or more solve results — either through
 //!    [`calibrate_camera`] (which fits a SIP polynomial model and returns a
-//!    fully-populated [`CameraModel`]) or directly via the internal radial
+//!    fully-populated [`CameraModel`](crate::CameraModel)) or directly via the internal radial
 //!    fitter for the simpler `(k1, k2, k3)` model.
 //!    Both fitters use iterative robust sigma-clipping to reject
 //!    mismatched stars.

@@ -98,7 +98,7 @@ impl Default for FastCentroidConfig {
 
 /// Fast single-pass centroid extraction — the "adequate star tracker" path.
 ///
-/// An alternative to [`extract_centroids_from_raw`] that reads each pixel
+/// An alternative to [`extract_centroids_from_raw`](super::extract_centroids_from_raw) that reads each pixel
 /// **once**: a cheap subsampled pre-pass builds a coarse background grid, then
 /// a single raster sweep thresholds against the bilinearly-interpolated
 /// background, groups lit pixels into connected regions via run-length +
@@ -114,7 +114,7 @@ impl Default for FastCentroidConfig {
 ///   brightest stars a tracker locks onto, not deep detection.
 /// - Center-of-mass is threshold-clipped: sub-pixel accuracy is ~0.1 px for
 ///   bright stars, degrading for faint ones. A 3×3 parabola refine on the peak
-///   ([`quadratic_peak_offset`]) sharpens it when the region is large enough
+///   (`quadratic_peak_offset`) sharpens it when the region is large enough
 ///   and the fit agrees with the CoM, matching the CCL path's gate.
 /// - A global noise σ is used (adequate when read/shot noise is roughly
 ///   uniform even where the background level is not).
