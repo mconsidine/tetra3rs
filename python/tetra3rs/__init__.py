@@ -15,9 +15,11 @@ from .tetra3rs import (
     PolynomialDistortion,
     RadialDistortion,
     SolveResult,
+    SolveFailure,
     SolverDatabase,
     earth_barycentric_velocity,
     extract_centroids,
+    extract_centroids_fast,
     __git_hash__,
 )
 
@@ -30,8 +32,10 @@ __all__ = [
     "PolynomialDistortion",
     "RadialDistortion",
     "SolveResult",
+    "SolveFailure",
     "SolverDatabase",
     "earth_barycentric_velocity",
     "extract_centroids",
+    "extract_centroids_fast",
     "__git_hash__",
 ]

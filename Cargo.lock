@@ -464,9 +464,9 @@ dependencies = [
 
 [[package]]
 name = "numeris"
-version = "0.5.12"
+version = "0.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0225c114a2219690166bf3be79b9375cada439e54a17ada07f21c9d55b3d69c8"
+checksum = "d5b3135801d7f17db8c67cd7d6dd42f7f05b2255a0a936bfd9f917749fe7596b"
 dependencies = [
  "num-complex",
  "num-traits",
@@ -890,7 +890,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "tetra3"
-version = "0.7.4"
+version = "0.9.0"
 dependencies = [
  "image",
  "numeris",
@@ -907,7 +907,7 @@ dependencies = [
 
 [[package]]
 name = "tetra3-python"
-version = "0.7.4"
+version = "0.9.0"
 dependencies = [
  "numeris",
  "numpy",

@@ -21,12 +21,15 @@ use crate::Star;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StarCatalog {
-    pub nside: u32,
-    pub n_lat: u32,
-    pub n_lon: u32,
-    pub stars: Vec<Star>,
-    pub cell_offsets: Vec<u32>,
-    pub star_indices: Vec<u32>,
+    // Index internals are private so the spatial-index invariant (derived cell
+    // layout must match `stars`) can't be broken from outside. Access stars via
+    // `stars()` / `len()`. Field order is the postcard wire layout — keep it.
+    nside: u32,
+    n_lat: u32,
+    n_lon: u32,
+    stars: Vec<Star>,
+    cell_offsets: Vec<u32>,
+    star_indices: Vec<u32>,
 }
 
 impl StarCatalog {
@@ -64,11 +67,6 @@ impl StarCatalog {
         }
     }
 
-    /// Build a catalog by cloning stars from a slice.
-    pub fn from_slice(nside: u32, stars: &[Star]) -> Self {
-        Self::new(nside, stars.to_vec())
-    }
-
     /// Return the index resolution parameter.
     pub fn nside(&self) -> u32 {
         self.nside
@@ -98,10 +96,10 @@ impl StarCatalog {
         self.query_indices_from_uvec(dir, radius_rad)
     }
 
-    /// Query stars within an angular radius of a pointing direction.
-    ///
-    /// Input coordinates are in radians (`ra_rad`, `dec_rad`, `radius_rad`).
-    /// Returns references to matching stars.
+    /// Query stars within an angular radius of a pointing direction, returning
+    /// references to matching stars. Test-only convenience over
+    /// [`query_indices`](Self::query_indices), which the solver uses directly.
+    #[cfg(test)]
     pub fn query_stars(&self, ra_rad: f32, dec_rad: f32, radius_rad: f32) -> Vec<&Star> {
         self.query_indices(ra_rad, dec_rad, radius_rad)
             .into_iter()
@@ -114,8 +112,8 @@ impl StarCatalog {
     /// `dir` is normalized internally; `radius_rad` is clamped to `[0, π]`.
     /// Returns indices into the internal star storage. Each candidate star's
     /// unit vector is recomputed from its `(ra, dec)` via trigonometry; for hot
-    /// paths that already hold precomputed unit vectors, prefer
-    /// [`query_indices_from_uvec_cached`](Self::query_indices_from_uvec_cached).
+    /// paths that already hold precomputed unit vectors, prefer the internal
+    /// `query_indices_from_uvec_cached`.
     pub fn query_indices_from_uvec(&self, dir: Vector3<f32>, radius_rad: f32) -> Vec<usize> {
         self.query_impl(dir, radius_rad, None)
     }
@@ -195,17 +193,6 @@ impl StarCatalog {
         out.sort_unstable();
         out.dedup();
         out
-    }
-
-    /// Query stars around a (possibly non-unit) direction vector.
-    ///
-    /// `dir` is normalized internally; `radius_rad` is clamped to `[0, π]`.
-    /// Returns references to matching stars.
-    pub fn query_stars_from_uvec(&self, dir: Vector3<f32>, radius_rad: f32) -> Vec<&Star> {
-        self.query_indices_from_uvec(dir, radius_rad)
-            .into_iter()
-            .map(|idx| &self.stars[idx])
-            .collect()
     }
 
     fn collect_cell_matches(
@@ -298,7 +285,8 @@ fn wrap_angle(theta_rad: f32) -> f32 {
     theta_rad.rem_euclid(TAU)
 }
 
-fn radec_to_uvec(ra_rad: f32, dec_rad: f32) -> Vector3<f32> {
+/// ICRS unit vector from (RA, Dec) in radians. Also used by [`Star::uvec`].
+pub(crate) fn radec_to_uvec(ra_rad: f32, dec_rad: f32) -> Vector3<f32> {
     let (sin_ra, cos_ra) = ra_rad.sin_cos();
     let (sin_dec, cos_dec) = dec_rad.sin_cos();
     Vector3::from_array([cos_dec * cos_ra, cos_dec * sin_ra, sin_dec])

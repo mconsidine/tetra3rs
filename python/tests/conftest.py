@@ -311,6 +311,9 @@ def tess_db(gaia_catalog_path):
     cache_path = os.path.join(DATA_DIR, "test_tess_db.bin")
     if os.path.exists(cache_path):
         return tetra3rs.SolverDatabase.load_from_file(cache_path)
+    # Parameters mirror the Rust `test_tess_multi_image_calibration` database
+    # and the multi-image-calibration notebook exactly (LIS solver generation
+    # must match across all three).
     db = tetra3rs.SolverDatabase.generate_from_gaia(
         gaia_catalog_path,
         max_fov_deg=14.0,
@@ -318,7 +321,9 @@ def tess_db(gaia_catalog_path):
         lattice_field_oversampling=100,
         patterns_per_lattice_field=500,
         verification_stars_per_fov=3000,
+        multiscale_step=1.5,
         epoch_proper_motion_year=2018.0,
+        catalog_nside=8,
     )
     os.makedirs(DATA_DIR, exist_ok=True)
     db.save_to_file(cache_path)

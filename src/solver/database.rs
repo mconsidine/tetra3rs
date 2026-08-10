@@ -87,11 +87,7 @@ impl SolverDatabase {
             .collect();
 
         let default_pm_year = 1991.25; // Hipparcos reference epoch
-        Ok(Self::generate_from_star_list(
-            stars,
-            config,
-            default_pm_year,
-        ))
+        Self::generate_from_star_list(stars, config, default_pm_year)
     }
 
     /// Generate a solver database from a Gaia binary catalog file.
@@ -118,11 +114,7 @@ impl SolverDatabase {
             .collect();
 
         let default_pm_year = 2016.0; // Gaia DR3 reference epoch
-        Ok(Self::generate_from_star_list(
-            stars,
-            config,
-            default_pm_year,
-        ))
+        Self::generate_from_star_list(stars, config, default_pm_year)
     }
 
     /// Core database generation from a pre-converted list of generic stars.
@@ -133,7 +125,8 @@ impl SolverDatabase {
         mut stars: Vec<Star>,
         config: &GenerateDatabaseConfig,
         default_pm_year: f64,
-    ) -> Self {
+    ) -> crate::Result<Self> {
+        config.validate()?;
         let max_fov = config.max_fov_deg.to_radians();
         let min_fov = config
             .min_fov_deg
@@ -381,13 +374,13 @@ impl SolverDatabase {
             patterns_per_lattice_field: config.patterns_per_lattice_field,
         };
 
-        SolverDatabase {
+        Ok(SolverDatabase {
             star_catalog,
             star_vectors,
             star_catalog_ids,
             pattern_catalog,
             props,
-        }
+        })
     }
 }
 

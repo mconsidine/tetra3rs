@@ -18,11 +18,13 @@ For each candidate match, solve Wahba's problem via SVD to find the optimal rota
 
 ### 4. Verification
 
-Project nearby catalog stars into the camera frame using the estimated rotation, count how many match observed centroids within a tolerance, and accept only if the false-positive probability (computed via the binomial CDF) is below a threshold. This statistical test ensures that the match is not a coincidence.
+Project nearby catalog stars into the camera frame using the estimated rotation, count how many match observed centroids within a tolerance, and compute the false-positive probability of that match count via the binomial CDF. The null model uses the *measured* density of projected catalog stars over the frame (times the π·r² area of the match disc), and the 4 pattern stars that formed the candidate are excluded from the trials — they are the hypothesis being tested, not evidence for it. This statistical test ensures that the match is not a coincidence.
+
+Each matched pattern also yields a *measured* FOV (from the ratio of catalog to image pattern scale), and the candidate's centroid vectors are rebuilt at that scale before verification — so a wrong FOV estimate (up to `fov_max_error_rad`) solves at essentially full speed, without a fine FOV sweep.
 
 ### 5. Refinement and WCS Fit
 
-Refine the solution using *all* matched star pairs (not just the initial 4) via a constrained 3-DOF tangent-plane fit (rotation angle θ + CRVAL offset, pixel scale locked). The fit iterates internally: each pass re-fits the parameters, sigma-clips outliers, re-projects catalog stars, and re-matches centroids using the improved solution, stopping once the match set is stable. The result is FITS-standard WCS output — a CD matrix and CRVAL reference point — allowing direct pixel↔sky coordinate conversions.
+Refine the solution using *all* matched star pairs (not just the initial 4) via a constrained 3-DOF tangent-plane fit (rotation angle θ + CRVAL offset, pixel scale locked). The fit iterates internally: each pass re-fits the parameters, sigma-clips outliers, re-projects catalog stars, and re-matches centroids using the improved solution, stopping once the match set is stable. Acceptance is then decided by **re-verifying the refined attitude** at a match radius tied to the refined RMSE: a true candidate's matches sit within a few RMSE (its p-value collapses when the radius tightens), while a false candidate's coincidences are spread uniformly and cannot be aligned by the 3-DOF fit. The result is FITS-standard WCS output — a CD matrix and CRVAL reference point — allowing direct pixel↔sky coordinate conversions.
 
 ## Parity Flip Detection
 
@@ -39,5 +41,5 @@ The solver uses a breadth-first (brightest-first) search strategy. Brighter star
 The search can be bounded by:
 
 - **Timeout** (`solve_timeout_ms`) — stop after a time limit
-- **Match threshold** (`match_threshold`) — accept the first match with false-positive probability below this value
+- **Match threshold** (`match_threshold`) — a per-solve false-positive *budget*: the k-th candidate tested is accepted when its corrected p-value `p·k` falls below this value (a sequential Bonferroni correction over the candidates actually tested). `SolveResult.prob` reports the corrected p-value. Raising the budget (e.g. to `1e-3`) lets very sparse fields (≲7 stars) solve, at an explicitly chosen false-positive risk
 - **FOV error** (`fov_max_error_rad`) — restrict the search to patterns consistent with the estimated field of view

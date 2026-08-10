@@ -94,12 +94,12 @@ impl PyCentroid {
 
     /// Remove lens distortion from this centroid's position (distorted → ideal).
     ///
-    /// Takes a distortion model (RadialDistortion)
+    /// Takes a distortion model (RadialDistortion or PolynomialDistortion)
     /// and returns a new Centroid at the corrected position.
     /// Brightness and covariance are preserved.
     ///
     /// Args:
-    ///     distortion: A RadialDistortion model.
+    ///     distortion: A RadialDistortion or PolynomialDistortion model.
     ///
     /// Returns:
     ///     A new Centroid with undistorted (ideal) position.
@@ -118,12 +118,12 @@ impl PyCentroid {
 
     /// Apply lens distortion to this centroid's position (ideal → distorted).
     ///
-    /// Takes a distortion model (RadialDistortion)
+    /// Takes a distortion model (RadialDistortion or PolynomialDistortion)
     /// and returns a new Centroid at the distorted position.
     /// Brightness and covariance are preserved.
     ///
     /// Args:
-    ///     distortion: A RadialDistortion model.
+    ///     distortion: A RadialDistortion or PolynomialDistortion model.
     ///
     /// Returns:
     ///     A new Centroid with distorted position.
@@ -141,9 +141,7 @@ impl PyCentroid {
     }
 
     fn __reduce__(slf: &Bound<'_, Self>) -> PyResult<(Py<PyAny>, (Vec<u8>,))> {
-        let bytes = crate::helpers::to_postcard_bytes(&slf.borrow().inner)?;
-        let from_bytes = slf.get_type().getattr("_from_pickle_bytes")?;
-        Ok((from_bytes.unbind(), (bytes,)))
+        crate::helpers::pickle_reduce(slf, &slf.borrow().inner)
     }
 
     #[staticmethod]

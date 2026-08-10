@@ -8,7 +8,6 @@ Requires Gaia catalog and TESS same-CCD images (downloaded from GCS).
 """
 
 import pytest
-
 import tetra3rs
 
 from .conftest import (
@@ -43,11 +42,14 @@ class TestTessMultiImageCalibration:
 
             ext = tetra3rs.extract_centroids(
                 image,
-                sigma_threshold=300.0,
-                min_pixels=4,
+                sigma_threshold=180.0,
+                min_pixels=3,
                 max_pixels=10000,
                 local_bg_block_size=16,
                 max_elongation=6.0,
+                # Mirror the Rust TESS tests: threshold tuned for the
+                # unfiltered image.
+                matched_filter_sigma=None,
             )
             all_centroids.append(ext.centroids)
             all_headers.append(headers)
@@ -55,7 +57,7 @@ class TestTessMultiImageCalibration:
         # -- Tiered solve + calibrate (matching notebook) --
         pass_configs = [
             # (match_radius, cal_order, fov_error_deg)
-            (0.01, 3, 0.5),
+            (0.005, 3, 0.5),
             (0.005, 4, 0.5),
             (0.003, 5, 0.5),
             (0.002, 6, 0.5),
@@ -89,7 +91,7 @@ class TestTessMultiImageCalibration:
 
         # -- Verify final results --
         # All images should be solved
-        n_solved = sum(1 for r in results if r is not None)
+        n_solved = sum(1 for r in results if r)
         assert n_solved == len(sectors), f"Only {n_solved}/{len(sectors)} images solved"
 
         # Check per-image quality
@@ -98,7 +100,7 @@ class TestTessMultiImageCalibration:
         for idx, (result, headers, sector) in enumerate(
             zip(results, all_headers, sectors)
         ):
-            assert result is not None, f"Sector {sector}: no solution"
+            assert result, f"Sector {sector}: no solution ({result})"
             assert result.status == "match_found"
 
             rmse = result.rmse_arcsec
@@ -107,10 +109,12 @@ class TestTessMultiImageCalibration:
             # Compare center pixel against FITS WCS
             solved_ra, solved_dec = result.pixel_to_world(0.0, 0.0)
 
-            # FITS WCS reference: center of the 2048x2048 science region
-            # in full-frame coords is (44 + 1024, 1024)
+            # FITS WCS reference: geometric center of the 2048x2048 science
+            # region (pixel-center origin (W-1)/2, issue #28) in full-frame
+            # 0-indexed coords is (44 + 1023.5, 1023.5) — matching the origin of
+            # pixel_to_world(0, 0) above.
             wcs_ra, wcs_dec = fits_pixel_to_radec(
-                headers, 44.0 + sci_size / 2.0, sci_size / 2.0
+                headers, 44.0 + (sci_size - 1) / 2.0, (sci_size - 1) / 2.0
             )
             sep = angular_sep_deg(solved_ra, solved_dec, wcs_ra, wcs_dec) * 3600
 
@@ -120,7 +124,7 @@ class TestTessMultiImageCalibration:
                 f'vs WCS={sep:.2f}"'
             )
 
-            assert rmse < 25.0, f'Sector {sector}: RMSE {rmse:.1f}" exceeds 25"'
+            assert rmse < 15.0, f'Sector {sector}: RMSE {rmse:.1f}" exceeds 15"'
             assert sep < 10.0, f'Sector {sector}: WCS separation {sep:.1f}" exceeds 10"'
 
     def test_radial_calibration(self, tess_db, tess_image_paths):
@@ -161,11 +165,14 @@ class TestTessMultiImageCalibration:
             image = image[:2048, 44:2092].copy()
             ext = tetra3rs.extract_centroids(
                 image,
-                sigma_threshold=300.0,
-                min_pixels=4,
+                sigma_threshold=180.0,
+                min_pixels=3,
                 max_pixels=10000,
                 local_bg_block_size=16,
                 max_elongation=6.0,
+                # Mirror the Rust TESS tests: threshold tuned for the
+                # unfiltered image.
+                matched_filter_sigma=None,
             )
             all_centroids.append(ext.centroids)
             all_headers.append(headers)
@@ -178,7 +185,11 @@ class TestTessMultiImageCalibration:
                 fov_estimate_deg=11.8,
                 fov_max_error_deg=0.5,
                 image_shape=(sci_size, sci_size),
-                match_radius=0.01,
+                # 0.005 (matching the Rust TESS tests): at 0.01 with this
+                # database's 3000 verification stars, a wrong attitude
+                # coincidence-matches ~90% of centroids, leaving verification
+                # statistically uninformative for raw-distortion frames.
+                match_radius=0.005,
                 match_threshold=1e-5,
             )
             initial_results.append(result)
@@ -222,13 +233,14 @@ class TestTessMultiImageCalibration:
         )
 
         # -- Re-solve with the radial-calibrated camera model --
-        # Use match_radius=0.01 (~7 arcmin at TESS's 11.7° FOV). Radial-only
-        # calibration leaves ~3 px (~150") residuals on TESS because radial
-        # cannot capture TESS's tangential / decentering distortion; the
-        # default 0.005 tolerance is too tight for those residuals near
-        # corners and most sectors fall through to wrong-attitude alternate
-        # solves. With 0.01 tolerance, true matches are kept and the great
-        # majority of sectors solve correctly (≤30" WCS agreement).
+        # match_radius=0.005 (matching the Rust TESS solve configs): the
+        # radial model's ~3 px residuals sit comfortably inside the ~10 px
+        # radius, and against this database's 3000 verification stars a
+        # 0.01 radius saturates the coincidence null (a wrong attitude
+        # matches most centroids by chance), leaving verification
+        # uninformative. (An older comment here justified 0.01 by
+        # wrong-attitude alternate solves at 0.005 — a failure mode of the
+        # pre-0.9 verification statistics that no longer exists.)
         results = []
         for centroids in all_centroids:
             result = tess_db.solve_from_centroids(
@@ -236,7 +248,7 @@ class TestTessMultiImageCalibration:
                 fov_estimate_deg=cal.camera_model.fov_deg,
                 fov_max_error_deg=0.5,
                 image_shape=(sci_size, sci_size),
-                match_radius=0.01,
+                match_radius=0.005,
                 match_threshold=1e-5,
                 camera_model=cal.camera_model,
             )
@@ -257,8 +269,9 @@ class TestTessMultiImageCalibration:
         for result, headers, sector in zip(results, all_headers, sectors):
             rmse = result.rmse_arcsec
             solved_ra, solved_dec = result.pixel_to_world(0.0, 0.0)
+            # Geometric center (W-1)/2 (issue #28), matching pixel_to_world(0, 0).
             wcs_ra, wcs_dec = fits_pixel_to_radec(
-                headers, 44.0 + sci_size / 2.0, sci_size / 2.0
+                headers, 44.0 + (sci_size - 1) / 2.0, (sci_size - 1) / 2.0
             )
             sep = angular_sep_deg(solved_ra, solved_dec, wcs_ra, wcs_dec) * 3600
             print(

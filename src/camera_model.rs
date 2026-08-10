@@ -49,7 +49,15 @@ impl CameraModel {
     /// Create a camera model from a horizontal field of view and image dimensions.
     ///
     /// Sets crpix to `[0, 0]`, no parity flip, no distortion.
+    ///
+    /// `fov_rad` must lie in `(0, π)`; outside that range the focal length is
+    /// non-positive or infinite, which propagates NaN/negative pixel scales
+    /// through the solver (checked in debug builds).
     pub fn from_fov(fov_rad: f64, image_width: u32, image_height: u32) -> Self {
+        debug_assert!(
+            fov_rad.is_finite() && fov_rad > 0.0 && fov_rad < std::f64::consts::PI,
+            "from_fov: fov_rad must be in (0, π), got {fov_rad}"
+        );
         let f = (image_width as f64 / 2.0) / (fov_rad / 2.0).tan();
         Self {
             focal_length_px: f,

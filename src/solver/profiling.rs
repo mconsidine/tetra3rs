@@ -1,6 +1,6 @@
 //! Lightweight, feature-gated solver profiling.
 //!
-//! Enabled by the `profile` cargo feature. When disabled, the [`timed!`] macro
+//! Enabled by the `profile` cargo feature. When disabled, the `timed!` macro
 //! and the `count` / `record` calls compile to nothing, so there is zero cost
 //! in normal builds.
 //!

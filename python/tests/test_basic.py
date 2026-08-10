@@ -34,7 +34,11 @@ class TestImport:
             assert hasattr(tetra3rs, name), f"Missing: {name}"
 
     def test_all_functions_exist(self):
-        for name in ["earth_barycentric_velocity", "extract_centroids"]:
+        for name in [
+            "earth_barycentric_velocity",
+            "extract_centroids",
+            "extract_centroids_fast",
+        ]:
             assert callable(getattr(tetra3rs, name)), f"Not callable: {name}"
 
 
@@ -322,6 +326,19 @@ class TestPolynomialDistortion:
         assert d2.scale == d.scale
         np.testing.assert_array_equal(d2.a_coeffs, d.a_coeffs)
 
+    def test_construct_without_inverse_coeffs(self):
+        """ap/bp are optional — the model inverts numerically."""
+        n = 6
+        a = np.zeros(n, dtype=np.float64)
+        a[3] = 0.01
+        b = np.zeros(n, dtype=np.float64)
+        d = tetra3rs.PolynomialDistortion(order=2, scale=1024.0, a_coeffs=a, b_coeffs=b)
+        # Forward → inverse should still round-trip via Newton iteration.
+        xd, yd = d.distort(120.0, -80.0)
+        xu, yu = d.undistort(xd, yd)
+        assert abs(xu - 120.0) < 1e-6
+        assert abs(yu + 80.0) < 1e-6
+
 
 # ---------------------------------------------------------------------------
 # earth_barycentric_velocity
@@ -390,6 +407,87 @@ class TestExtractCentroids:
         image[32, 32] = 10000  # bright pixel
 
         result = tetra3rs.extract_centroids(image, sigma_threshold=3.0)
+        result2 = pickle.loads(pickle.dumps(result))
+        assert result2.image_width == result.image_width
+        assert len(result2.centroids) == len(result.centroids)
+
+    def test_fast_gaussian_spots(self):
+        """The single-pass fast path recovers spots over a gradient."""
+        h, w = 512, 512
+        # Background with a left-to-right gradient + noise.
+        gradient = np.linspace(50, 250, w, dtype=np.float32)[None, :]
+        image = (np.random.normal(0, 5, (h, w)) + gradient).astype(np.float32)
+
+        spots = [(100, 200), (300, 150), (250, 400), (50, 50), (450, 300)]
+        for cy, cx in spots:
+            yy, xx = np.mgrid[cy - 10 : cy + 11, cx - 10 : cx + 11]
+            yy = np.clip(yy, 0, h - 1)
+            xx = np.clip(xx, 0, w - 1)
+            g = 5000 * np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * 2.0**2))
+            image[yy, xx] += g.astype(np.float32)
+
+        result = tetra3rs.extract_centroids_fast(
+            image, sigma_threshold=5.0, bg_grid=64, max_centroids=20
+        )
+        assert isinstance(result, tetra3rs.ExtractionResult)
+        assert result.image_width == w and result.image_height == h
+        assert result.background_sigma > 0
+        assert len(result.centroids) >= 3
+
+        # Brightest of the 5 injected spots should be recovered to ~1 px.
+        found = [(c.x + w / 2, c.y + h / 2) for c in result.centroids]
+        for cy, cx in spots:
+            nearest = min(((fx - cx) ** 2 + (fy - cy) ** 2) ** 0.5 for fx, fy in found)
+            assert nearest < 1.0, f"spot ({cx},{cy}) nearest detection {nearest:.2f} px"
+
+    def test_degenerate_image_raises_not_panics(self):
+        """Zero-size / 1-wide images and bad config raise, not abort."""
+        empty = np.zeros((0, 0), dtype=np.float32)
+        with pytest.raises((ValueError, TypeError)):
+            tetra3rs.extract_centroids(empty)
+        tiny = np.zeros((1, 1), dtype=np.float32)
+        with pytest.raises(ValueError):
+            tetra3rs.extract_centroids(tiny)
+        img = np.zeros((16, 16), dtype=np.float32)
+        with pytest.raises(ValueError):
+            tetra3rs.extract_centroids(img, local_bg_block_size=0)
+
+    def test_non_ndarray_raises_typeerror(self):
+        """A plain list gives a clear TypeError, not an AttributeError."""
+        with pytest.raises(TypeError):
+            tetra3rs.extract_centroids([[1.0, 2.0], [3.0, 4.0]])
+
+    def test_big_endian_matches_native(self):
+        """Big-endian input (as FITS yields) extracts the same as native."""
+        h, w = 128, 128
+        native = np.full((h, w), 100.0, dtype=np.float32)
+        yy, xx = np.mgrid[54:75, 54:75]
+        native[yy, xx] += (
+            5000 * np.exp(-((yy - 64) ** 2 + (xx - 64) ** 2) / (2 * 2.0**2))
+        ).astype(np.float32)
+        big_endian = native.astype(">f4")
+        assert not big_endian.dtype.isnative
+        r_native = tetra3rs.extract_centroids(native, sigma_threshold=5.0)
+        r_big = tetra3rs.extract_centroids(big_endian, sigma_threshold=5.0)
+        assert len(r_native.centroids) == len(r_big.centroids) >= 1
+        assert r_native.image_width == r_big.image_width
+        # Same values in → same centroid position out.
+        assert abs(r_native.centroids[0].x - r_big.centroids[0].x) < 1e-4
+
+    def test_fast_result_pickle_and_drop_in(self):
+        """Fast path returns a pickleable ExtractionResult with usable centroids."""
+        h, w = 64, 64
+        image = np.random.normal(100, 5, (h, w)).astype(np.float32)
+        # A star-shaped 3x3 patch (a bare 2-pixel spike is a hot-pixel pair,
+        # which the default sharpness gate now correctly rejects).
+        image[32, 32] = 10000
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            image[32 + dr, 32 + dc] = 5000
+        for dr, dc in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
+            image[32 + dr, 32 + dc] = 2500
+
+        result = tetra3rs.extract_centroids_fast(image, sigma_threshold=4.0)
+        assert len(result.centroids) >= 1
         result2 = pickle.loads(pickle.dumps(result))
         assert result2.image_width == result.image_width
         assert len(result2.centroids) == len(result.centroids)

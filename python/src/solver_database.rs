@@ -13,7 +13,7 @@ use crate::helpers::{
     at_most_one_angle_rad, exactly_one_angle_rad, parse_centroids_single,
     parse_solve_results_and_centroids, resolve_image_dims,
 };
-use crate::solve_result::PySolveResult;
+use crate::solve_result::{PySolveFailure, PySolveResult};
 
 /// A star pattern database for plate solving.
 ///
@@ -30,15 +30,12 @@ pub(crate) struct PySolverDatabase {
 
 #[pymethods]
 impl PySolverDatabase {
-    /// Generate a database from a Gaia DR3 catalog file (CSV or binary).
+    /// Generate a database from a Gaia DR3 binary catalog file.
     ///
-    /// Accepts either:
-    /// - A CSV file (``.csv``) with columns:
-    ///   ``source_id,ra,dec,phot_g_mean_mag,phot_bp_mean_mag,phot_rp_mean_mag,parallax,pmra,pmdec``
-    /// - A binary file (``.bin``) from the ``gaia-catalog`` package.
-    ///
-    /// If ``catalog_path`` is None, uses the bundled catalog from the
-    /// ``gaia-catalog`` package (installed as a dependency).
+    /// Expects a binary file (``.bin``) in the compact GDR3 format from the
+    /// ``gaia-catalog`` package (header magic ``GDR3``). If ``catalog_path`` is
+    /// None, uses the bundled catalog from the ``gaia-catalog`` package
+    /// (installed as a dependency).
     ///
     /// Args:
     ///     catalog_path: Path to the Gaia catalog file. If None, uses the
@@ -100,7 +97,7 @@ impl PySolverDatabase {
             catalog_nside,
         };
         let db = SolverDatabase::generate_from_gaia(&resolved_path, &config)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(crate::helpers::map_tetra3_err)?;
         Ok(PySolverDatabase { inner: db })
     }
 
@@ -121,6 +118,18 @@ impl PySolverDatabase {
 
     /// Solve for camera attitude given star centroids.
     ///
+    /// Runs **lost-in-space** (pattern-hash search) by default, or **tracking**
+    /// (direct correspondence from a prior estimate) when ``attitude_hint`` is
+    /// given — with automatic fallback to lost-in-space. Arguments group by
+    /// which mode reads them; arguments for one mode are ignored in the other:
+    ///
+    /// * **Both modes:** ``camera_model`` / ``fov_estimate_*`` / ``image_*``,
+    ///   ``match_radius``, ``match_threshold``, ``solve_timeout_ms``,
+    ///   ``observer_velocity_km_s``.
+    /// * **Lost-in-space only:** ``fov_max_error``, ``match_max_error``.
+    /// * **Tracking only** (ignored unless ``attitude_hint`` is set):
+    ///   ``attitude_hint``, ``hint_uncertainty_*``, ``strict_hint``.
+    ///
     /// Args:
     ///     centroids: Either a list of Centroid objects (from extract_centroids),
     ///         or an Nx2/Nx3 numpy array of centroid positions in pixels.
@@ -128,19 +137,26 @@ impl PySolverDatabase {
     ///         Origin is at the image center, +X right, +Y down.
     ///     fov_estimate_deg: Estimated horizontal field of view in degrees.
     ///     fov_estimate_rad: Estimated horizontal field of view in radians.
-    ///         Exactly one of fov_estimate_deg or fov_estimate_rad must be provided.
     ///         Used (with the image dimensions) to build a pinhole camera model
-    ///         when camera_model is not given; ignored when it is — the model's
-    ///         focal length then defines the FOV estimate.
-    ///     image_width: Image width in pixels.
-    ///     image_height: Image height in pixels.
+    ///         when camera_model is not given — in that case exactly one of
+    ///         fov_estimate_deg / fov_estimate_rad is required. When camera_model
+    ///         is given, both are optional and ignored (the model's focal length
+    ///         defines the FOV estimate).
+    ///     image_width: Image width in pixels. Required only when camera_model is
+    ///         not given (the model carries its own dimensions).
+    ///     image_height: Image height in pixels. See image_width.
     ///     image_shape: Image shape as (height, width) tuple (numpy convention).
     ///         Can be used instead of image_width/image_height.
     ///     fov_max_error: Maximum FOV error in degrees. None = no filtering.
     ///     match_radius: Match distance as fraction of FOV. Default 0.01.
-    ///     match_threshold: False-positive probability threshold. Default 1e-5.
+    ///     match_threshold: False-positive probability budget for accepting a
+    ///         solution (candidate p-values are tested against this with a
+    ///         sequential multiple-comparison correction). Raising it (e.g. 1e-3)
+    ///         accepts weaker evidence — useful for very sparse fields at
+    ///         increased false-positive risk. Default 1e-5.
     ///     solve_timeout_ms: Timeout in milliseconds. None = no timeout.
     ///     match_max_error: Maximum edge-ratio error. None = use database value.
+    ///         Values below the database's pattern quantization error are clamped up to it.
     ///     camera_model: A CameraModel specifying focal length, image dimensions,
     ///         optical center, distortion, and parity. When provided it is the
     ///         single source of camera geometry (fov_estimate and image
@@ -177,7 +193,10 @@ impl PySolverDatabase {
     ///         solve fails. Default False. Ignored unless ``attitude_hint`` is set.
     ///
     /// Returns:
-    ///     SolveResult on success, None if no match was found.
+    ///     SolveResult on success, or a (falsy) SolveFailure carrying the
+    ///     failure reason (``status``: ``'no_match'`` / ``'timeout'`` /
+    ///     ``'too_few'``) and ``solve_time_ms``. Use ``if result:`` to
+    ///     distinguish the two.
     #[pyo3(signature = (
         centroids,
         fov_estimate_deg = None,
@@ -201,7 +220,7 @@ impl PySolverDatabase {
     #[allow(clippy::too_many_arguments)]
     fn solve_from_centroids<'py>(
         &self,
-        _py: Python<'py>,
+        py: Python<'py>,
         centroids: &Bound<'py, pyo3::PyAny>,
         fov_estimate_deg: Option<f64>,
         fov_estimate_rad: Option<f64>,
@@ -220,18 +239,7 @@ impl PySolverDatabase {
         hint_uncertainty_deg: Option<f64>,
         hint_uncertainty_rad: Option<f64>,
         strict_hint: bool,
-    ) -> PyResult<Option<PySolveResult>> {
-        // Resolve FOV estimate: exactly one of deg or rad must be provided
-        let fov_rad = exactly_one_angle_rad(
-            fov_estimate_deg,
-            fov_estimate_rad,
-            "Specify exactly one of fov_estimate_deg or fov_estimate_rad, not both",
-            "Must specify either fov_estimate_deg or fov_estimate_rad",
-        )?;
-
-        // Resolve image dimensions: image_shape=(h, w) or image_width + image_height
-        let (img_width, img_height) = resolve_image_dims(image_shape, image_width, image_height)?;
-
+    ) -> PyResult<Py<pyo3::PyAny>> {
         // Accept either a list of Centroid objects or an Nx2/Nx3 numpy array.
         let centroid_vec: Vec<Centroid> = parse_centroids_single(centroids)?;
 
@@ -242,10 +250,22 @@ impl PySolverDatabase {
             "Specify at most one of fov_max_error_deg or fov_max_error_rad, not both",
         )?;
 
-        // Use provided camera model, or create a default pinhole model from FOV
+        // A camera_model is the single source of geometry. Only when it is
+        // absent do we build a pinhole model — and only then are fov_estimate_*
+        // and the image dimensions needed (and required).
         let cam = match camera_model {
             Some(py_cam) => py_cam.inner,
-            None => CameraModel::from_fov(fov_rad as f64, img_width, img_height),
+            None => {
+                let fov_rad = exactly_one_angle_rad(
+                    fov_estimate_deg,
+                    fov_estimate_rad,
+                    "Specify exactly one of fov_estimate_deg or fov_estimate_rad, not both",
+                    "Must specify fov_estimate_deg or fov_estimate_rad (or pass camera_model)",
+                )?;
+                let (img_width, img_height) =
+                    resolve_image_dims(image_shape, image_width, image_height)?;
+                CameraModel::from_fov(fov_rad as f64, img_width, img_height)
+            }
         };
 
         // Resolve hint uncertainty: at most one of deg or rad.
@@ -278,7 +298,16 @@ impl PySolverDatabase {
 
         let result = self.inner.solve_from_centroids(&centroid_vec, &config);
 
-        Ok(result.ok().map(PySolveResult::from_solution))
+        match result {
+            Ok(solution) => Ok(PySolveResult::from_solution(solution)
+                .into_pyobject(py)?
+                .into_any()
+                .unbind()),
+            Err(failure) => Ok(PySolveFailure { inner: failure }
+                .into_pyobject(py)?
+                .into_any()
+                .unbind()),
+        }
     }
 
     /// Number of stars in the catalog.
@@ -428,7 +457,7 @@ impl PySolverDatabase {
     /// Returns:
     ///     CatalogStar at that index.
     fn get_star(&self, index: usize) -> PyResult<PyCatalogStar> {
-        let stars = &self.inner.star_catalog.stars;
+        let stars = self.inner.star_catalog.stars();
         if index >= stars.len() {
             return Err(pyo3::exceptions::PyIndexError::new_err(format!(
                 "star index {} out of range (catalog has {} stars)",
@@ -454,7 +483,7 @@ impl PySolverDatabase {
             .iter()
             .position(|&id| id == catalog_id)
             .map(|idx| PyCatalogStar {
-                inner: self.inner.star_catalog.stars[idx].clone(),
+                inner: self.inner.star_catalog.stars()[idx].clone(),
             })
     }
 
@@ -479,7 +508,7 @@ impl PySolverDatabase {
         indices
             .into_iter()
             .map(|idx| PyCatalogStar {
-                inner: self.inner.star_catalog.stars[idx].clone(),
+                inner: self.inner.star_catalog.stars()[idx].clone(),
             })
             .collect()
     }
@@ -503,7 +532,9 @@ impl PySolverDatabase {
     ///   distortion is symmetric about the optical center.
     ///
     /// Args:
-    ///     solve_results: A SolveResult or list of SolveResult objects.
+    ///     solve_results: A SolveResult, or a list that may mix SolveResult
+    ///         and SolveFailure objects — failures are skipped, so solve
+    ///         outputs can be passed straight through without filtering.
     ///     centroids: Matching centroids (list of Centroid lists, or single list).
     ///     image_width: Image width in pixels.
     ///     image_height: Image height in pixels.
@@ -587,18 +618,10 @@ impl PySolverDatabase {
             img_width,
             img_height,
             &config,
-        );
+        )
+        .map_err(crate::helpers::map_tetra3_err)?;
 
-        Ok(PyCalibrateResult {
-            camera_model: PyCameraModel {
-                inner: result.camera_model,
-            },
-            rmse_before_px: result.rmse_before_px,
-            rmse_after_px: result.rmse_after_px,
-            n_inliers: result.n_inliers,
-            n_outliers: result.n_outliers,
-            iterations: result.iterations,
-        })
+        Ok(PyCalibrateResult { inner: result })
     }
 }
 
@@ -607,41 +630,37 @@ impl PySolverDatabase {
 /// Accepts either a 4-element quaternion `[w, x, y, z]` (list or 1D ndarray)
 /// or a 3×3 rotation matrix (2D ndarray).
 fn parse_attitude_hint(obj: &Bound<'_, pyo3::PyAny>) -> PyResult<tetra3::Quaternion> {
-    use numpy::{PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
+    use numpy::{PyReadonlyArray2, PyUntypedArrayMethods};
     use pyo3::exceptions::PyValueError;
 
-    // Try 1D [w, x, y, z] quaternion.
-    if let Ok(arr) = obj.extract::<PyReadonlyArray1<f64>>() {
-        let slice = arr
-            .as_slice()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        if slice.len() != 4 {
-            return Err(PyValueError::new_err(format!(
-                "attitude_hint 1D array must have 4 elements [w, x, y, z], got {}",
-                slice.len()
-            )));
+    // Build a unit quaternion from raw [w, x, y, z], rejecting a degenerate
+    // (near-zero / non-finite) norm. Unnormalized hints would otherwise become
+    // silently-wrong or NaN rotations and a confusing solve failure.
+    let quat_from_wxyz = |w: f64, x: f64, y: f64, z: f64| -> PyResult<tetra3::Quaternion> {
+        let n = (w * w + x * x + y * y + z * z).sqrt();
+        if !(n.is_finite() && n > 1e-9) {
+            return Err(PyValueError::new_err(
+                "attitude_hint quaternion has a near-zero or non-finite norm",
+            ));
         }
-        return Ok(tetra3::Quaternion::new(
-            slice[0] as f32,
-            slice[1] as f32,
-            slice[2] as f32,
-            slice[3] as f32,
-        ));
-    }
-    // Try a plain Python list / tuple of length 4.
+        Ok(tetra3::Quaternion::new(
+            (w / n) as f32,
+            (x / n) as f32,
+            (y / n) as f32,
+            (z / n) as f32,
+        ))
+    };
+
+    // Try a 4-element [w, x, y, z] sequence: list, tuple, or 1D ndarray (the
+    // Vec extraction accepts any f64 sequence, so no separate ndarray branch).
     if let Ok(vec) = obj.extract::<Vec<f64>>() {
         if vec.len() != 4 {
             return Err(PyValueError::new_err(format!(
-                "attitude_hint list must have 4 elements [w, x, y, z], got {}",
+                "attitude_hint sequence must have 4 elements [w, x, y, z], got {}",
                 vec.len()
             )));
         }
-        return Ok(tetra3::Quaternion::new(
-            vec[0] as f32,
-            vec[1] as f32,
-            vec[2] as f32,
-            vec[3] as f32,
-        ));
+        return quat_from_wxyz(vec[0], vec[1], vec[2], vec[3]);
     }
     // Try a 3×3 rotation matrix.
     if let Ok(arr) = obj.extract::<PyReadonlyArray2<f64>>() {
@@ -653,6 +672,20 @@ fn parse_attitude_hint(obj: &Bound<'_, pyo3::PyAny>) -> PyResult<tetra3::Quatern
             )));
         }
         let view = arr.as_array();
+        // Reject a matrix that isn't (close to) a rotation: Mᵀ·M ≈ I. Catches
+        // unnormalized / garbage matrices before they yield a bogus attitude.
+        for i in 0..3 {
+            for j in 0..3 {
+                let dot: f64 = (0..3).map(|k| view[(k, i)] * view[(k, j)]).sum();
+                let expected = if i == j { 1.0 } else { 0.0 };
+                if !dot.is_finite() || (dot - expected).abs() > 1e-3 {
+                    return Err(PyValueError::new_err(
+                        "attitude_hint 3x3 matrix is not orthonormal (columns must be \
+                         orthonormal; expected a rotation matrix)",
+                    ));
+                }
+            }
+        }
         let m = numeris::Matrix3::<f32>::new([
             [
                 view[(0, 0)] as f32,

@@ -13,8 +13,9 @@ __git_hash__: str
 import datetime
 import numpy as np
 import numpy.typing as npt
-from typing import Optional, Union
+from typing import Optional, Union, final, overload
 
+@final
 class CameraModel:
     """Camera intrinsics model: focal length, optical center, parity, and distortion.
 
@@ -31,15 +32,15 @@ class CameraModel:
     @staticmethod
     def _from_pickle_bytes(data: bytes) -> "CameraModel": ...
 
-    def __init__(
-        self,
+    def __new__(
+        cls,
         focal_length_px: float,
         image_width: int,
         image_height: int,
         crpix: Optional[list[float]] = None,
         parity_flip: bool = False,
         distortion: Optional[Union["RadialDistortion", "PolynomialDistortion"]] = None,
-    ) -> None:
+    ) -> "CameraModel":
         """Create a camera model with explicit parameters.
 
         Args:
@@ -134,6 +135,7 @@ class CameraModel:
         ...
 
 
+@final
 class CalibrateResult:
     """Result of camera calibration.
 
@@ -176,6 +178,7 @@ class CalibrateResult:
         ...
 
 
+@final
 class SolveResult:
     """Result of a successful plate-solve.
 
@@ -187,6 +190,10 @@ class SolveResult:
     def __reduce__(self) -> tuple: ...
     @staticmethod
     def _from_pickle_bytes(data: bytes) -> "SolveResult": ...
+    def __bool__(self) -> bool:
+        """Always ``True`` — lets ``if result:`` distinguish success from a
+        (falsy) ``SolveFailure``."""
+        ...
 
     @property
     def rotation_matrix_icrs_to_camera(self) -> npt.NDArray[np.float64]:
@@ -287,12 +294,9 @@ class SolveResult:
         ...
 
     @property
-    def distortion(self) -> Optional[Union["RadialDistortion", "PolynomialDistortion"]]:
-        """The distortion model used during solving, if any.
-
-        Returns a ``RadialDistortion`` or ``PolynomialDistortion`` instance,
-        or ``None`` if no distortion was applied.
-        """
+    def camera_model(self) -> CameraModel:
+        """The camera model used for the solve (focal length, image dimensions,
+        optical center, distortion, and parity)."""
         ...
 
     @property
@@ -301,6 +305,17 @@ class SolveResult:
 
         Maps pixel offsets from CRPIX to gnomonic tangent-plane coordinates
         at CRVAL.
+        """
+        ...
+
+    @property
+    def theta_deg(self) -> float:
+        """Fitted rotation angle in degrees (camera roll in tangent plane).
+
+        The angle from the tangent-plane ξ (East) axis to the camera +X axis,
+        measured counter-clockwise. When ``parity_flip`` is ``True``,
+        "camera +X" means the x-negated (mirror-corrected) axis — the same
+        frame the quaternion rotates into.
         """
         ...
 
@@ -318,38 +333,21 @@ class SolveResult:
         ...
 
     @property
-    def crpix(self) -> npt.NDArray[np.float32]:
+    def crpix(self) -> npt.NDArray[np.float64]:
         """Optical center offset from the geometric image center, in pixels [x, y]."""
         ...
-
-    from typing import overload
 
     @overload
     def pixel_to_world(self, x: float, y: float) -> tuple[float, float]: ...
     @overload
     def pixel_to_world(
         self, x: npt.NDArray[np.float64], y: npt.NDArray[np.float64]
-    ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]: ...
-
-    def pixel_to_world(
-        self,
-        x: Union[float, npt.NDArray[np.float64]],
-        y: Union[float, npt.NDArray[np.float64]],
-    ) -> Union[tuple[float, float], tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]]:
+    ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
         """Convert centered pixel coordinates to world coordinates (RA, Dec in degrees).
 
         Pixel coordinates use the same convention as solver centroids:
-        origin at the image center, +X right, +Y down.
-
-        Args:
-            x: X pixel coordinate(s). Scalar or 1D numpy array.
-            y: Y pixel coordinate(s). Scalar or 1D numpy array.
-
-        Returns:
-            (ra_deg, dec_deg): Tuple of RA and Dec in degrees.
-                Scalars if input is scalar, numpy arrays if input is array.
-                Array elements are NaN where the transform is undefined.
-                Returns None for scalar input if the point is degenerate.
+        origin at the image center, +X right, +Y down. Scalars in, scalars out;
+        1D numpy arrays in, 1D numpy arrays out (NaN where undefined).
         """
         ...
 
@@ -358,30 +356,56 @@ class SolveResult:
     @overload
     def world_to_pixel(
         self, ra_deg: npt.NDArray[np.float64], dec_deg: npt.NDArray[np.float64]
-    ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]: ...
-
-    def world_to_pixel(
-        self,
-        ra_deg: Union[float, npt.NDArray[np.float64]],
-        dec_deg: Union[float, npt.NDArray[np.float64]],
-    ) -> Union[Optional[tuple[float, float]], tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]]:
+    ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
         """Convert world coordinates (RA, Dec in degrees) to centered pixel coordinates.
 
         Returns pixel coordinates in the same convention as solver centroids:
-        origin at the image center, +X right, +Y down.
-
-        Args:
-            ra_deg: Right ascension in degrees. Scalar or 1D numpy array.
-            dec_deg: Declination in degrees. Scalar or 1D numpy array.
-
-        Returns:
-            (x, y): Tuple of pixel coordinates.
-                Scalars if input is scalar, numpy arrays if input is array.
-                Array elements are NaN for points behind the camera.
-                Returns None for scalar input if the point is behind the camera.
+        origin at the image center, +X right, +Y down. Scalars in, scalars out
+        (None if the point is behind the camera); 1D numpy arrays in, arrays out
+        (NaN for points behind the camera).
         """
         ...
 
+@final
+class SolveFailure:
+    """A failed plate-solve attempt: why it failed and how long it took.
+
+    Returned by ``SolverDatabase.solve_from_centroids`` when no solution was
+    found. Falsy, so ``if result:`` cleanly separates success from failure::
+
+        result = db.solve_from_centroids(centroids, ...)
+        if result:
+            print(result.ra_deg, result.dec_deg)
+        else:
+            print(f"solve failed: {result.status} after {result.solve_time_ms:.0f} ms")
+
+    Supports ``pickle`` serialization.
+    """
+
+    def __reduce__(self) -> tuple: ...
+    @staticmethod
+    def _from_pickle_bytes(data: bytes) -> "SolveFailure": ...
+    def __bool__(self) -> bool:
+        """Always ``False`` — lets ``if result:`` distinguish a (truthy)
+        ``SolveResult`` from a failure."""
+        ...
+
+    @property
+    def status(self) -> str:
+        """Why the solve produced no solution.
+
+        One of ``'no_match'`` (all pattern combinations exhausted),
+        ``'timeout'`` (``solve_timeout_ms`` reached), or ``'too_few'``
+        (fewer than 4 usable centroids).
+        """
+        ...
+
+    @property
+    def solve_time_ms(self) -> float:
+        """Wall-clock time spent before giving up, in milliseconds."""
+        ...
+
+@final
 class CatalogStar:
     """A star from the solver catalog.
 
@@ -408,6 +432,7 @@ class CatalogStar:
         """Visual magnitude."""
         ...
 
+@final
 class ExtractionResult:
     """Result of centroid extraction from an image.
 
@@ -454,6 +479,7 @@ class ExtractionResult:
         """Number of raw blobs before filtering."""
         ...
 
+@final
 class Centroid:
     """A detected star centroid with position, brightness, and shape.
 
@@ -466,7 +492,7 @@ class Centroid:
     @staticmethod
     def _from_pickle_bytes(data: bytes) -> "Centroid": ...
 
-    def __init__(self, x: float, y: float, brightness: Optional[float] = None) -> None:
+    def __new__(cls, x: float, y: float, brightness: Optional[float] = None) -> "Centroid":
         """Create a new Centroid.
 
         Args:
@@ -507,7 +533,9 @@ class Centroid:
         """
         ...
 
-    def undistort(self, distortion: RadialDistortion) -> Centroid:
+    def undistort(
+        self, distortion: Union[RadialDistortion, PolynomialDistortion]
+    ) -> Centroid:
         """Remove lens distortion from this centroid's position (distorted → ideal).
 
         Returns a new Centroid at the corrected position.
@@ -515,7 +543,9 @@ class Centroid:
         """
         ...
 
-    def distort(self, distortion: RadialDistortion) -> Centroid:
+    def distort(
+        self, distortion: Union[RadialDistortion, PolynomialDistortion]
+    ) -> Centroid:
         """Apply lens distortion to this centroid's position (ideal → distorted).
 
         Returns a new Centroid at the distorted position.
@@ -523,6 +553,7 @@ class Centroid:
         """
         ...
 
+@final
 class SolverDatabase:
     """A star pattern database for plate solving.
 
@@ -627,8 +658,20 @@ class SolverDatabase:
         hint_uncertainty_deg: Optional[float] = None,
         hint_uncertainty_rad: Optional[float] = None,
         strict_hint: bool = False,
-    ) -> Optional[SolveResult]:
+    ) -> Union[SolveResult, SolveFailure]:
         """Solve for camera attitude given star centroids.
+
+        Runs **lost-in-space** (pattern-hash search) by default, or **tracking**
+        (direct correspondence from a prior estimate) when ``attitude_hint`` is
+        given — with automatic fallback to lost-in-space. The arguments group by
+        which mode reads them; arguments for one mode are ignored in the other:
+
+        * **Both modes:** ``camera_model`` / ``fov_estimate_*`` / ``image_*``,
+          ``match_radius``, ``match_threshold``, ``solve_timeout_ms``,
+          ``observer_velocity_km_s``.
+        * **Lost-in-space only:** ``fov_max_error_*``, ``match_max_error``.
+        * **Tracking only** (ignored unless ``attitude_hint`` is set):
+          ``attitude_hint``, ``hint_uncertainty_*``, ``strict_hint``.
 
         Args:
             centroids: Either a list of Centroid objects (from extract_centroids),
@@ -648,10 +691,17 @@ class SolverDatabase:
             fov_max_error_deg: Maximum FOV error in degrees. None = no limit.
             fov_max_error_rad: Maximum FOV error in radians. None = no limit.
                 At most one of fov_max_error_deg or fov_max_error_rad can be provided.
+                Lost-in-space only — tracking takes its scale from the hint.
             match_radius: Match distance as fraction of FOV.
-            match_threshold: False-positive probability threshold.
+            match_threshold: False-positive probability budget for accepting
+                a solution (candidate p-values are tested against this with a
+                sequential multiple-comparison correction). Raising it (e.g.
+                1e-3) accepts weaker evidence — useful for very sparse fields
+                at increased false-positive risk.
             solve_timeout_ms: Timeout in milliseconds. None = no timeout.
             match_max_error: Maximum edge-ratio error. None = use database value.
+                Values below the database's pattern quantization error are clamped up to it.
+                Lost-in-space only — tracking does not use the pattern hash.
             camera_model: A CameraModel specifying focal length, image
                 dimensions, optical center, distortion, and parity. When
                 provided it is the single source of camera geometry
@@ -693,7 +743,10 @@ class SolverDatabase:
                 ``attitude_hint`` is set.
 
         Returns:
-            A SolveResult on success, or None if no match was found.
+            A SolveResult on success, or a (falsy) SolveFailure carrying the
+            failure reason (``status``: ``'no_match'`` / ``'timeout'`` /
+            ``'too_few'``) and ``solve_time_ms``. Use ``if result:`` to
+            distinguish the two.
         """
         ...
 
@@ -783,7 +836,7 @@ class SolverDatabase:
 
     def calibrate_camera(
         self,
-        solve_results: Union[SolveResult, list[SolveResult]],
+        solve_results: Union[SolveResult, list[Union[SolveResult, SolveFailure]]],
         centroids: Union[
             list[Centroid],
             npt.NDArray[np.float64],
@@ -815,7 +868,9 @@ class SolverDatabase:
           symmetric about the optical center.
 
         Args:
-            solve_results: A SolveResult or list of SolveResult objects.
+            solve_results: A SolveResult, or a list that may mix SolveResult
+                and SolveFailure objects — failures are skipped, so solve
+                outputs can be passed straight through without filtering.
             centroids: Matching centroids (list of Centroid lists, or single list).
             image_width: Image width in pixels.
             image_height: Image height in pixels.
@@ -836,16 +891,19 @@ class SolverDatabase:
         """
         ...
 
+@final
 class RadialDistortion:
     """Brown-Conrady radial+tangential distortion model.
 
     ``x_d = x · (1 + k1·r² + k2·r⁴ + k3·r⁶) + 2·p1·x·y + p2·(r² + 2·x²)``
     ``y_d = y · (1 + k1·r² + k2·r⁴ + k3·r⁶) + p1·(r² + 2·y²) + 2·p2·x·y``
 
-    Coordinates are in pixels relative to the optical center (image center
-    minus CRPIX). Tangential coefficients ``p1, p2`` default to 0 — set them
-    to model lens decentering, sensor tilt, or off-axis CCD placement.
-    Supports ``pickle`` serialization.
+    Coordinates are in pixels, origin at the image center; the model shifts
+    into its own ``center`` frame (the optical axis, ``(0, 0)`` by default)
+    internally. Tangential coefficients ``p1, p2`` default to 0 — set them
+    to model lens decentering or sensor tilt. On mosaic cameras (e.g. TESS)
+    the optical axis can sit far off the detector center — ``center``
+    carries that offset. Supports ``pickle`` serialization.
 
     Example::
 
@@ -874,14 +932,15 @@ class RadialDistortion:
     @staticmethod
     def _from_pickle_bytes(data: bytes) -> "RadialDistortion": ...
 
-    def __init__(
-        self,
+    def __new__(
+        cls,
         k1: float = 0.0,
         k2: float = 0.0,
         k3: float = 0.0,
         p1: float = 0.0,
         p2: float = 0.0,
-    ) -> None: ...
+        center: tuple[float, float] = (0.0, 0.0),
+    ) -> "RadialDistortion": ...
     @property
     def k1(self) -> float:
         """First radial coefficient."""
@@ -907,6 +966,12 @@ class RadialDistortion:
         """Second tangential / decentering coefficient."""
         ...
 
+    @property
+    def center(self) -> tuple[float, float]:
+        """Distortion center (optical axis) as ``(cx, cy)`` in pixels,
+        image-center-origin frame."""
+        ...
+
     def distort(self, x: float, y: float) -> tuple[float, float]:
         """Forward distortion: ideal → distorted."""
         ...
@@ -915,6 +980,7 @@ class RadialDistortion:
         """Inverse distortion: distorted → ideal."""
         ...
 
+@final
 class PolynomialDistortion:
     """SIP-like polynomial distortion model with independent x,y correction terms.
 
@@ -956,27 +1022,28 @@ class PolynomialDistortion:
     @staticmethod
     def _from_pickle_bytes(data: bytes) -> "PolynomialDistortion": ...
 
-    def __init__(
-        self,
+    def __new__(
+        cls,
         order: int,
         scale: float,
         a_coeffs: list[float],
         b_coeffs: list[float],
-        ap_coeffs: list[float],
-        bp_coeffs: list[float],
-    ) -> None:
-        """Create a polynomial distortion model from coefficient arrays.
+        ap_coeffs: Optional[list[float]] = None,
+        bp_coeffs: Optional[list[float]] = None,
+    ) -> "PolynomialDistortion":
+        """Create a polynomial distortion model from forward coefficient arrays.
 
-        Each coefficient array must have exactly (order+1)(order+2)/2 elements,
-        covering all terms from p+q=0 (constant offset) through p+q=order.
+        a_coeffs and b_coeffs must each have exactly (order+1)(order+2)/2
+        elements, covering all terms from p+q=0 (constant offset) through
+        p+q=order.
 
         Args:
             order: Polynomial order (2–6 typical).
             scale: Normalization scale (typically image_width / 2).
             a_coeffs: Forward A coefficients (x correction, ideal → distorted).
             b_coeffs: Forward B coefficients (y correction, ideal → distorted).
-            ap_coeffs: Inverse AP coefficients (x correction, distorted → ideal).
-            bp_coeffs: Inverse BP coefficients (y correction, distorted → ideal).
+            ap_coeffs: Deprecated and ignored — the model inverts numerically.
+            bp_coeffs: Deprecated and ignored. See ap_coeffs.
         """
         ...
 
@@ -1031,7 +1098,11 @@ def extract_centroids(
     max_centroids: Optional[int] = None,
     local_bg_block_size: Optional[int] = 64,
     max_elongation: Optional[float] = 3.0,
-    matched_filter_sigma: Optional[float] = None,
+    matched_filter_sigma: Optional[float] = 1.5,
+    max_sharpness: Optional[float] = 0.9,
+    saturation_level: Optional[float] = None,
+    deblend: str = "off",
+    border_margin: int = 0,
 ) -> ExtractionResult:
     """Extract star centroids from a 2D image array.
 
@@ -1046,46 +1117,87 @@ def extract_centroids(
             None = global background only.
         max_elongation: Maximum blob elongation ratio. None = disabled.
         matched_filter_sigma: Apply a Gaussian matched filter of this sigma
-            (in pixels) before thresholding. Boosts point-source SNR; used
-            only to form the detection mask so photometry is unaffected.
-            Consider lowering sigma_threshold when enabled. None = disabled.
+            (in pixels) before thresholding (~2x point-source SNR for a
+            sigma~1.5 px PSF). Used only to form the detection mask, so
+            photometry is unaffected, and the threshold is automatically
+            scaled for the filtered noise level — no retuning needed.
+            None = disabled. Default 1.5.
+        max_sharpness: Reject blobs whose peak sharpness
+            ``(peak - mean(8 neighbors)) / peak`` exceeds this — values near
+            1 are hot pixels / cosmic rays, not stars. A critically sampled
+            PSF scores ~0.5; strongly undersampled optics up to ~0.85.
+            Set to None for severely undersampled data (PSF FWHM below
+            ~1.5 px), where real stars are indistinguishable from hot
+            pixels. Default 0.9.
+        saturation_level: Pixel value at or above which the sensor is
+            saturated; such blobs skip sub-pixel peak refinement (a flat top
+            has no meaningful maximum) and keep the center-of-mass position.
+            None = disabled.
+        deblend: Policy for blobs with more than one distinct intensity
+            peak (blended pairs centroid to a wrong midpoint position).
+            "off" keeps them merged; "reject" drops them — the safe choice
+            for plate solving. Saturated blobs are exempt.
+        border_margin: Drop blobs whose bounding box comes within this many
+            pixels of an image edge (truncated PSFs bias the center-of-mass
+            inward).
 
     Returns:
         ExtractionResult with centroids and image statistics.
     """
     ...
 
-def undistort_centroids(
-    centroids: list[Centroid],
-    distortion: Union[RadialDistortion, PolynomialDistortion],
-) -> list[Centroid]:
-    """Apply distortion correction to a list of centroids (distorted → ideal).
+def extract_centroids_fast(
+    image: npt.NDArray,
+    sigma_threshold: float = 5.0,
+    bg_grid: int = 64,
+    min_pixels: int = 2,
+    max_centroids: Optional[int] = None,
+    max_sharpness: Optional[float] = 0.9,
+    saturation_level: Optional[float] = None,
+    max_pixels: int = 10000,
+    max_elongation: Optional[float] = None,
+    border_margin: int = 0,
+) -> ExtractionResult:
+    """Fast single-pass centroid extraction — the "adequate star tracker" path.
 
-    Returns a new list with corrected positions; brightness and covariance are preserved.
-
-    Args:
-        centroids: List of Centroid objects.
-        distortion: A RadialDistortion model.
-
-    Returns:
-        A new list of Centroid objects with undistorted positions.
-    """
-    ...
-
-def distort_centroids(
-    centroids: list[Centroid],
-    distortion: Union[RadialDistortion, PolynomialDistortion],
-) -> list[Centroid]:
-    """Apply forward distortion to a list of centroids (ideal → distorted).
-
-    Returns a new list with distorted positions; brightness and covariance are preserved.
+    Reads each pixel once (coarse-grid background + run-length connected-
+    component moments), so it is several times faster than
+    :func:`extract_centroids` — at the cost of faint-star sensitivity and
+    sub-pixel accuracy (~0.1 px on bright stars). Use :func:`extract_centroids`
+    for calibration or faint-star work. Returns the same ``ExtractionResult``,
+    so it is a drop-in for ``solve_from_centroids``.
 
     Args:
-        centroids: List of Centroid objects.
-        distortion: A RadialDistortion model.
+        image: 2D numpy array (height x width) of pixel values.
+            Supported dtypes: float64, float32, uint16, int16, uint8.
+        sigma_threshold: Detection threshold in noise sigmas above the local
+            background.
+        bg_grid: Coarse background-grid block size in pixels (tracks gradients
+            such as vignetting / Milky Way).
+        min_pixels: Minimum pixels in a region; rejects hot pixels.
+        max_centroids: Maximum number of centroids to return, brightest first.
+            None = all.
+        max_sharpness: Reject regions whose peak sharpness
+            ``(peak - mean(8 neighbors)) / peak`` exceeds this — values near
+            1 are hot pixels / cosmic rays, not stars. Set to None for
+            severely undersampled data (PSF FWHM below ~1.5 px).
+            Default 0.9.
+        saturation_level: Pixel value at or above which the sensor is
+            saturated; such regions skip sub-pixel peak refinement and keep
+            the center-of-mass position. None = disabled.
+        max_pixels: Maximum region size in pixels — without it a satellite
+            trail or horizon glow becomes the *brightest* centroid handed to
+            the solver.
+        max_elongation: Maximum elongation ratio (major/minor axis) from
+            intensity-weighted second moments — rejects streaks too small
+            for max_pixels. Off by default (noisy for few-pixel regions);
+            enable (3.0-5.0) with min_pixels raised to ~5+. None = disabled.
+        border_margin: Drop regions whose bounding box comes within this
+            many pixels of an image edge (truncated PSFs bias the
+            center-of-mass inward).
 
     Returns:
-        A new list of Centroid objects with distorted positions.
+        ExtractionResult with centroids and image statistics.
     """
     ...
 

@@ -24,9 +24,12 @@ pub(crate) fn extract_distortion(obj: &Bound<'_, pyo3::PyAny>) -> PyResult<Disto
 /// y_d = y · (1 + k1·r² + k2·r⁴ + k3·r⁶) + p1·(r² + 2·y²) + 2·p2·x·y
 /// ```
 ///
-/// Coordinates are in pixels relative to the optical center (image center
-/// minus CRPIX). Tangential coefficients ``p1, p2`` default to 0 — set them
-/// to model lens decentering, sensor tilt, or off-axis CCD placement.
+/// Coordinates are in pixels, origin at the image center; the model shifts
+/// into its own ``center`` frame (the optical axis, ``(0, 0)`` by default)
+/// internally. Tangential coefficients ``p1, p2`` default to 0 — set them
+/// to model lens decentering or sensor tilt. On mosaic cameras (e.g. TESS)
+/// the optical axis can sit far off the detector center — ``center`` carries
+/// that offset.
 ///
 /// Example:
 ///     d = tetra3rs.RadialDistortion(k1=-7e-9, k2=2e-15)
@@ -63,11 +66,13 @@ impl PyRadialDistortion {
     ///     k3: Third radial coefficient. Default 0.
     ///     p1: First tangential / decentering coefficient. Default 0.
     ///     p2: Second tangential / decentering coefficient. Default 0.
+    ///     center: Distortion center (optical axis) in pixels,
+    ///         image-center-origin frame. Default (0, 0).
     #[new]
-    #[pyo3(signature = (k1 = 0.0, k2 = 0.0, k3 = 0.0, p1 = 0.0, p2 = 0.0))]
-    fn new(k1: f64, k2: f64, k3: f64, p1: f64, p2: f64) -> Self {
+    #[pyo3(signature = (k1 = 0.0, k2 = 0.0, k3 = 0.0, p1 = 0.0, p2 = 0.0, center = (0.0, 0.0)))]
+    fn new(k1: f64, k2: f64, k3: f64, p1: f64, p2: f64, center: (f64, f64)) -> Self {
         Self {
-            inner: RadialDistortion::with_tangential(k1, k2, k3, p1, p2),
+            inner: RadialDistortion::with_center(center.0, center.1, k1, k2, k3, p1, p2),
         }
     }
 
@@ -96,6 +101,13 @@ impl PyRadialDistortion {
         self.inner.p2
     }
 
+    /// Distortion center (optical axis) as ``(cx, cy)`` in pixels,
+    /// image-center-origin frame.
+    #[getter]
+    fn center(&self) -> (f64, f64) {
+        (self.inner.center[0], self.inner.center[1])
+    }
+
     /// Forward distortion: ideal → distorted.
     fn distort(&self, x: f64, y: f64) -> (f64, f64) {
         self.inner.distort(x, y)
@@ -107,9 +119,7 @@ impl PyRadialDistortion {
     }
 
     fn __reduce__(slf: &Bound<'_, Self>) -> PyResult<(Py<PyAny>, (Vec<u8>,))> {
-        let bytes = crate::helpers::to_postcard_bytes(&slf.borrow().inner)?;
-        let from_bytes = slf.get_type().getattr("_from_pickle_bytes")?;
-        Ok((from_bytes.unbind(), (bytes,)))
+        crate::helpers::pickle_reduce(slf, &slf.borrow().inner)
     }
 
     #[staticmethod]
@@ -119,23 +129,31 @@ impl PyRadialDistortion {
     }
 
     fn __repr__(&self) -> String {
-        if self.inner.p1 == 0.0 && self.inner.p2 == 0.0 {
+        let mut s = if self.inner.p1 == 0.0 && self.inner.p2 == 0.0 {
             format!(
-                "RadialDistortion(k1={:.3e}, k2={:.3e}, k3={:.3e})",
+                "RadialDistortion(k1={:.3e}, k2={:.3e}, k3={:.3e}",
                 self.inner.k1, self.inner.k2, self.inner.k3
             )
         } else {
             format!(
-                "RadialDistortion(k1={:.3e}, k2={:.3e}, k3={:.3e}, p1={:.3e}, p2={:.3e})",
+                "RadialDistortion(k1={:.3e}, k2={:.3e}, k3={:.3e}, p1={:.3e}, p2={:.3e}",
                 self.inner.k1, self.inner.k2, self.inner.k3, self.inner.p1, self.inner.p2
             )
+        };
+        if self.inner.center != [0.0, 0.0] {
+            s.push_str(&format!(
+                ", center=({:.1}, {:.1})",
+                self.inner.center[0], self.inner.center[1]
+            ));
         }
+        s.push(')');
+        s
     }
 }
 
 /// SIP-like polynomial distortion model with independent x,y correction terms.
 ///
-/// Forward:  x_d = x + Σ A_pq · (x/s)^p · (y/s)^q   (2 ≤ p+q ≤ order)
+/// Forward:  x_d = x + Σ A_pq · (x/s)^p · (y/s)^q   (0 ≤ p+q ≤ order)
 /// Inverse:  x_i = x_d + Σ AP_pq · (x_d/s)^p · (y_d/s)^q
 ///
 /// Where s = scale = image_width/2.
@@ -169,39 +187,39 @@ pub(crate) struct PyPolynomialDistortion {
 
 #[pymethods]
 impl PyPolynomialDistortion {
-    /// Create a polynomial distortion model from coefficient arrays.
+    /// Create a polynomial distortion model from forward coefficient arrays.
     ///
     /// Args:
     ///     order: Polynomial order (2–6 typical).
     ///     scale: Normalization scale (typically image_width / 2).
     ///     a_coeffs: Forward A coefficients (x correction, ideal → distorted).
     ///     b_coeffs: Forward B coefficients (y correction, ideal → distorted).
-    ///     ap_coeffs: Inverse AP coefficients (x correction, distorted → ideal).
-    ///     bp_coeffs: Inverse BP coefficients (y correction, distorted → ideal).
+    ///     ap_coeffs: Deprecated and ignored — the model inverts numerically
+    ///         (Newton). Accepted only for backward compatibility.
+    ///     bp_coeffs: Deprecated and ignored. See ap_coeffs.
     #[new]
+    #[pyo3(signature = (order, scale, a_coeffs, b_coeffs, ap_coeffs=None, bp_coeffs=None))]
     fn new(
         order: u32,
         scale: f64,
         a_coeffs: Vec<f64>,
         b_coeffs: Vec<f64>,
-        ap_coeffs: Vec<f64>,
-        bp_coeffs: Vec<f64>,
+        ap_coeffs: Option<Vec<f64>>,
+        bp_coeffs: Option<Vec<f64>>,
     ) -> PyResult<Self> {
+        let _ = (ap_coeffs, bp_coeffs); // legacy inverse coeffs are no longer used
         let n = poly_num_coeffs(order);
-        if a_coeffs.len() != n
-            || b_coeffs.len() != n
-            || ap_coeffs.len() != n
-            || bp_coeffs.len() != n
-        {
+        if a_coeffs.len() != n || b_coeffs.len() != n {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Each coefficient array must have {} elements for order {} (got a={}, b={}, ap={}, bp={})",
-                n, order, a_coeffs.len(), b_coeffs.len(), ap_coeffs.len(), bp_coeffs.len()
+                "a_coeffs and b_coeffs must each have {} elements for order {} (got a={}, b={})",
+                n,
+                order,
+                a_coeffs.len(),
+                b_coeffs.len()
             )));
         }
         Ok(Self {
-            inner: PolynomialDistortion::new(
-                order, scale, a_coeffs, b_coeffs, ap_coeffs, bp_coeffs,
-            ),
+            inner: PolynomialDistortion::new(order, scale, a_coeffs, b_coeffs),
         })
     }
 
@@ -256,9 +274,7 @@ impl PyPolynomialDistortion {
     }
 
     fn __reduce__(slf: &Bound<'_, Self>) -> PyResult<(Py<PyAny>, (Vec<u8>,))> {
-        let bytes = crate::helpers::to_postcard_bytes(&slf.borrow().inner)?;
-        let from_bytes = slf.get_type().getattr("_from_pickle_bytes")?;
-        Ok((from_bytes.unbind(), (bytes,)))
+        crate::helpers::pickle_reduce(slf, &slf.borrow().inner)
     }
 
     #[staticmethod]

@@ -15,7 +15,8 @@ Python API documentation for tetra3rs, auto-generated from type stubs.
 
 | Symbol | Description |
 |--------|-------------|
-| [`extract_centroids()`](extraction.md) | Extract star centroids from an image array |
+| [`extract_centroids()`](extraction.md) | Extract star centroids from an image array (connected-component pipeline; default) |
+| [`extract_centroids_fast()`](extraction.md#tetra3rs.extract_centroids_fast) | Fast single-pass extractor — lower latency, lower fidelity ("adequate star tracker") |
 | [`ExtractionResult`](extraction.md#tetra3rs.ExtractionResult) | Extraction result with centroids and image statistics |
 | [`Centroid`](extraction.md#tetra3rs.Centroid) | A single star centroid with position, brightness, and shape |
 
@@ -31,5 +32,3 @@ Python API documentation for tetra3rs, auto-generated from type stubs.
 | Function | Description |
 |----------|-------------|
 | [`earth_barycentric_velocity()`](functions.md#tetra3rs.earth_barycentric_velocity) | Approximate Earth barycentric velocity for aberration correction |
-| [`undistort_centroids()`](functions.md#tetra3rs.undistort_centroids) | Apply inverse distortion to a list of centroids |
-| [`distort_centroids()`](functions.md#tetra3rs.distort_centroids) | Apply forward distortion to a list of centroids |

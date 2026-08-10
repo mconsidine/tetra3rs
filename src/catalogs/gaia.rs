@@ -1,13 +1,17 @@
 use crate::error::{Error, Result};
 use std::path::Path;
+use tracing::debug;
 
 pub struct GaiaStar {
     pub source_id: i64,
     pub ra_deg: f32,
     pub dec_deg: f32,
     pub phot_g_mean_mag: f32,
-    pub pmra: Option<f32>,
-    pub pmdec: Option<f32>,
+    /// Proper motion in RA (mas/yr, as μα·cos δ). The binary format encodes
+    /// missing proper motion as 0.0, so this is never optional.
+    pub pmra: f32,
+    /// Proper motion in Dec (mas/yr).
+    pub pmdec: f32,
 }
 
 /// Load a Gaia catalog from the binary format.
@@ -41,7 +45,31 @@ pub fn load_gaia_binary<P: AsRef<Path>>(path: P) -> Result<Vec<GaiaStar>> {
     let num_stars = u64::from_le_bytes(header[8..16].try_into().unwrap()) as usize;
 
     let record_size = 36;
-    let mut buf = vec![0u8; num_stars * record_size];
+    // A corrupt/truncated header could claim a huge `num_stars`, driving a
+    // multi-gigabyte allocation (or a capacity-overflow abort) before
+    // `read_exact` gets a chance to fail. Require the star block to match the
+    // file's remaining bytes exactly first.
+    let expected_bytes = num_stars.checked_mul(record_size).ok_or_else(|| {
+        Error::InvalidCatalog("Gaia binary: num_stars * record_size overflows".into())
+    })?;
+    let data_bytes = file.metadata()?.len().saturating_sub(header.len() as u64);
+    // Require *at least* the claimed star block (guards a truncated header that
+    // would otherwise drive a multi-gigabyte allocation before `read_exact`
+    // fails). Trailing bytes — padding or appended metadata that 0.8 read past
+    // fine — are tolerated: we consume exactly `expected_bytes` below.
+    if data_bytes < expected_bytes as u64 {
+        return Err(Error::InvalidCatalog(format!(
+            "Gaia binary: header claims {num_stars} stars ({expected_bytes} bytes) \
+             but file has only {data_bytes} data bytes"
+        )));
+    }
+    if data_bytes > expected_bytes as u64 {
+        debug!(
+            "Gaia binary: {} trailing byte(s) after the {num_stars}-star block; ignoring",
+            data_bytes - expected_bytes as u64
+        );
+    }
+    let mut buf = vec![0u8; expected_bytes];
     file.read_exact(&mut buf)?;
 
     let mut stars = Vec::with_capacity(num_stars);
@@ -61,8 +89,8 @@ pub fn load_gaia_binary<P: AsRef<Path>>(path: P) -> Result<Vec<GaiaStar>> {
             ra_deg: ra as f32,
             dec_deg: dec as f32,
             phot_g_mean_mag: mag,
-            pmra: Some(pmra),
-            pmdec: Some(pmdec),
+            pmra,
+            pmdec,
         });
     }
 

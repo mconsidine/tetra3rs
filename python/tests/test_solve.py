@@ -76,6 +76,14 @@ class TestCatalogAccess:
         mags = [s.magnitude for s in stars]
         assert mags == sorted(mags), "Cone search should return brightest first"
 
+    def test_catalog_star_pickle(self, skyview_db):
+        star = skyview_db.cone_search(83.0, -1.0, 5.0)[0]
+        star2 = pickle.loads(pickle.dumps(star))
+        assert star2.id == star.id
+        assert star2.ra_deg == star.ra_deg
+        assert star2.dec_deg == star.dec_deg
+        assert star2.magnitude == star.magnitude
+
 
 # ---------------------------------------------------------------------------
 # Solve from synthetic centroids
@@ -114,7 +122,7 @@ class TestSolveFromCentroids:
             solve_timeout_ms=60_000,
         )
 
-        assert result is not None, f"{label}: no solution"
+        assert result, f"{label}: no solution ({result})"
         assert result.status == "match_found"
         error = angular_sep_deg(result.ra_deg, result.dec_deg, ra, dec)
         assert error < 0.5, f"{label}: boresight error {error:.3f}° > 0.5°"
@@ -137,8 +145,59 @@ class TestSolveFromCentroids:
             image_height=image_size,
             fov_max_error_deg=3.0,
         )
-        assert result is not None
+        assert result
         assert result.status == "match_found"
+
+    def test_solve_with_camera_model_only(self, skyview_db):
+        """A CameraModel alone suffices — fov_estimate/image_* are optional."""
+        ra, dec = 83.0, -1.0
+        fov_deg = 10.0
+        image_size = 2048
+        f_px = image_size / (2.0 * math.tan(math.radians(fov_deg / 2.0)))
+
+        stars = skyview_db.cone_search(ra, dec, fov_deg)
+        centroids = project_stars_tan(stars[:50], ra, dec, f_px, image_size)
+
+        cam = tetra3rs.CameraModel.from_fov(fov_deg, image_size, image_size)
+        # No fov_estimate_* and no image_* — the model carries all geometry.
+        result = skyview_db.solve_from_centroids(
+            centroids, camera_model=cam, fov_max_error_deg=3.0
+        )
+        assert result, f"camera-model-only solve failed ({result})"
+        assert result.status == "match_found"
+
+    def test_solve_with_float32_centroid_array(self, skyview_db):
+        """An Nx2 float32 array is accepted (not just float64)."""
+        ra, dec = 83.0, -1.0
+        fov_deg = 10.0
+        image_size = 2048
+        f_px = image_size / (2.0 * math.tan(math.radians(fov_deg / 2.0)))
+
+        stars = skyview_db.cone_search(ra, dec, fov_deg)
+        centroid_objs = project_stars_tan(stars[:50], ra, dec, f_px, image_size)
+        arr = np.array([[c.x, c.y] for c in centroid_objs], dtype=np.float32)
+
+        result = skyview_db.solve_from_centroids(
+            arr,
+            fov_estimate_deg=fov_deg,
+            image_width=image_size,
+            image_height=image_size,
+            fov_max_error_deg=3.0,
+        )
+        assert result
+        assert result.status == "match_found"
+
+    def test_bad_attitude_hint_raises(self, skyview_db):
+        """A degenerate (zero-norm) quaternion hint raises ValueError."""
+        centroids = np.zeros((5, 2), dtype=np.float64)
+        with pytest.raises(ValueError):
+            skyview_db.solve_from_centroids(
+                centroids,
+                fov_estimate_deg=10.0,
+                image_width=2048,
+                image_height=2048,
+                attitude_hint=[0.0, 0.0, 0.0, 0.0],
+            )
 
     def test_solve_with_numpy_array_3col(self, skyview_db):
         """Verify centroids can be passed as Nx3 numpy array (x, y, brightness)."""
@@ -161,7 +220,7 @@ class TestSolveFromCentroids:
             image_height=image_size,
             fov_max_error_deg=3.0,
         )
-        assert result is not None
+        assert result
         assert result.status == "match_found"
 
 
@@ -189,7 +248,7 @@ class TestSolveResult:
             image_height=image_size,
             fov_max_error_deg=3.0,
         )
-        assert result is not None
+        assert result
         return result
 
     def test_basic_properties(self, orion_result):
@@ -240,7 +299,7 @@ class TestSolveResult:
         """Center pixel should map to near the boresight."""
         r = orion_result
         result = r.pixel_to_world(0.0, 0.0)
-        assert result is not None
+        assert result
         ra, dec = result
         error = angular_sep_deg(ra, dec, r.ra_deg, r.dec_deg)
         assert error < 0.5
@@ -249,7 +308,7 @@ class TestSolveResult:
         """Boresight RA/Dec should map back to near image center."""
         r = orion_result
         result = r.world_to_pixel(r.ra_deg, r.dec_deg)
-        assert result is not None
+        assert result
         x, y = result
         assert abs(x) < 10.0
         assert abs(y) < 10.0
@@ -269,7 +328,7 @@ class TestSolveResult:
         xs = np.array([0.0, 100.0, -100.0])
         ys = np.array([0.0, 50.0, -50.0])
         result = r.pixel_to_world(xs, ys)
-        assert result is not None
+        assert result
         ras, decs = result
         assert len(ras) == 3
         assert len(decs) == 3
@@ -304,7 +363,7 @@ class TestCalibration:
             image_height=image_size,
             fov_max_error_deg=3.0,
         )
-        assert result is not None
+        assert result
 
         cal = skyview_db.calibrate_camera(
             result,
@@ -371,7 +430,7 @@ class TestTrackingMode:
             image_height=image_size,
             fov_max_error_deg=3.0,
         )
-        assert lis is not None, "LIS solve failed"
+        assert lis, f"LIS solve failed ({lis})"
 
         # Step 2: perturb the recovered attitude by 15' around a random axis.
         # Small-angle quaternion: q_pert = [cos(θ/2), sin(θ/2)·axis]
@@ -414,7 +473,7 @@ class TestTrackingMode:
             strict_hint=True,  # no LIS fallback — we want to test tracking specifically
         )
 
-        assert tracked is not None, f"Tracking solve failed with {hint_kind} hint"
+        assert tracked, f"Tracking solve failed with {hint_kind} hint ({tracked})"
         # On noiseless synthetic data, tracking and LIS converge to the same
         # fixed point of wcs_refine — agreement should be well below 1″.
         # We use 1″ as a loose bound that catches gross regressions but
@@ -443,7 +502,7 @@ class TestTrackingMode:
             # strict_hint=False → fallback to LIS
         )
 
-        assert result is not None, "Should have fallen back to LIS"
+        assert result, f"Should have fallen back to LIS ({result})"
         error = angular_sep_deg(result.ra_deg, result.dec_deg, ra, dec)
         assert error < 0.5, f"LIS fallback solved wrong field (error {error:.3f}°)"
 
@@ -462,7 +521,8 @@ class TestTrackingMode:
             hint_uncertainty_deg=0.5,
             strict_hint=True,
         )
-        assert result is None, "strict_hint should suppress LIS fallback on bad hint"
+        assert not result, "strict_hint should suppress LIS fallback on bad hint"
+        assert result.status in ("no_match", "too_few")
 
     def test_attitude_hint_invalid_shape_raises(self, skyview_db):
         """Passing a hint with wrong shape should raise ValueError."""
