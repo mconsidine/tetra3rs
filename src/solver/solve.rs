@@ -605,11 +605,8 @@ impl SolverDatabase {
                     // Determine parity from the rotation determinant.
                     // centroid_vectors is never mutated; when parity is needed we use
                     // a lazily-created x-flipped copy for verification matching.
-                    let parity_flip;
-                    let working_vectors: &[[f32; 3]];
-                    if rotation_matrix.det() < 0.0 {
+                    let parity_flip = if rotation_matrix.det() < 0.0 {
                         // Wrong parity (e.g. FITS image with CDELT1 < 0).
-                        parity_flip = true;
                         // Derive the parity-flipped rotation WITHOUT a second SVD.
                         //
                         // Flipping the x-component of every image vector is
@@ -631,10 +628,11 @@ impl SolverDatabase {
                         rotation_matrix[(0, 0)] = -rotation_matrix[(0, 0)];
                         rotation_matrix[(0, 1)] = -rotation_matrix[(0, 1)];
                         rotation_matrix[(0, 2)] = -rotation_matrix[(0, 2)];
+                        true
                     } else {
-                        parity_flip = false;
-                    }
-                    if rebuild {
+                        false
+                    };
+                    let working_vectors: &[[f32; 3]] = if rebuild {
                         // Rebuild the full verification set at the measured
                         // scale (parity applied directly via the x-sign).
                         let sign = if parity_flip { -1.0f32 } else { 1.0 };
@@ -644,18 +642,18 @@ impl SolverDatabase {
                                 .iter()
                                 .map(|&i| unit_vector_from_pixels(&centroids[i], ps_meas, sign)),
                         );
-                        working_vectors = &rebuilt_vectors;
+                        &rebuilt_vectors
                     } else if parity_flip {
                         // Lazily create flipped centroid vectors for matching
-                        working_vectors = flipped_vectors.get_or_insert_with(|| {
+                        flipped_vectors.get_or_insert_with(|| {
                             centroid_vectors
                                 .iter()
                                 .map(|v| [-v[0], v[1], v[2]])
                                 .collect()
-                        });
+                        })
                     } else {
-                        working_vectors = &centroid_vectors;
-                    }
+                        &centroid_vectors
+                    };
 
                     // ── Verify by matching nearby catalog stars ──
                     // The pattern stars that fall inside the tested
