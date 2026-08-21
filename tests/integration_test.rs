@@ -846,6 +846,58 @@ fn test_save_and_load_database() {
 
     // Clean up temporary file
     std::fs::remove_file(tmp_path).expect("Failed to delete temporary file");
+
+    // ── Corruption is rejected at load, not deferred to a mid-solve panic ──
+    // Each tampered database decodes cleanly through postcard; without
+    // validate() the inconsistency only surfaces as an out-of-bounds index
+    // (or unbounded key enumeration) during solve_from_centroids.
+    let n_stars = db.star_catalog.len() as u32;
+
+    let mut tampered = db.clone();
+    tampered.star_vectors.truncate(db.star_vectors.len() / 2);
+    assert!(
+        tampered.validate().is_err(),
+        "truncated star_vectors must fail validation"
+    );
+
+    let mut tampered = db.clone();
+    tampered.star_catalog_ids.push(0);
+    assert!(
+        tampered.validate().is_err(),
+        "over-long star_catalog_ids must fail validation"
+    );
+
+    let mut tampered = db.clone();
+    let slot = tampered
+        .pattern_catalog
+        .entries
+        .iter()
+        .position(|e| !e.is_empty())
+        .expect("generated database has at least one pattern");
+    tampered.pattern_catalog.entries[slot].star_indices = [n_stars, 0, 0, 0];
+    assert!(
+        tampered.validate().is_err(),
+        "pattern entry indexing past the star table must fail validation"
+    );
+
+    let mut tampered = db.clone();
+    tampered.props.pattern_bins = u32::MAX; // would explode key enumeration
+    assert!(
+        tampered.validate().is_err(),
+        "pattern_bins inconsistent with pattern_max_error must fail validation"
+    );
+
+    // And end-to-end: a bit-flipped file either fails to decode (postcard) or
+    // fails validation — it must never load successfully with corrupt indices.
+    let bad_path = "temp_db_corrupt.bin";
+    tampered.star_vectors.truncate(3);
+    let bytes = tampered.to_bytes().expect("serialize tampered db");
+    std::fs::write(bad_path, &bytes).expect("write corrupt db");
+    assert!(
+        SolverDatabase::load_from_file(bad_path).is_err(),
+        "corrupt database file must be rejected at load"
+    );
+    std::fs::remove_file(bad_path).ok();
 }
 
 /// Solve 1000 random orientations with a 10° FOV camera and 4"/axis centroid noise.

@@ -344,8 +344,21 @@ impl GenerateDatabaseConfig {
                 "verification_stars_per_fov must be >= 1".into(),
             ));
         }
-        if self.catalog_nside == 0 {
-            return Err(InvalidInput("catalog_nside must be >= 1".into()));
+        if self.catalog_nside == 0 || self.catalog_nside > crate::starcatalog::MAX_NSIDE {
+            return Err(InvalidInput(format!(
+                "catalog_nside must be in [1, {}], got {}",
+                crate::starcatalog::MAX_NSIDE,
+                self.catalog_nside
+            )));
+        }
+        // The epoch multiplies proper motions (star.ra + μ·Δt); NaN/absurd
+        // years silently produce NaN star positions and a useless database.
+        if let Some(year) = self.epoch_proper_motion_year {
+            if !(year.is_finite() && (1000.0..=3000.0).contains(&year)) {
+                return Err(InvalidInput(format!(
+                    "epoch_proper_motion_year must be a plausible year in [1000, 3000], got {year}"
+                )));
+            }
         }
         Ok(())
     }

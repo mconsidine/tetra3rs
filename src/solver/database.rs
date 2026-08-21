@@ -22,6 +22,13 @@ use super::{DatabaseProperties, GenerateDatabaseConfig, PatternEntry, SolverData
 
 // ── Sky geometry utilities ──────────────────────────────────────────────────
 
+/// Hard ceiling on lattice points per FOV scale during generation. The count
+/// scales as `oversampling / fov²`, so a tiny-but-valid `min_fov_deg` (e.g.
+/// 0.1° at the default oversampling of 100 → ~5×10⁸ points ≈ 6 GB) would
+/// otherwise exhaust memory with no diagnostic. 10⁸ points (1.2 GB) is far
+/// beyond any published tetra3-style database.
+const MAX_LATTICE_POINTS: usize = 100_000_000;
+
 /// Approximate number of FOV-sized fields needed to tile the full sky.
 fn num_fields_for_sky(fov_rad: f32) -> usize {
     // Solid angle of a cone with half-angle fov/2: 2π(1 − cos(fov/2))
@@ -253,8 +260,16 @@ impl SolverDatabase {
 
             // ── Distribute lattice fields and generate patterns ──
             let fov_angle = pattern_fov / 2.0;
-            let n_fields =
-                num_fields_for_sky(pattern_fov) * config.lattice_field_oversampling as usize;
+            let n_fields = num_fields_for_sky(pattern_fov)
+                .saturating_mul(config.lattice_field_oversampling as usize);
+            if n_fields > MAX_LATTICE_POINTS {
+                return Err(crate::Error::InvalidInput(format!(
+                    "lattice would need {n_fields} field centers at FOV {:.3}° \
+                     (limit {MAX_LATTICE_POINTS}); raise min_fov_deg or lower \
+                     lattice_field_oversampling",
+                    pattern_fov.to_degrees()
+                )));
+            }
 
             let lattice_points = fibonacci_sphere_lattice(n_fields);
             let mut total_added = 0usize;
@@ -412,27 +427,118 @@ fn compute_magnitude_cutoff(stars: &[Star], min_fov: f32, verification_stars_per
 
 impl SolverDatabase {
     /// Serialize the database to bytes using postcard.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(self).expect("postcard serialization failed")
+    pub fn to_bytes(&self) -> crate::Result<Vec<u8>> {
+        Ok(postcard::to_allocvec(self)?)
     }
 
     /// Save the database to a file using postcard.
     pub fn save_to_file(&self, path: &str) -> crate::Result<()> {
-        let bytes = self.to_bytes();
+        let bytes = self.to_bytes()?;
         std::fs::write(path, &bytes)?;
         info!("Saved database to {} ({} bytes)", path, bytes.len());
         Ok(())
     }
 
     /// Load a database from a postcard file.
+    ///
+    /// The decoded database is checked with [`Self::validate`], so a corrupt,
+    /// truncated, or tampered file fails here with a descriptive
+    /// [`crate::Error::InvalidInput`] instead of panicking mid-solve.
     pub fn load_from_file(path: &str) -> crate::Result<Self> {
         let bytes = std::fs::read(path)?;
         let db = postcard::from_bytes::<Self>(&bytes)?;
+        db.validate()?;
         info!(
             "Loaded database: {} stars, {} patterns",
             db.star_catalog.len(),
             db.props.num_patterns
         );
         Ok(db)
+    }
+
+    /// Check the cross-field invariants the solver relies on but postcard
+    /// deserialization cannot: every structure decodes independently, so a
+    /// file that parses cleanly can still carry pattern entries indexing past
+    /// the star table, a spatial index inconsistent with its stars, or
+    /// properties that blow up the key-enumeration bounds. Each of those is a
+    /// deferred panic (or memory blow-up) on the first solve.
+    ///
+    /// Called by [`Self::load_from_file`]; call it yourself after decoding
+    /// database bytes from any other untrusted source (e.g. pickle).
+    pub fn validate(&self) -> crate::Result<()> {
+        use crate::Error::InvalidInput;
+        self.star_catalog.validate()?;
+
+        let n_stars = self.star_catalog.len();
+        if self.star_vectors.len() != n_stars || self.star_catalog_ids.len() != n_stars {
+            return Err(InvalidInput(format!(
+                "SolverDatabase: star_vectors ({}) / star_catalog_ids ({}) must both match \
+                 the star catalog ({n_stars} stars)",
+                self.star_vectors.len(),
+                self.star_catalog_ids.len()
+            )));
+        }
+
+        let p = &self.props;
+        if !(p.pattern_max_error.is_finite()
+            && p.pattern_max_error > 0.0
+            && p.pattern_max_error <= 0.25)
+        {
+            return Err(InvalidInput(format!(
+                "SolverDatabase: props.pattern_max_error must be in (0, 0.25], got {}",
+                p.pattern_max_error
+            )));
+        }
+        // Generation always derives bins from the error tolerance; a file
+        // claiming a different (huge) bin count inflates the solver's 5-D
+        // candidate-key enumeration without bound.
+        let expected_bins = (0.25 / p.pattern_max_error).round() as u32;
+        if p.pattern_bins != expected_bins {
+            return Err(InvalidInput(format!(
+                "SolverDatabase: props.pattern_bins ({}) inconsistent with \
+                 pattern_max_error {} (expected {expected_bins})",
+                p.pattern_bins, p.pattern_max_error
+            )));
+        }
+        let fov_ok = p.max_fov_rad.is_finite()
+            && p.max_fov_rad > 0.0
+            && p.max_fov_rad < std::f32::consts::PI
+            && p.min_fov_rad.is_finite()
+            && p.min_fov_rad > 0.0
+            && p.min_fov_rad <= p.max_fov_rad;
+        if !fov_ok {
+            return Err(InvalidInput(format!(
+                "SolverDatabase: props FOV range [{}, {}] rad must be finite, positive, \
+                 ordered, and below π",
+                p.min_fov_rad, p.max_fov_rad
+            )));
+        }
+        if p.verification_stars_per_fov == 0 {
+            return Err(InvalidInput(
+                "SolverDatabase: props.verification_stars_per_fov must be >= 1".into(),
+            ));
+        }
+        if p.num_patterns as usize > self.pattern_catalog.len() {
+            return Err(InvalidInput(format!(
+                "SolverDatabase: props.num_patterns ({}) exceeds the pattern table size ({})",
+                p.num_patterns,
+                self.pattern_catalog.len()
+            )));
+        }
+
+        // Every non-empty pattern entry is indexed straight into star_vectors
+        // during hash probing — before any filter can reject it.
+        for entry in &self.pattern_catalog.entries {
+            if entry.is_empty() {
+                continue;
+            }
+            if entry.star_indices.iter().any(|&i| i as usize >= n_stars) {
+                return Err(InvalidInput(format!(
+                    "SolverDatabase: pattern entry references star index past the \
+                     {n_stars}-star table"
+                )));
+            }
+        }
+        Ok(())
     }
 }

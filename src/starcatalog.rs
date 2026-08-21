@@ -32,16 +32,32 @@ pub struct StarCatalog {
     star_indices: Vec<u32>,
 }
 
+/// Largest `nside` accepted by [`StarCatalog::new`] (and enforced by
+/// [`StarCatalog::validate`]). The index allocates `12 * nside²` cells, so an
+/// unbounded value is a memory-exhaustion vector (`nside = 10_000` ≈ 29 GB of
+/// bin headers) and overflows the `u32` cell arithmetic near `nside ≈ 19_000`.
+/// 1024 (12.6M cells) is far beyond any practical star-density need — the
+/// default is 16.
+pub const MAX_NSIDE: u32 = 1024;
+
 impl StarCatalog {
     /// Build a catalog and spatial index from owned stars.
     ///
-    /// `nside` controls resolution and must be greater than zero.
-    /// The number of sky cells is `12 * nside^2`.
+    /// `nside` controls resolution. The number of sky cells is `12 * nside^2`.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `1 <= nside <= MAX_NSIDE`. Config-driven callers
+    /// ([`crate::GenerateDatabaseConfig`]) reject out-of-range values with an
+    /// error before reaching this constructor.
     pub fn new(nside: u32, stars: Vec<Star>) -> Self {
-        assert!(nside > 0, "nside must be > 0");
+        assert!(
+            nside > 0 && nside <= MAX_NSIDE,
+            "nside must be in [1, {MAX_NSIDE}], got {nside}"
+        );
         let n_lat = 3 * nside;
         let n_lon = 4 * nside;
-        let n_cells = (n_lat * n_lon) as usize;
+        let n_cells = (n_lat as usize) * (n_lon as usize);
 
         let mut bins: Vec<Vec<u32>> = vec![Vec::new(); n_cells];
         for (star_idx, star) in stars.iter().enumerate() {
@@ -85,6 +101,62 @@ impl StarCatalog {
     /// Return all catalog stars as an immutable slice.
     pub fn stars(&self) -> &[Star] {
         &self.stars
+    }
+
+    /// Check the spatial-index invariants that [`Self::new`] establishes by
+    /// construction but that serde deserialization can bypass (the fields are
+    /// private, yet `#[derive(Deserialize)]` writes them directly).
+    ///
+    /// Every cone query indexes `cell_offsets`, `star_indices`, and `stars`
+    /// with values derived from these fields, so a catalog decoded from a
+    /// corrupt or tampered file must pass this check before use — otherwise
+    /// the first query panics out-of-bounds. Called by
+    /// [`crate::SolverDatabase::load_from_file`].
+    pub fn validate(&self) -> crate::Result<()> {
+        use crate::Error::InvalidInput;
+        if self.nside == 0 || self.nside > MAX_NSIDE {
+            return Err(InvalidInput(format!(
+                "StarCatalog: nside must be in [1, {MAX_NSIDE}], got {}",
+                self.nside
+            )));
+        }
+        if self.n_lat != 3 * self.nside || self.n_lon != 4 * self.nside {
+            return Err(InvalidInput(format!(
+                "StarCatalog: n_lat/n_lon ({}/{}) inconsistent with nside {}",
+                self.n_lat, self.n_lon, self.nside
+            )));
+        }
+        let n_cells = (self.n_lat as usize) * (self.n_lon as usize);
+        if self.cell_offsets.len() != n_cells + 1 {
+            return Err(InvalidInput(format!(
+                "StarCatalog: cell_offsets has {} entries, expected {} (12*nside²+1)",
+                self.cell_offsets.len(),
+                n_cells + 1
+            )));
+        }
+        if self.cell_offsets[0] != 0
+            || self.cell_offsets.windows(2).any(|w| w[0] > w[1])
+            || self.cell_offsets[n_cells] as usize != self.star_indices.len()
+        {
+            return Err(InvalidInput(
+                "StarCatalog: cell_offsets must rise monotonically from 0 to star_indices.len()"
+                    .into(),
+            ));
+        }
+        let n_stars = self.stars.len();
+        if self.star_indices.len() != n_stars {
+            return Err(InvalidInput(format!(
+                "StarCatalog: star_indices has {} entries for {} stars",
+                self.star_indices.len(),
+                n_stars
+            )));
+        }
+        if self.star_indices.iter().any(|&i| i as usize >= n_stars) {
+            return Err(InvalidInput(
+                "StarCatalog: star_indices contains an index past the star table".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Query stars within an angular radius of a pointing direction.
@@ -352,6 +424,85 @@ mod tests {
         let mut hit_ids: Vec<i64> = hits.iter().map(|s| s.id).collect();
         hit_ids.sort_unstable();
         assert_eq!(hit_ids, expected);
+    }
+
+    /// Field-for-field mirror of `StarCatalog`'s postcard wire layout, used to
+    /// craft catalogs that violate the private-field invariants — exactly what
+    /// a corrupt or tampered database file can produce through serde.
+    #[derive(serde::Serialize)]
+    struct RawCatalog {
+        nside: u32,
+        n_lat: u32,
+        n_lon: u32,
+        stars: Vec<Star>,
+        cell_offsets: Vec<u32>,
+        star_indices: Vec<u32>,
+    }
+
+    #[test]
+    fn validate_accepts_constructed_and_rejects_tampered() {
+        let stars = vec![Star {
+            id: 1,
+            ra_rad: 0.5,
+            dec_rad: 0.2,
+            mag: 3.0,
+        }];
+        let catalog = StarCatalog::new(2, stars.clone());
+        assert!(catalog.validate().is_ok());
+
+        // Round-trip through postcard stays valid.
+        let bytes = postcard::to_allocvec(&catalog).unwrap();
+        let decoded: StarCatalog = postcard::from_bytes(&bytes).unwrap();
+        assert!(decoded.validate().is_ok());
+
+        let decode = |raw: &RawCatalog| -> StarCatalog {
+            postcard::from_bytes(&postcard::to_allocvec(raw).unwrap()).unwrap()
+        };
+
+        // Each of these decodes cleanly but would panic (OOB index or u32
+        // underflow) inside the first cone query without validate().
+        let n_cells = 6 * 8; // nside 2
+        let cases = [
+            RawCatalog {
+                nside: 0, // n_lat-1 underflow in z_to_lat_bin
+                n_lat: 0,
+                n_lon: 0,
+                stars: stars.clone(),
+                cell_offsets: vec![0],
+                star_indices: vec![0],
+            },
+            RawCatalog {
+                nside: 2,
+                n_lat: 6,
+                n_lon: 8,
+                stars: stars.clone(),
+                cell_offsets: vec![0; 3], // too short for 48 cells
+                star_indices: vec![0],
+            },
+            RawCatalog {
+                nside: 2,
+                n_lat: 6,
+                n_lon: 8,
+                stars: stars.clone(),
+                cell_offsets: vec![7; n_cells + 1], // offsets past star_indices
+                star_indices: vec![0],
+            },
+            RawCatalog {
+                nside: 2,
+                n_lat: 6,
+                n_lon: 8,
+                stars: stars.clone(),
+                cell_offsets: {
+                    let mut o = vec![0; n_cells + 1];
+                    o[n_cells] = 1;
+                    o
+                },
+                star_indices: vec![99], // index past the 1-star table
+            },
+        ];
+        for (i, raw) in cases.iter().enumerate() {
+            assert!(decode(raw).validate().is_err(), "case {i} passed validate");
+        }
     }
 
     #[test]

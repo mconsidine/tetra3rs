@@ -73,6 +73,12 @@ pub struct PolynomialDistortion {
     pub bp_coeffs: Vec<f64>,
 }
 
+/// Largest polynomial order accepted by [`PolynomialDistortion::new`] /
+/// [`PolynomialDistortion::zero`] and by [`PolynomialDistortion::validate`].
+/// SIP fits in practice use order 2–6; this bound exists so an absurd order
+/// can't drive coefficient-count arithmetic or allocations off a cliff.
+pub const MAX_POLY_ORDER: u32 = 12;
+
 impl PolynomialDistortion {
     /// Create a new polynomial distortion model from the forward coefficients.
     ///
@@ -80,7 +86,16 @@ impl PolynomialDistortion {
     /// elements. The legacy inverse (`ap`/`bp`) coefficients are zero-filled —
     /// this crate inverts numerically (Newton) rather than storing an inverse
     /// polynomial; the fields persist only for binary-format compatibility.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `order > MAX_POLY_ORDER` or when a coefficient vector's
+    /// length is not `num_coeffs(order)`.
     pub fn new(order: u32, scale: f64, a_coeffs: Vec<f64>, b_coeffs: Vec<f64>) -> Self {
+        assert!(
+            order <= MAX_POLY_ORDER,
+            "polynomial order must be <= {MAX_POLY_ORDER}, got {order}"
+        );
         let n = num_coeffs(order);
         assert_eq!(a_coeffs.len(), n, "a_coeffs length mismatch");
         assert_eq!(b_coeffs.len(), n, "b_coeffs length mismatch");
@@ -95,7 +110,15 @@ impl PolynomialDistortion {
     }
 
     /// Create a zero (identity) polynomial distortion model.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `order > MAX_POLY_ORDER`.
     pub fn zero(order: u32, scale: f64) -> Self {
+        assert!(
+            order <= MAX_POLY_ORDER,
+            "polynomial order must be <= {MAX_POLY_ORDER}, got {order}"
+        );
         let n = num_coeffs(order);
         Self {
             order,
@@ -161,15 +184,13 @@ impl PolynomialDistortion {
             let j21 = db_du;
             let j22 = 1.0 + db_dv;
             let det = j11 * j22 - j12 * j21;
-            // Singular Jacobian indicates near-degenerate distortion at this
-            // point. We've never observed this in practice — for any sensible
-            // lens distortion the Jacobian is dominated by the identity. If
-            // it ever fires, the latest iterate is still the best estimate.
-            debug_assert!(
-                det.abs() > 1e-15,
-                "singular Jacobian in undistort Newton step"
-            );
-            if det.abs() < 1e-15 {
+            // Singular (or NaN, from non-finite input) Jacobian indicates
+            // degenerate distortion at this point; for any sensible lens the
+            // Jacobian is dominated by the identity. Bail with the latest
+            // iterate — it is still the best estimate. (Deliberately not an
+            // assert: NaN centroids are legal caller input and are filtered
+            // downstream by the solver's finiteness checks.)
+            if !det.is_finite() || det.abs() < 1e-15 {
                 break;
             }
             let inv_det = 1.0 / det;
@@ -180,6 +201,46 @@ impl PolynomialDistortion {
         }
 
         (x, y)
+    }
+
+    /// Check the cross-field invariants that construction normally enforces
+    /// but deserialization (and direct field access — the fields are `pub`)
+    /// can bypass: bounded order, coefficient-vector lengths matching
+    /// `num_coeffs(order)`, and finite scale/coefficients.
+    ///
+    /// Call this after loading a model from an untrusted source (saved file,
+    /// pickle bytes): `distort` / `undistort` index the coefficient vectors
+    /// by `order` and panic out-of-bounds when the two disagree.
+    pub fn validate(&self) -> crate::Result<()> {
+        use crate::Error::InvalidInput;
+        if self.order > MAX_POLY_ORDER {
+            return Err(InvalidInput(format!(
+                "PolynomialDistortion: order must be <= {MAX_POLY_ORDER}, got {}",
+                self.order
+            )));
+        }
+        let n = num_coeffs(self.order);
+        for (name, coeffs) in [("a_coeffs", &self.a_coeffs), ("b_coeffs", &self.b_coeffs)] {
+            if coeffs.len() != n {
+                return Err(InvalidInput(format!(
+                    "PolynomialDistortion: {name} has {} coefficients, order {} requires {n}",
+                    coeffs.len(),
+                    self.order
+                )));
+            }
+            if coeffs.iter().any(|c| !c.is_finite()) {
+                return Err(InvalidInput(format!(
+                    "PolynomialDistortion: {name} contains a non-finite coefficient"
+                )));
+            }
+        }
+        if !(self.scale.is_finite() && self.scale > 0.0) {
+            return Err(InvalidInput(format!(
+                "PolynomialDistortion: scale must be finite and > 0, got {}",
+                self.scale
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -195,8 +256,13 @@ impl PolynomialDistortion {
 ///   etc.
 ///
 /// Total = (order+1)(order+2)/2.
+///
+/// Computed in `u128` (saturating at `usize::MAX`) so an absurd `order` near
+/// `u32::MAX` cannot wrap to a small count — a wrapped count would let
+/// `eval_poly` run past the coefficient vector.
 pub fn num_coeffs(order: u32) -> usize {
-    ((order + 1) * (order + 2) / 2) as usize
+    let o = order as u128;
+    usize::try_from((o + 1) * (o + 2) / 2).unwrap_or(usize::MAX)
 }
 
 /// Map (p, q) with 0 ≤ p+q ≤ order to a flat index.
@@ -329,6 +395,49 @@ mod tests {
                 (0, 3)
             ]
         );
+    }
+
+    #[test]
+    fn test_num_coeffs_no_overflow() {
+        // Regression: u32 arithmetic wrapped for huge orders, letting an
+        // absurd `order` pair with tiny coefficient vectors and index OOB.
+        // (o+1)(o+2)/2 at o = 2³²−1 is 2⁶³ + 2³¹.
+        assert_eq!(num_coeffs(u32::MAX), (1u64 << 63) as usize + (1 << 31));
+    }
+
+    #[test]
+    fn test_validate_catches_inconsistent_fields() {
+        let good = PolynomialDistortion::zero(4, 1024.0);
+        assert!(good.validate().is_ok());
+
+        // Coefficient count disagreeing with order (constructible because the
+        // fields are pub, and decodable from tampered pickle/file bytes).
+        let mut bad = good.clone();
+        bad.a_coeffs.truncate(3);
+        assert!(bad.validate().is_err());
+
+        let mut bad = good.clone();
+        bad.order = MAX_POLY_ORDER + 1;
+        assert!(bad.validate().is_err());
+
+        let mut bad = good.clone();
+        bad.scale = 0.0;
+        assert!(bad.validate().is_err());
+
+        let mut bad = good.clone();
+        bad.b_coeffs[2] = f64::NAN;
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn test_undistort_nan_input_returns_without_panic() {
+        // Regression: a debug_assert on the Newton Jacobian determinant fired
+        // for NaN inputs (legal caller data — the solver filters non-finite
+        // centroids downstream).
+        let d = PolynomialDistortion::zero(4, 1024.0);
+        let (x, y) = d.undistort(f64::NAN, 100.0);
+        assert!(x.is_nan());
+        assert!(y.is_finite() || y.is_nan());
     }
 
     #[test]
