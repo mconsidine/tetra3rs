@@ -262,6 +262,13 @@ impl PySolveResult {
     #[staticmethod]
     fn _from_pickle_bytes(data: &[u8]) -> PyResult<Self> {
         let solution = crate::helpers::from_postcard_bytes::<Solution>(data)?;
+        // The embedded camera model drives pixel_to_world / world_to_pixel;
+        // tampered bytes could give it an inconsistent distortion that
+        // panics on first use.
+        solution
+            .camera_model
+            .validate()
+            .map_err(crate::helpers::map_tetra3_err)?;
         Ok(Self::from_solution(solution))
     }
 

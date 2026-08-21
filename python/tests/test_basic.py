@@ -491,3 +491,48 @@ class TestExtractCentroids:
         result2 = pickle.loads(pickle.dumps(result))
         assert result2.image_width == result.image_width
         assert len(result2.centroids) == len(result.centroids)
+
+
+class TestArgumentValidation:
+    """Regression tests: degenerate arguments raise ValueError instead of
+    panicking (PanicException) or silently poisoning downstream math."""
+
+    def test_from_fov_rejects_degenerate_fov(self):
+        for bad_fov in [0.0, -10.0, 180.0, 360.0, float("nan"), float("inf")]:
+            with pytest.raises(ValueError):
+                tetra3rs.CameraModel.from_fov(bad_fov, 1024, 768)
+        with pytest.raises(ValueError):
+            tetra3rs.CameraModel.from_fov(10.0, 0, 768)
+
+    def test_camera_model_rejects_degenerate_intrinsics(self):
+        with pytest.raises(ValueError):
+            tetra3rs.CameraModel(0.0, 1024, 768)
+        with pytest.raises(ValueError):
+            tetra3rs.CameraModel(float("nan"), 1024, 768)
+        with pytest.raises(ValueError):
+            tetra3rs.CameraModel(5000.0, 0, 768)
+
+    def test_polynomial_distortion_rejects_huge_order(self):
+        # Used to construct via u32 wrap-around and panic on first distort().
+        with pytest.raises(ValueError):
+            tetra3rs.PolynomialDistortion(2**32 - 1, 1.0, [], [])
+        with pytest.raises(ValueError):
+            tetra3rs.PolynomialDistortion(100, 1.0, [0.0], [0.0])
+
+    def test_distortion_rejects_non_finite(self):
+        with pytest.raises(ValueError):
+            tetra3rs.RadialDistortion(k1=float("nan"))
+        n = 15  # order 4
+        bad = [0.0] * n
+        bad[3] = float("inf")
+        with pytest.raises(ValueError):
+            tetra3rs.PolynomialDistortion(4, 512.0, bad, [0.0] * n)
+
+    def test_corrupt_camera_model_pickle_raises(self):
+        cam = tetra3rs.CameraModel.from_fov(10.0, 1024, 768)
+        blob = pickle.dumps(cam)
+        # Truncating the payload must give a clean exception, not a panic on
+        # a later method call.
+        with pytest.raises(Exception) as excinfo:
+            pickle.loads(blob[:-4])
+        assert "Panic" not in type(excinfo.value).__name__

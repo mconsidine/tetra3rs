@@ -276,9 +276,14 @@ pub(crate) fn extract_centroids(
         border_margin,
     };
 
-    let result =
-        tetra3::centroid_extraction::extract_centroids_from_raw(&pixels, width, height, &config)
-            .map_err(crate::helpers::map_tetra3_err)?;
+    // The image was copied into a pure-Rust buffer above; release the GIL for
+    // the (potentially long) extraction so other Python threads keep running.
+    let result = image
+        .py()
+        .detach(|| {
+            tetra3::centroid_extraction::extract_centroids_from_raw(&pixels, width, height, &config)
+        })
+        .map_err(crate::helpers::map_tetra3_err)?;
 
     Ok(PyExtractionResult {
         inner: result.into(),
@@ -371,9 +376,14 @@ pub(crate) fn extract_centroids_fast(
         border_margin,
     };
 
-    let result =
-        tetra3::centroid_extraction::extract_centroids_fast(&pixels, width, height, &config)
-            .map_err(crate::helpers::map_tetra3_err)?;
+    // Input already copied to a pure-Rust buffer; release the GIL during the
+    // sweep.
+    let result = image
+        .py()
+        .detach(|| {
+            tetra3::centroid_extraction::extract_centroids_fast(&pixels, width, height, &config)
+        })
+        .map_err(crate::helpers::map_tetra3_err)?;
 
     Ok(PyExtractionResult {
         inner: result.into(),

@@ -70,10 +70,11 @@ impl PyRadialDistortion {
     ///         image-center-origin frame. Default (0, 0).
     #[new]
     #[pyo3(signature = (k1 = 0.0, k2 = 0.0, k3 = 0.0, p1 = 0.0, p2 = 0.0, center = (0.0, 0.0)))]
-    fn new(k1: f64, k2: f64, k3: f64, p1: f64, p2: f64, center: (f64, f64)) -> Self {
-        Self {
-            inner: RadialDistortion::with_center(center.0, center.1, k1, k2, k3, p1, p2),
-        }
+    fn new(k1: f64, k2: f64, k3: f64, p1: f64, p2: f64, center: (f64, f64)) -> PyResult<Self> {
+        let inner = RadialDistortion::with_center(center.0, center.1, k1, k2, k3, p1, p2);
+        // A NaN coefficient silently poisons every corrected coordinate.
+        inner.validate().map_err(crate::helpers::map_tetra3_err)?;
+        Ok(Self { inner })
     }
 
     #[getter]
@@ -125,6 +126,7 @@ impl PyRadialDistortion {
     #[staticmethod]
     fn _from_pickle_bytes(data: &[u8]) -> PyResult<Self> {
         let inner = crate::helpers::from_postcard_bytes::<RadialDistortion>(data)?;
+        inner.validate().map_err(crate::helpers::map_tetra3_err)?;
         Ok(Self { inner })
     }
 
@@ -208,6 +210,16 @@ impl PyPolynomialDistortion {
         bp_coeffs: Option<Vec<f64>>,
     ) -> PyResult<Self> {
         let _ = (ap_coeffs, bp_coeffs); // legacy inverse coeffs are no longer used
+                                        // PolynomialDistortion::new panics (by contract) above MAX_POLY_ORDER;
+                                        // from Python that must be a ValueError. (This also closes the old
+                                        // u32-wrap hole where order=2**32-1 constructed with empty
+                                        // coefficient lists and panicked on first distort().)
+        if order > tetra3::distortion::MAX_POLY_ORDER {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "order must be <= {}, got {order}",
+                tetra3::distortion::MAX_POLY_ORDER
+            )));
+        }
         let n = poly_num_coeffs(order);
         if a_coeffs.len() != n || b_coeffs.len() != n {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -218,9 +230,10 @@ impl PyPolynomialDistortion {
                 b_coeffs.len()
             )));
         }
-        Ok(Self {
-            inner: PolynomialDistortion::new(order, scale, a_coeffs, b_coeffs),
-        })
+        let inner = PolynomialDistortion::new(order, scale, a_coeffs, b_coeffs);
+        // Catches non-finite coefficients / non-positive scale.
+        inner.validate().map_err(crate::helpers::map_tetra3_err)?;
+        Ok(Self { inner })
     }
 
     #[getter]
@@ -280,6 +293,9 @@ impl PyPolynomialDistortion {
     #[staticmethod]
     fn _from_pickle_bytes(data: &[u8]) -> PyResult<Self> {
         let inner = crate::helpers::from_postcard_bytes::<PolynomialDistortion>(data)?;
+        // Corrupt pickle bytes can decode a model whose coefficient count
+        // disagrees with its order — which panics OOB on first use.
+        inner.validate().map_err(crate::helpers::map_tetra3_err)?;
         Ok(Self { inner })
     }
 
