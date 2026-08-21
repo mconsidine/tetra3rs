@@ -95,6 +95,11 @@ unchanged.
   `load_from_file`, and both extraction functions — so other Python threads
   keep running.
 
+### Dependencies
+
+- Bumped `numeris` 0.5.14 → 0.5.17.
+- Python bindings: upgraded `pyo3` to 0.29.2 and `numpy` to 0.29.0.
+
 ## 0.9.0
 
 ### Upgrading from 0.8

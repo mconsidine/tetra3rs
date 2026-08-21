@@ -464,9 +464,9 @@ dependencies = [
 
 [[package]]
 name = "numeris"
-version = "0.5.14"
+version = "0.5.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5b3135801d7f17db8c67cd7d6dd42f7f05b2255a0a936bfd9f917749fe7596b"
+checksum = "6a842e37f149029e1dd010093efbc5c1ec31aa3497308e62de8229a5d8129f71"
 dependencies = [
  "num-complex",
  "num-traits",
