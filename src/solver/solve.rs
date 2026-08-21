@@ -90,19 +90,16 @@ impl SolverDatabase {
     ) -> SolveResult {
         let t0 = Instant::now();
 
-        // The `SolveConfig::default()` camera model is a placeholder with a zero
-        // image size / focal length; a config left at those defaults yields a
-        // degenerate FOV and silently NoMatches. Warn loudly so the cause is
-        // visible rather than mysterious.
-        let cam = &config.camera_model;
-        let focal_ok = cam.focal_length_px.is_finite() && cam.focal_length_px > 0.0;
-        if cam.image_width == 0 || cam.image_height == 0 || !focal_ok {
-            warn!(
-                "camera model appears unconfigured (image {}x{}, focal_length_px {}); \
-                 solve will not match — build SolveConfig via new()/with_camera_model()",
-                cam.image_width, cam.image_height, cam.focal_length_px
-            );
+        // A config that cannot produce a meaningful solve — the
+        // `SolveConfig::default()` placeholder camera model (zero image size),
+        // NaN match parameters that silently disable all matching, etc. —
+        // fails fast with `InvalidConfig` instead of burning the full search
+        // to a guaranteed NoMatch.
+        if let Err(e) = config.validate() {
+            warn!("solve_from_centroids: {e}");
+            return failure(SolveStatus::InvalidConfig, t0);
         }
+        let cam = &config.camera_model;
 
         // ── Aberration correction: build corrected catalog vectors if velocity is set ──
         let star_vecs: Cow<[[f32; 3]]> = match config.observer_velocity_km_s {
@@ -531,6 +528,16 @@ impl SolverDatabase {
 
                     // Refine FOV estimate from this match
                     let fov = cat_largest_edge / image_largest_edge * fov_estimate;
+                    // With `fov_max_error_rad: None` (the default) nothing above
+                    // bounds this ratio, and a tight image quad matching a wide
+                    // catalog pattern can imply a FOV past π — where tan(fov/2)
+                    // flips sign and the verification geometry (pixel scale,
+                    // density region) turns to nonsense. Such a candidate can
+                    // only waste refinement work or weaken the statistical
+                    // gate, never be right; skip it.
+                    if !(fov.is_finite() && fov > 0.0 && fov < std::f32::consts::PI) {
+                        continue;
+                    }
 
                     // ── Rebuild vectors at the measured scale when the sweep
                     // value is meaningfully off ──
@@ -598,11 +605,8 @@ impl SolverDatabase {
                     // Determine parity from the rotation determinant.
                     // centroid_vectors is never mutated; when parity is needed we use
                     // a lazily-created x-flipped copy for verification matching.
-                    let parity_flip;
-                    let working_vectors: &[[f32; 3]];
-                    if rotation_matrix.det() < 0.0 {
+                    let parity_flip = if rotation_matrix.det() < 0.0 {
                         // Wrong parity (e.g. FITS image with CDELT1 < 0).
-                        parity_flip = true;
                         // Derive the parity-flipped rotation WITHOUT a second SVD.
                         //
                         // Flipping the x-component of every image vector is
@@ -624,10 +628,11 @@ impl SolverDatabase {
                         rotation_matrix[(0, 0)] = -rotation_matrix[(0, 0)];
                         rotation_matrix[(0, 1)] = -rotation_matrix[(0, 1)];
                         rotation_matrix[(0, 2)] = -rotation_matrix[(0, 2)];
+                        true
                     } else {
-                        parity_flip = false;
-                    }
-                    if rebuild {
+                        false
+                    };
+                    let working_vectors: &[[f32; 3]] = if rebuild {
                         // Rebuild the full verification set at the measured
                         // scale (parity applied directly via the x-sign).
                         let sign = if parity_flip { -1.0f32 } else { 1.0 };
@@ -637,18 +642,18 @@ impl SolverDatabase {
                                 .iter()
                                 .map(|&i| unit_vector_from_pixels(&centroids[i], ps_meas, sign)),
                         );
-                        working_vectors = &rebuilt_vectors;
+                        &rebuilt_vectors
                     } else if parity_flip {
                         // Lazily create flipped centroid vectors for matching
-                        working_vectors = flipped_vectors.get_or_insert_with(|| {
+                        flipped_vectors.get_or_insert_with(|| {
                             centroid_vectors
                                 .iter()
                                 .map(|v| [-v[0], v[1], v[2]])
                                 .collect()
-                        });
+                        })
                     } else {
-                        working_vectors = &centroid_vectors;
-                    }
+                        &centroid_vectors
+                    };
 
                     // ── Verify by matching nearby catalog stars ──
                     // The pattern stars that fall inside the tested
@@ -1133,6 +1138,11 @@ fn build_fov_sweep(
 
     if let Some(max_error) = fov_max_error {
         if max_error > 0.0 {
+            // FOV values at or beyond π are geometrically meaningless, so an
+            // infinite/huge max_error (which would otherwise stall the
+            // `offset += step` accumulation below into an unbounded loop)
+            // clamps to the widest sweep that can matter.
+            let max_error = max_error.min(std::f32::consts::PI);
             // Half-diagonal angle at the estimated FOV (fov is width-referenced).
             let theta_hd = ((fov_estimate as f64 / 2.0).tan() * diag_factor as f64).atan();
             // Second-order ratio-drift coefficient; guarded so a degenerate
@@ -1147,7 +1157,12 @@ fn build_fov_sweep(
                 if fov_estimate - offset > 0.0 {
                     values.push(fov_estimate - offset);
                 }
-                offset += step;
+                let next = offset + step;
+                if next <= offset {
+                    // f32 saturation: adding `step` no longer changes `offset`.
+                    break;
+                }
+                offset = next;
             }
         }
     }
@@ -1505,5 +1520,25 @@ mod tests {
         assert!(apparent[2].abs() < 1e-7, "Z not zero: {}", apparent[2]);
         // X should still be ~1.0 (normalized)
         assert!((apparent[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_build_fov_sweep_terminates_on_extreme_max_error() {
+        // Regression: with `offset += step` stalling below f32 precision, an
+        // infinite/huge max_error used to loop (and push) forever. Values at
+        // or beyond π are meaningless, so the sweep must clamp and terminate.
+        let fov = 10.0_f32.to_radians();
+        for max_error in [f32::INFINITY, f32::MAX, 1e30] {
+            let values = build_fov_sweep(fov, Some(max_error), 0.003, 1.2);
+            assert!(!values.is_empty());
+            assert!(
+                values.len() < 100_000,
+                "sweep exploded to {} values for max_error {max_error}",
+                values.len()
+            );
+        }
+        // NaN and negative skip the sweep entirely, leaving just the estimate.
+        assert_eq!(build_fov_sweep(fov, Some(f32::NAN), 0.003, 1.2).len(), 1);
+        assert_eq!(build_fov_sweep(fov, Some(-1.0), 0.003, 1.2).len(), 1);
     }
 }

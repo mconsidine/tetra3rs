@@ -326,7 +326,14 @@ fn sort_and_truncate_by_mass(centroids: &mut Vec<Centroid>, max_centroids: Optio
 
 /// Validate that a raw pixel buffer matches the claimed dimensions.
 fn check_pixel_len(len: usize, width: u32, height: u32) -> Result<()> {
-    let expected = (width as usize) * (height as usize);
+    // Checked multiply: on a 32-bit target `width * height` can wrap in
+    // `usize` (e.g. 65536×65536 → 0), letting an undersized buffer through to
+    // panic on indexing later. No real buffer can reach a wrapping size.
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| {
+            Error::InvalidInput(format!("image dimensions {width}x{height} overflow usize"))
+        })?;
     if len != expected {
         return Err(Error::InvalidInput(format!(
             "Pixel data length ({len}) does not match width*height ({width}x{height}={expected})",

@@ -1,5 +1,105 @@
 # Changelog
 
+## 0.10.0
+
+Robustness sweep: validate at every trust boundary (file load, pickle,
+public constructors) so corrupt data and degenerate arguments fail with a
+descriptive error instead of a deferred panic, hang, or silently-wrong
+result. No solver-algorithm changes; all outputs on valid inputs are
+unchanged.
+
+### Upgrading from 0.9
+
+- `SolverDatabase::to_bytes` returns `crate::Result<Vec<u8>>` — add `?`.
+- Exhaustive matches on `SolveStatus` need a new `InvalidConfig` arm, and
+  solves with a degenerate config (e.g. the `Default::default()`
+  placeholder camera model) now return it instead of `NoMatch`.
+- `CameraModel::from_fov` panics on FOV outside `(0, π)` in release builds
+  too (previously debug-only); Python raises `ValueError`.
+- Corrupt database/camera files and pickles now fail at load
+  (`InvalidInput` / Python `ValueError`) instead of panicking on first use.
+
+### Fixed
+
+- **Corrupt/tampered database files and pickles are rejected at load.**
+  `SolverDatabase::load_from_file` (and the Python pickle path) now run a
+  full invariant check — `StarCatalog` spatial-index consistency, pattern
+  entries within the star table, `star_vectors`/`star_catalog_ids` length
+  agreement, and sane `DatabaseProperties` (including
+  `pattern_bins`-vs-`pattern_max_error` consistency, which previously let a
+  crafted file inflate the key enumeration without bound). Previously a file
+  that decoded cleanly could panic out-of-bounds mid-solve. New public
+  `SolverDatabase::validate` / `StarCatalog::validate`.
+  `CameraModel::load_from_file` and the pickle paths for `CameraModel`,
+  `RadialDistortion`, `PolynomialDistortion`, `SolveResult`, and
+  `CalibrateResult` validate the same way (Python: `ValueError`).
+- **Infinite loop / unbounded memory in the FOV sweep** with
+  `fov_max_error_rad: Some(f32::INFINITY)` (or any value large enough to
+  stall the f32 step accumulation). The sweep now clamps to π and detects
+  step saturation. Candidate matches implying a FOV outside `(0, π)` are
+  also skipped (previously they degenerated the verification statistics).
+- **Hipparcos parser panicked on multi-byte UTF-8** straddling a fixed-width
+  column boundary; such lines are now skipped like any other malformed
+  record.
+- **`PolynomialDistortion` order/coefficient mismatches panicked
+  out-of-bounds** on first use. `num_coeffs` no longer wraps for absurd
+  orders (this also closes the Python hole where
+  `PolynomialDistortion(order=2**32-1, a_coeffs=[], b_coeffs=[])`
+  constructed and panicked on `.distort()`); constructors bound `order` by
+  the new `MAX_POLY_ORDER` (12); `validate()` checks the invariants at
+  deserialization boundaries. The debug-only assert on the Newton Jacobian
+  in `undistort` (which fired on NaN input) is removed — the existing
+  release-path bailout handles it.
+- **Single-image `calibrate_camera` returned a fabricated perfect result**
+  (identity distortion, RMSE 0, 0 inliers) when the fit had too few matched
+  points, contradicting its documented error contract. It now returns
+  `InvalidInput` like the multi-image path.
+- **Gaia binary loader**: the star count no longer silently truncates on
+  32-bit targets, and records with non-finite ra/dec/mag/pm are skipped
+  with a warning instead of silently poisoning the spatial index.
+  32-bit `width*height` overflow in the extraction buffer check is also
+  closed.
+
+### Changed
+
+- **New `SolveStatus::InvalidConfig` variant** (breaking for exhaustive
+  matches): `solve_from_centroids` now runs the new public
+  `SolveConfig::validate()` first and fails fast with `InvalidConfig`
+  instead of warn-and-proceed to a guaranteed `NoMatch` — for the
+  `Default::default()` placeholder camera model, non-finite
+  `match_radius`/`match_threshold`, non-finite `fov_max_error_rad` /
+  `match_max_error` / `observer_velocity_km_s`, and (when a hint is set) a
+  degenerate `hint_uncertainty_rad`. Python: `SolveFailure.status` gains
+  `'invalid_config'`. The variant is appended after the 0.9 ones, so
+  previously serialized statuses keep their wire values.
+- **`CameraModel::from_fov` and `StarCatalog::new` validate in release
+  builds** (documented panics). Previously `from_fov` checked only in debug,
+  so release builds accepted `fov=0`/`≥180°`/NaN and silently produced
+  infinite/negative/NaN focal lengths. From Python these are `ValueError`s
+  (as are zero image dimensions, degenerate `CameraModel` constructor args,
+  and non-finite distortion coefficients).
+- **`SolverDatabase::to_bytes` returns `crate::Result<Vec<u8>>`** (breaking)
+  instead of panicking on serialization failure.
+- **`calibrate_camera` argument errors are `Err(InvalidInput)`** instead of
+  panics (mismatched slice lengths, polynomial order outside `[2, 6]`). The
+  lower-level `fit_*_distortion` functions keep their asserts, now
+  documented.
+- **Generation limits**: `GenerateDatabaseConfig::validate` bounds
+  `catalog_nside` by `MAX_NSIDE` (1024) and requires a plausible
+  `epoch_proper_motion_year`; generation errors (instead of OOM) when the
+  lattice would exceed 10⁸ points (tiny `min_fov_deg` × high oversampling).
+  `matched_filter_sigma` above 64 px is rejected (the kernel allocation
+  scales with σ).
+- **Python: the GIL is released during long native calls** —
+  `solve_from_centroids`, `generate_from_gaia`, `calibrate_camera`,
+  `load_from_file`, and both extraction functions — so other Python threads
+  keep running.
+
+### Dependencies
+
+- Bumped `numeris` 0.5.14 → 0.5.17.
+- Python bindings: upgraded `pyo3` to 0.29.2 and `numpy` to 0.29.0.
+
 ## 0.9.0
 
 ### Upgrading from 0.8

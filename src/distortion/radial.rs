@@ -117,6 +117,22 @@ impl RadialDistortion {
         }
     }
 
+    /// Check that every coefficient and the center are finite. Call after
+    /// loading a model from an untrusted source (saved file, pickle bytes) —
+    /// a NaN coefficient silently poisons every undistorted coordinate.
+    pub fn validate(&self) -> crate::Result<()> {
+        let finite = [self.k1, self.k2, self.k3, self.p1, self.p2]
+            .iter()
+            .all(|c| c.is_finite())
+            && self.center.iter().all(|c| c.is_finite());
+        if !finite {
+            return Err(crate::Error::InvalidInput(
+                "RadialDistortion: coefficients and center must be finite".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Forward distortion: ideal → distorted.
     ///
     /// Given ideal (pinhole) pixel coordinates `(x, y)`, returns the

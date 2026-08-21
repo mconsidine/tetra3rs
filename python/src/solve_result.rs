@@ -262,6 +262,13 @@ impl PySolveResult {
     #[staticmethod]
     fn _from_pickle_bytes(data: &[u8]) -> PyResult<Self> {
         let solution = crate::helpers::from_postcard_bytes::<Solution>(data)?;
+        // The embedded camera model drives pixel_to_world / world_to_pixel;
+        // tampered bytes could give it an inconsistent distortion that
+        // panics on first use.
+        solution
+            .camera_model
+            .validate()
+            .map_err(crate::helpers::map_tetra3_err)?;
         Ok(Self::from_solution(solution))
     }
 
@@ -441,6 +448,7 @@ impl PySolveFailure {
             SolveStatus::NoMatch => "no_match",
             SolveStatus::Timeout => "timeout",
             SolveStatus::TooFew => "too_few",
+            SolveStatus::InvalidConfig => "invalid_config",
         }
     }
 }
@@ -449,7 +457,9 @@ impl PySolveFailure {
 impl PySolveFailure {
     /// Why the solve produced no solution: ``'no_match'`` (all pattern
     /// combinations exhausted), ``'timeout'`` (``solve_timeout_ms`` reached),
-    /// or ``'too_few'`` (fewer than 4 usable centroids).
+    /// ``'too_few'`` (fewer than 4 usable centroids), or
+    /// ``'invalid_config'`` (degenerate camera model or non-finite matching
+    /// parameters — nothing was searched).
     #[getter]
     fn status(&self) -> &'static str {
         self.status_str()

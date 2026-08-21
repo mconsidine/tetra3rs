@@ -96,7 +96,10 @@ impl PySolverDatabase {
             epoch_proper_motion_year,
             catalog_nside,
         };
-        let db = SolverDatabase::generate_from_gaia(&resolved_path, &config)
+        // Generation runs for seconds to minutes on pure-Rust data; release
+        // the GIL so other Python threads keep running.
+        let db = py
+            .detach(|| SolverDatabase::generate_from_gaia(&resolved_path, &config))
             .map_err(crate::helpers::map_tetra3_err)?;
         Ok(PySolverDatabase { inner: db })
     }
@@ -109,10 +112,16 @@ impl PySolverDatabase {
     }
 
     /// Load a database from a file.
+    ///
+    /// Raises OSError for file problems and ValueError when the file decodes
+    /// but fails the database's consistency validation (corrupt/tampered data
+    /// that would otherwise crash mid-solve).
     #[staticmethod]
-    fn load_from_file(path: &str) -> PyResult<Self> {
-        let db = SolverDatabase::load_from_file(path)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+    fn load_from_file(py: Python<'_>, path: &str) -> PyResult<Self> {
+        let path = path.to_string();
+        let db = py
+            .detach(move || SolverDatabase::load_from_file(&path))
+            .map_err(crate::helpers::map_tetra3_err)?;
         Ok(PySolverDatabase { inner: db })
     }
 
@@ -195,8 +204,8 @@ impl PySolverDatabase {
     /// Returns:
     ///     SolveResult on success, or a (falsy) SolveFailure carrying the
     ///     failure reason (``status``: ``'no_match'`` / ``'timeout'`` /
-    ///     ``'too_few'``) and ``solve_time_ms``. Use ``if result:`` to
-    ///     distinguish the two.
+    ///     ``'too_few'`` / ``'invalid_config'``) and ``solve_time_ms``. Use
+    ///     ``if result:`` to distinguish the two.
     #[pyo3(signature = (
         centroids,
         fov_estimate_deg = None,
@@ -254,7 +263,16 @@ impl PySolverDatabase {
         // absent do we build a pinhole model — and only then are fov_estimate_*
         // and the image dimensions needed (and required).
         let cam = match camera_model {
-            Some(py_cam) => py_cam.inner,
+            Some(py_cam) => {
+                // A degenerate model (zero/NaN focal length, zero dimensions,
+                // inconsistent distortion) can only produce a guaranteed
+                // NoMatch or a panic deep in the solver — reject it here.
+                py_cam
+                    .inner
+                    .validate()
+                    .map_err(crate::helpers::map_tetra3_err)?;
+                py_cam.inner
+            }
             None => {
                 let fov_rad = exactly_one_angle_rad(
                     fov_estimate_deg,
@@ -262,8 +280,24 @@ impl PySolverDatabase {
                     "Specify exactly one of fov_estimate_deg or fov_estimate_rad, not both",
                     "Must specify fov_estimate_deg or fov_estimate_rad (or pass camera_model)",
                 )?;
+                // CameraModel::from_fov panics (by contract) outside (0, π);
+                // from Python that must be a ValueError instead.
+                if !(fov_rad.is_finite()
+                    && fov_rad > 0.0
+                    && (fov_rad as f64) < std::f64::consts::PI)
+                {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "fov_estimate must be in (0, 180) degrees, got {} rad",
+                        fov_rad
+                    )));
+                }
                 let (img_width, img_height) =
                     resolve_image_dims(image_shape, image_width, image_height)?;
+                if img_width == 0 || img_height == 0 {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "image dimensions must be non-zero, got {img_width}x{img_height}"
+                    )));
+                }
                 CameraModel::from_fov(fov_rad as f64, img_width, img_height)
             }
         };
@@ -296,7 +330,9 @@ impl PySolverDatabase {
             strict_hint,
         };
 
-        let result = self.inner.solve_from_centroids(&centroid_vec, &config);
+        // The solve can run up to its timeout (default 5 s) on pure-Rust data;
+        // release the GIL so other Python threads keep running.
+        let result = py.detach(|| self.inner.solve_from_centroids(&centroid_vec, &config));
 
         match result {
             Ok(solution) => Ok(PySolveResult::from_solution(solution)
@@ -415,7 +451,11 @@ impl PySolverDatabase {
     }
 
     fn __reduce__(slf: &Bound<'_, Self>) -> PyResult<(Py<PyAny>, (Vec<u8>,))> {
-        let bytes = slf.borrow().inner.to_bytes();
+        let bytes = slf
+            .borrow()
+            .inner
+            .to_bytes()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let from_bytes = slf.get_type().getattr("_from_pickle_bytes")?;
         Ok((from_bytes.unbind(), (bytes,)))
     }
@@ -424,6 +464,10 @@ impl PySolverDatabase {
     fn _from_pickle_bytes(data: &[u8]) -> PyResult<Self> {
         let inner = postcard::from_bytes::<SolverDatabase>(data)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        // Corrupt pickle bytes can decode into a structurally-valid database
+        // whose indices panic mid-solve; enforce the same invariants as
+        // load_from_file (ValueError instead of a deferred PanicException).
+        inner.validate().map_err(crate::helpers::map_tetra3_err)?;
         Ok(Self { inner })
     }
 
@@ -566,7 +610,7 @@ impl PySolverDatabase {
     #[allow(clippy::too_many_arguments)]
     fn calibrate_camera<'py>(
         &self,
-        _py: Python<'py>,
+        py: Python<'py>,
         solve_results: &Bound<'py, pyo3::PyAny>,
         centroids: &Bound<'py, pyo3::PyAny>,
         image_width: Option<u32>,
@@ -611,15 +655,20 @@ impl PySolverDatabase {
             convergence_threshold_px,
         };
 
-        let result = calibrate_camera(
-            &sr_refs,
-            &cent_refs,
-            &self.inner,
-            img_width,
-            img_height,
-            &config,
-        )
-        .map_err(crate::helpers::map_tetra3_err)?;
+        // Calibration iterates WCS refinement over all images on pure-Rust
+        // data; release the GIL for the duration.
+        let result = py
+            .detach(|| {
+                calibrate_camera(
+                    &sr_refs,
+                    &cent_refs,
+                    &self.inner,
+                    img_width,
+                    img_height,
+                    &config,
+                )
+            })
+            .map_err(crate::helpers::map_tetra3_err)?;
 
         Ok(PyCalibrateResult { inner: result })
     }

@@ -44,16 +44,18 @@ impl PyCameraModel {
             Some(obj) => extract_distortion(obj)?,
             None => Distortion::None,
         };
-        Ok(Self {
-            inner: CameraModel {
-                focal_length_px,
-                image_width,
-                image_height,
-                crpix: crpix.unwrap_or([0.0, 0.0]),
-                parity_flip,
-                distortion: dist,
-            },
-        })
+        let inner = CameraModel {
+            focal_length_px,
+            image_width,
+            image_height,
+            crpix: crpix.unwrap_or([0.0, 0.0]),
+            parity_flip,
+            distortion: dist,
+        };
+        // Zero/NaN focal length or zero dimensions silently poison every
+        // downstream pixel scale — reject at construction.
+        inner.validate().map_err(crate::helpers::map_tetra3_err)?;
+        Ok(Self { inner })
     }
 
     /// Create a camera model from a horizontal field of view and image dimensions.
@@ -67,10 +69,22 @@ impl PyCameraModel {
     ///     CameraModel with no distortion, crpix=[0,0], parity_flip=False.
     #[staticmethod]
     #[pyo3(signature = (fov_deg, image_width, image_height))]
-    fn from_fov(fov_deg: f64, image_width: u32, image_height: u32) -> Self {
-        Self {
-            inner: CameraModel::from_fov(fov_deg.to_radians(), image_width, image_height),
+    fn from_fov(fov_deg: f64, image_width: u32, image_height: u32) -> PyResult<Self> {
+        // CameraModel::from_fov panics (by contract) outside (0, 180)°; from
+        // Python that must be a ValueError instead.
+        if !(fov_deg.is_finite() && fov_deg > 0.0 && fov_deg < 180.0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "fov_deg must be in (0, 180), got {fov_deg}"
+            )));
         }
+        if image_width == 0 || image_height == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "image dimensions must be non-zero, got {image_width}x{image_height}"
+            )));
+        }
+        Ok(Self {
+            inner: CameraModel::from_fov(fov_deg.to_radians(), image_width, image_height),
+        })
     }
 
     /// Focal length in pixels.
@@ -184,6 +198,9 @@ impl PyCameraModel {
     #[staticmethod]
     fn _from_pickle_bytes(data: &[u8]) -> PyResult<Self> {
         let inner = crate::helpers::from_postcard_bytes::<CameraModel>(data)?;
+        // Tampered pickle bytes can decode into a model that panics (or
+        // divides by zero) on first use — enforce the invariants here.
+        inner.validate().map_err(crate::helpers::map_tetra3_err)?;
         Ok(Self { inner })
     }
 

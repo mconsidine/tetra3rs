@@ -50,11 +50,14 @@ impl CameraModel {
     ///
     /// Sets crpix to `[0, 0]`, no parity flip, no distortion.
     ///
-    /// `fov_rad` must lie in `(0, π)`; outside that range the focal length is
-    /// non-positive or infinite, which propagates NaN/negative pixel scales
-    /// through the solver (checked in debug builds).
+    /// # Panics
+    ///
+    /// Panics unless `fov_rad` lies in `(0, π)` — outside that range the focal
+    /// length is non-positive, infinite, or NaN, which silently poisons every
+    /// pixel scale downstream. (Was a debug-only check before 0.9; release
+    /// builds accepted the garbage.)
     pub fn from_fov(fov_rad: f64, image_width: u32, image_height: u32) -> Self {
-        debug_assert!(
+        assert!(
             fov_rad.is_finite() && fov_rad > 0.0 && fov_rad < std::f64::consts::PI,
             "from_fov: fov_rad must be in (0, π), got {fov_rad}"
         );
@@ -122,6 +125,38 @@ impl CameraModel {
         (dx + self.crpix[0], dy + self.crpix[1])
     }
 
+    /// Check the invariants a well-formed camera model must satisfy: finite
+    /// positive focal length, non-zero image dimensions, finite CRPIX, and a
+    /// self-consistent distortion model.
+    ///
+    /// Postcard/serde deserialization checks structure, not semantics — a
+    /// bit-flipped saved model can decode cleanly and then divide by a zero
+    /// focal length or index past a truncated coefficient vector. Called by
+    /// [`Self::load_from_file`]; call it yourself after any other untrusted
+    /// deserialization (e.g. pickle bytes).
+    pub fn validate(&self) -> crate::Result<()> {
+        use crate::Error::InvalidInput;
+        if !(self.focal_length_px.is_finite() && self.focal_length_px > 0.0) {
+            return Err(InvalidInput(format!(
+                "CameraModel: focal_length_px must be finite and > 0, got {}",
+                self.focal_length_px
+            )));
+        }
+        if self.image_width == 0 || self.image_height == 0 {
+            return Err(InvalidInput(format!(
+                "CameraModel: image dimensions must be non-zero, got {}x{}",
+                self.image_width, self.image_height
+            )));
+        }
+        if !(self.crpix[0].is_finite() && self.crpix[1].is_finite()) {
+            return Err(InvalidInput(format!(
+                "CameraModel: crpix must be finite, got [{}, {}]",
+                self.crpix[0], self.crpix[1]
+            )));
+        }
+        self.distortion.validate()
+    }
+
     /// Save the camera model to a file using postcard.
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> crate::Result<()> {
         let bytes = postcard::to_allocvec(self)?;
@@ -130,9 +165,15 @@ impl CameraModel {
     }
 
     /// Load a camera model from a postcard file.
+    ///
+    /// The decoded model is checked with [`Self::validate`] so a corrupt or
+    /// truncated file fails here with [`crate::Error::InvalidInput`] instead
+    /// of panicking (or silently producing NaN) on first use.
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> crate::Result<Self> {
         let bytes = std::fs::read(&path)?;
-        Ok(postcard::from_bytes::<Self>(&bytes)?)
+        let model = postcard::from_bytes::<Self>(&bytes)?;
+        model.validate()?;
+        Ok(model)
     }
 }
 
@@ -292,6 +333,42 @@ mod tests {
             expected_xi,
             xi,
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "fov_rad must be in (0, π)")]
+    fn test_from_fov_rejects_zero_fov() {
+        // Regression: this was a debug_assert, so release builds silently
+        // produced an infinite focal length.
+        let _ = CameraModel::from_fov(0.0, 1024, 768);
+    }
+
+    #[test]
+    fn test_validate_and_load_reject_degenerate_models() {
+        let mut cam = CameraModel::from_fov(10.0_f64.to_radians(), 1024, 768);
+        assert!(cam.validate().is_ok());
+
+        cam.focal_length_px = 0.0;
+        assert!(cam.validate().is_err());
+
+        // Regression: load_from_file used to hand back whatever decoded,
+        // deferring the failure to a divide-by-zero / OOB at first use.
+        let tmp = std::env::temp_dir().join("test_camera_model_invalid.bin");
+        std::fs::write(&tmp, postcard::to_allocvec(&cam).unwrap()).unwrap();
+        assert!(CameraModel::load_from_file(&tmp).is_err());
+        std::fs::remove_file(&tmp).ok();
+
+        cam.focal_length_px = 5000.0;
+        cam.crpix = [f64::NAN, 0.0];
+        assert!(cam.validate().is_err());
+
+        // Distortion invariants are checked through the same path: a
+        // truncated coefficient vector must fail validation, not panic later.
+        cam.crpix = [0.0, 0.0];
+        let mut poly = crate::distortion::PolynomialDistortion::zero(4, 512.0);
+        poly.a_coeffs.truncate(2);
+        cam.distortion = Distortion::Polynomial(poly);
+        assert!(cam.validate().is_err());
     }
 
     #[test]

@@ -682,6 +682,9 @@ fn test_statistical_1000_random_orientations() {
                     all_solve_times_ms.push(fail.solve_time_ms);
                 }
                 SolveStatus::TooFew => n_too_few += 1,
+                SolveStatus::InvalidConfig => {
+                    panic!("statistical trials use a valid config; got InvalidConfig")
+                }
             },
         }
 
@@ -846,6 +849,79 @@ fn test_save_and_load_database() {
 
     // Clean up temporary file
     std::fs::remove_file(tmp_path).expect("Failed to delete temporary file");
+
+    // ── Corruption is rejected at load, not deferred to a mid-solve panic ──
+    // Each tampered database decodes cleanly through postcard; without
+    // validate() the inconsistency only surfaces as an out-of-bounds index
+    // (or unbounded key enumeration) during solve_from_centroids.
+    let n_stars = db.star_catalog.len() as u32;
+
+    let mut tampered = db.clone();
+    tampered.star_vectors.truncate(db.star_vectors.len() / 2);
+    assert!(
+        tampered.validate().is_err(),
+        "truncated star_vectors must fail validation"
+    );
+
+    let mut tampered = db.clone();
+    tampered.star_catalog_ids.push(0);
+    assert!(
+        tampered.validate().is_err(),
+        "over-long star_catalog_ids must fail validation"
+    );
+
+    let mut tampered = db.clone();
+    let slot = tampered
+        .pattern_catalog
+        .entries
+        .iter()
+        .position(|e| !e.is_empty())
+        .expect("generated database has at least one pattern");
+    tampered.pattern_catalog.entries[slot].star_indices = [n_stars, 0, 0, 0];
+    assert!(
+        tampered.validate().is_err(),
+        "pattern entry indexing past the star table must fail validation"
+    );
+
+    let mut tampered = db.clone();
+    tampered.props.pattern_bins = u32::MAX; // would explode key enumeration
+    assert!(
+        tampered.validate().is_err(),
+        "pattern_bins inconsistent with pattern_max_error must fail validation"
+    );
+
+    // An invalid solve config fails fast with InvalidConfig instead of
+    // burning the search to a guaranteed NoMatch (or warn-and-proceed).
+    let dummy_centroids: Vec<Centroid> = (0..6)
+        .map(|i| Centroid {
+            x: 40.0 * i as f32 - 100.0,
+            y: 25.0 * i as f32 - 60.0,
+            mass: Some(100.0),
+            cov: None,
+        })
+        .collect();
+    let fail = db
+        .solve_from_centroids(&dummy_centroids, &SolveConfig::default())
+        .expect_err("placeholder camera model must not solve");
+    assert_eq!(fail.status, SolveStatus::InvalidConfig);
+    let mut bad_cfg = SolveConfig::new(20.0_f32.to_radians(), 1024, 768);
+    bad_cfg.match_radius = f32::NAN;
+    let fail = db
+        .solve_from_centroids(&dummy_centroids, &bad_cfg)
+        .expect_err("NaN match_radius must not solve");
+    assert_eq!(fail.status, SolveStatus::InvalidConfig);
+
+    // And end-to-end: a bit-flipped file either fails to decode (postcard) or
+    // fails validation — it must never load successfully with corrupt indices.
+    let bad_path = "temp_db_corrupt.bin";
+    tampered.star_vectors.truncate(3);
+    let bytes = tampered.to_bytes().expect("serialize tampered db");
+    std::fs::write(bad_path, &bytes).expect("write corrupt db");
+    assert!(
+        SolverDatabase::load_from_file(bad_path).is_err(),
+        "corrupt database file must be rejected at load"
+    );
+    std::fs::remove_file(bad_path).ok();
 }
 
 /// Solve 1000 random orientations with a 10° FOV camera and 4"/axis centroid noise.
@@ -1010,6 +1086,9 @@ fn test_statistical_1000_noisy_centroids() {
                     all_solve_times_ms.push(fail.solve_time_ms);
                 }
                 SolveStatus::TooFew => n_too_few += 1,
+                SolveStatus::InvalidConfig => {
+                    panic!("statistical trials use a valid config; got InvalidConfig")
+                }
             },
         }
 

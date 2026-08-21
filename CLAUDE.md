@@ -131,6 +131,17 @@ Publishing:
 
 TESS images have significant optical distortion and SIP WCS. Science region trimmed from 2136×2078 → 2048×2048.
 
+## Serialization & trust boundaries
+
+All persistence is **postcard + serde** (no rkyv anywhere, despite older notes
+elsewhere): `SolverDatabase` and `CameraModel` files, and every Python pickle.
+Postcard parses untrusted bytes safely, but structure ≠ semantics — cross-field
+invariants are enforced by `validate()` methods (`SolverDatabase`,
+`StarCatalog`, `CameraModel`, `Distortion`/`RadialDistortion`/
+`PolynomialDistortion`), called at every load/pickle boundary. When adding a
+field whose value other code indexes by or divides by, extend the owning
+`validate()`.
+
 ## Data assets (`data/`)
 
 Downloaded on first integration-test run from GCS (`tetra3rs-testvecs` bucket). Not in git.
@@ -138,7 +149,7 @@ Downloaded on first integration-test run from GCS (`tetra3rs-testvecs` bucket). 
 - `hipsolver_10_30.bin` (455M) — main solver database
 - `test_tess_db.bin` (144M), `test_skyview_db.bin` (38M)
 - `gaia_merged.bin` (17M) — binary Gaia+Hipparcos catalog
-- `gaia_merged.csv` (81M) — CSV form (loaded by an in-tree hand-rolled parser; no `csv` crate dep)
+- `gaia_merged.csv` (81M) — CSV form (used by `scripts/`; no in-tree Rust CSV parser — the crate loads only the `.bin` GDR3 format)
 - FITS test images (skyview, TESS). TIFF/JPEG variants exist in the bucket but aren't exercised in CI — the library no longer ships file-format decoders, so callers must decode files themselves before calling `extract_centroids_from_image`.
 
 ## Scripts (`scripts/`)

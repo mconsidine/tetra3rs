@@ -395,8 +395,10 @@ class SolveFailure:
         """Why the solve produced no solution.
 
         One of ``'no_match'`` (all pattern combinations exhausted),
-        ``'timeout'`` (``solve_timeout_ms`` reached), or ``'too_few'``
-        (fewer than 4 usable centroids).
+        ``'timeout'`` (``solve_timeout_ms`` reached), ``'too_few'``
+        (fewer than 4 usable centroids), or ``'invalid_config'``
+        (degenerate camera model or non-finite matching parameters —
+        nothing was searched).
         """
         ...
 
@@ -745,8 +747,8 @@ class SolverDatabase:
         Returns:
             A SolveResult on success, or a (falsy) SolveFailure carrying the
             failure reason (``status``: ``'no_match'`` / ``'timeout'`` /
-            ``'too_few'``) and ``solve_time_ms``. Use ``if result:`` to
-            distinguish the two.
+            ``'too_few'`` / ``'invalid_config'``) and ``solve_time_ms``. Use
+            ``if result:`` to distinguish the two.
         """
         ...
 

@@ -30,7 +30,7 @@ pub(crate) mod polynomial;
 pub(crate) mod radial;
 
 pub use calibrate::{calibrate_camera, CalibrateConfig, CalibrateResult, DistortionModelType};
-pub use polynomial::{num_coeffs, PolynomialDistortion};
+pub use polynomial::{num_coeffs, PolynomialDistortion, MAX_POLY_ORDER};
 pub use radial::RadialDistortion;
 
 /// Lens distortion model.
@@ -77,5 +77,16 @@ impl Distortion {
     /// Returns `true` if this is `Distortion::None`.
     pub fn is_none(&self) -> bool {
         matches!(self, Distortion::None)
+    }
+
+    /// Validate the inner model's invariants (see
+    /// [`PolynomialDistortion::validate`] / [`RadialDistortion::validate`]).
+    /// Call after deserializing from an untrusted source.
+    pub fn validate(&self) -> crate::Result<()> {
+        match self {
+            Distortion::None => Ok(()),
+            Distortion::Radial(r) => r.validate(),
+            Distortion::Polynomial(p) => p.validate(),
+        }
     }
 }

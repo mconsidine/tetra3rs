@@ -67,6 +67,12 @@ impl PyCalibrateResult {
     #[staticmethod]
     fn _from_pickle_bytes(data: &[u8]) -> PyResult<Self> {
         let inner = crate::helpers::from_postcard_bytes::<CalibrateResult>(data)?;
+        // The embedded camera model's distortion is evaluated on use;
+        // enforce its invariants against tampered pickle bytes.
+        inner
+            .camera_model
+            .validate()
+            .map_err(crate::helpers::map_tetra3_err)?;
         Ok(Self { inner })
     }
 
