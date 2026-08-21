@@ -1,12 +1,23 @@
 # Changelog
 
-## Unreleased
+## 0.10.0
 
 Robustness sweep: validate at every trust boundary (file load, pickle,
 public constructors) so corrupt data and degenerate arguments fail with a
 descriptive error instead of a deferred panic, hang, or silently-wrong
 result. No solver-algorithm changes; all outputs on valid inputs are
 unchanged.
+
+### Upgrading from 0.9
+
+- `SolverDatabase::to_bytes` returns `crate::Result<Vec<u8>>` — add `?`.
+- Exhaustive matches on `SolveStatus` need a new `InvalidConfig` arm, and
+  solves with a degenerate config (e.g. the `Default::default()`
+  placeholder camera model) now return it instead of `NoMatch`.
+- `CameraModel::from_fov` panics on FOV outside `(0, π)` in release builds
+  too (previously debug-only); Python raises `ValueError`.
+- Corrupt database/camera files and pickles now fail at load
+  (`InvalidInput` / Python `ValueError`) instead of panicking on first use.
 
 ### Fixed
 
