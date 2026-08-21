@@ -131,6 +131,12 @@ pub(super) struct MatchedPoint {
 /// most photographic / computer-vision lens calibrations; for cameras with
 /// significant tangential / decentering distortion (e.g. TESS), prefer
 /// [`fit_polynomial_distortion`] which has more parameters to absorb it.
+///
+/// # Panics
+///
+/// Panics when `solve_results` and `centroids` differ in length.
+/// [`crate::calibrate_camera`] validates this (returning an error) before
+/// delegating here.
 pub fn fit_radial_distortion(
     solve_results: &[&SolveResult],
     centroids: &[&[Centroid]],
@@ -762,6 +768,12 @@ pub(super) fn fit_polynomial_sigma_clip(
 /// - order 2: 6 terms per axis (12 total) — offset + linear + quadratic
 /// - order 3: 10 terms per axis (20 total) — + cubic
 /// - order 4: 15 terms per axis (30 total) — + quartic (recommended for TESS)
+///
+/// # Panics
+///
+/// Panics when `solve_results` and `centroids` differ in length or `order` is
+/// outside `[2, 6]`. [`crate::calibrate_camera`] validates both (returning an
+/// error) before delegating here.
 /// - order 5: 21 terms per axis (42 total) — + quintic
 ///
 /// Order-0 terms absorb optical center offset; order-1 terms absorb residual

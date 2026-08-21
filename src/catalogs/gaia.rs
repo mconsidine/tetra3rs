@@ -42,7 +42,13 @@ pub fn load_gaia_binary<P: AsRef<Path>>(path: P) -> Result<Vec<GaiaStar>> {
         )));
     }
 
-    let num_stars = u64::from_le_bytes(header[8..16].try_into().unwrap()) as usize;
+    // Convert the header's u64 count checked — `as usize` would silently
+    // truncate on a 32-bit target, loading a fraction of the claimed stars.
+    let num_stars: usize = u64::from_le_bytes(header[8..16].try_into().unwrap())
+        .try_into()
+        .map_err(|_| {
+            Error::InvalidCatalog("Gaia binary: num_stars exceeds addressable memory".into())
+        })?;
 
     let record_size = 36;
     // A corrupt/truncated header could claim a huge `num_stars`, driving a
@@ -73,6 +79,7 @@ pub fn load_gaia_binary<P: AsRef<Path>>(path: P) -> Result<Vec<GaiaStar>> {
     file.read_exact(&mut buf)?;
 
     let mut stars = Vec::with_capacity(num_stars);
+    let mut non_finite = 0usize;
     for i in 0..num_stars {
         let offset = i * record_size;
         let rec = &buf[offset..offset + record_size];
@@ -84,6 +91,20 @@ pub fn load_gaia_binary<P: AsRef<Path>>(path: P) -> Result<Vec<GaiaStar>> {
         let pmra = f32::from_le_bytes(rec[28..32].try_into().unwrap());
         let pmdec = f32::from_le_bytes(rec[32..36].try_into().unwrap());
 
+        // A NaN/inf position or magnitude would land the star in a bogus
+        // spatial-index bin (or drop it from every magnitude cut), and a
+        // non-finite proper motion poisons epoch propagation — all with no
+        // diagnostic. Skip such records and report the count instead.
+        if !(ra.is_finite()
+            && dec.is_finite()
+            && mag.is_finite()
+            && pmra.is_finite()
+            && pmdec.is_finite())
+        {
+            non_finite += 1;
+            continue;
+        }
+
         stars.push(GaiaStar {
             source_id,
             ra_deg: ra as f32,
@@ -92,6 +113,9 @@ pub fn load_gaia_binary<P: AsRef<Path>>(path: P) -> Result<Vec<GaiaStar>> {
             pmra,
             pmdec,
         });
+    }
+    if non_finite > 0 {
+        tracing::warn!("Gaia binary: skipped {non_finite} record(s) with non-finite ra/dec/mag");
     }
 
     Ok(stars)

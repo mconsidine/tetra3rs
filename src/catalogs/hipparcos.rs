@@ -40,21 +40,30 @@ impl HipparcosStar {
     }
 }
 
+/// Extract a fixed-width column as `&str`, or `None` if the bytes in that
+/// range are not valid UTF-8. Slicing the record as bytes (not `&str`) keeps
+/// a multi-byte character straddling a column boundary from panicking — such
+/// a line is malformed and gets skipped like any other unparseable record.
+fn column(record: &[u8], range: std::ops::Range<usize>) -> Option<&str> {
+    std::str::from_utf8(record.get(range)?).ok()
+}
+
 /// Parse a single Hipparcos catalog record into a `HipparcosStar`.
 fn parse_hipparcos_star(record: &str) -> Option<HipparcosStar> {
+    let bytes = record.as_bytes();
     // Highest column offset the parser reads is the B−V field ending at 158.
-    if record.len() < 158 {
+    if bytes.len() < 158 {
         return None;
     }
 
     Some(HipparcosStar {
-        hip: record[0..6].trim().parse().ok()?,
-        ra_rad: record[15..28].trim().parse().ok()?,
-        dec_rad: record[29..42].trim().parse().ok()?,
-        pm_ra: record[51..59].trim().parse().ok()?,
-        pm_dec: record[60..68].trim().parse().ok()?,
-        hpmag: record[129..136].trim().parse().ok()?,
-        b_v: record[152..158].trim().parse().ok()?,
+        hip: column(bytes, 0..6)?.trim().parse().ok()?,
+        ra_rad: column(bytes, 15..28)?.trim().parse().ok()?,
+        dec_rad: column(bytes, 29..42)?.trim().parse().ok()?,
+        pm_ra: column(bytes, 51..59)?.trim().parse().ok()?,
+        pm_dec: column(bytes, 60..68)?.trim().parse().ok()?,
+        hpmag: column(bytes, 129..136)?.trim().parse().ok()?,
+        b_v: column(bytes, 152..158)?.trim().parse().ok()?,
     })
 }
 
@@ -86,6 +95,19 @@ pub fn load_hipparcos_catalog_from_file<P: AsRef<std::path::Path>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multibyte_utf8_line_is_skipped_not_panicked() {
+        // Regression: `&str` byte-range slicing panicked when a multi-byte
+        // character straddled a fixed-width column boundary (e.g. at byte 5).
+        let mut line = String::from("  12é"); // 'é' spans bytes 4..6 — across the 0..6 boundary
+        line.push_str(&" ".repeat(160));
+        assert!(parse_hipparcos_star(&line).is_none());
+
+        // A fully multi-byte line long enough to pass the length gate.
+        let junk = "é".repeat(100);
+        assert!(parse_hipparcos_star(&junk).is_none());
+    }
 
     #[test]
     #[ignore]

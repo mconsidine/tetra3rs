@@ -140,16 +140,19 @@ pub fn calibrate_camera(
     image_height: u32,
     config: &CalibrateConfig,
 ) -> crate::Result<CalibrateResult> {
-    assert_eq!(
-        solve_results.len(),
-        centroids.len(),
-        "solve_results and centroids must have the same length"
-    );
+    if solve_results.len() != centroids.len() {
+        return Err(crate::Error::InvalidInput(format!(
+            "calibrate_camera: solve_results ({}) and centroids ({}) must have the same length",
+            solve_results.len(),
+            centroids.len()
+        )));
+    }
     if let DistortionModelType::Polynomial { order } = config.model {
-        assert!(
-            (2..=6).contains(&order),
-            "polynomial order must be in [2, 6]"
-        );
+        if !(2..=6).contains(&order) {
+            return Err(crate::Error::InvalidInput(format!(
+                "calibrate_camera: polynomial order must be in [2, 6], got {order}"
+            )));
+        }
     }
 
     // Count valid (successful) solves. With none, there is no attitude/FOV to
@@ -211,7 +214,11 @@ fn extract_crpix(distortion: Distortion) -> ([f64; 2], Distortion) {
             let new_poly = PolynomialDistortion::new(poly.order, poly.scale, a, b);
             ([crpix_x, crpix_y], Distortion::Polynomial(new_poly))
         }
-        other => ([0.0, 0.0], other),
+        // Matched explicitly (no catch-all) so a future variant carrying its
+        // own optical-center offset is caught by the compiler here, like the
+        // multi-image path's match does.
+        Distortion::None => ([0.0, 0.0], Distortion::None),
+        Distortion::Radial(r) => ([0.0, 0.0], Distortion::Radial(r)),
     }
 }
 
@@ -240,6 +247,18 @@ fn single_image_calibrate(
             fit_radial_distortion(solve_results, centroids, database, image_width, &fit_config)
         }
     };
+
+    // A fitter that had too few matched points returns its `no_fit` sentinel
+    // (identity model). Wrapping that in `Ok` would hand back a perfect-looking
+    // fabricated calibration (RMSE 0, no distortion) — exactly what the
+    // documented error contract promises to reject; the multi-image path
+    // enforces the same via its RMSE sentinel.
+    if fit_result.model.is_none() {
+        return Err(crate::Error::InvalidInput(format!(
+            "calibrate_camera: too few matched points ({}) for a {:?} distortion fit",
+            fit_result.n_inliers, config.model
+        )));
+    }
 
     // FOV and parity come from the (caller-guaranteed) successful solve.
     let first_solution = solve_results

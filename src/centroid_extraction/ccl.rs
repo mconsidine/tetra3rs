@@ -49,6 +49,17 @@ pub(super) fn extract_from_gray(
         )));
     }
 
+    // The Gaussian kernel spans 2·⌈3σ⌉+1 taps, so an absurd σ is a
+    // multi-gigabyte allocation / effective hang, not a blur. 64 px covers
+    // any plausible star PSF with two orders of magnitude to spare.
+    const MAX_MATCHED_FILTER_SIGMA: f32 = 64.0;
+    if let Some(s) = config.matched_filter_sigma {
+        if s.is_finite() && s > MAX_MATCHED_FILTER_SIGMA {
+            return Err(Error::InvalidInput(format!(
+                "matched_filter_sigma must be <= {MAX_MATCHED_FILTER_SIGMA} px, got {s}"
+            )));
+        }
+    }
     let filter_sigma = config
         .matched_filter_sigma
         .filter(|s| s.is_finite() && *s > 0.0);

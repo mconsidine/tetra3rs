@@ -29,7 +29,10 @@ const L_RATE_DEG: f64 = 0.9856474;
 ///
 /// * `days_since_j2000` — Days since the J2000.0 epoch (2000 January 1,
 ///   12:00 TT). TT ≈ UTC + 69 s; the difference is negligible for this
-///   approximation.
+///   approximation. Must be finite (a NaN/inf input propagates into a NaN
+///   velocity vector, which the solver then treats as "no correction
+///   possible" — every aberrated star fails to match); magnitudes beyond
+///   ~1e13 days lose all angular precision in the trigonometry.
 ///
 /// # Returns
 ///
