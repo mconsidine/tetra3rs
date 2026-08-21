@@ -183,6 +183,14 @@ pub enum SolveStatus {
     Timeout,
     /// Too few centroids were provided to form a pattern.
     TooFew,
+    /// The [`SolveConfig`] failed validation (degenerate camera model or
+    /// non-finite matching parameters) — nothing was searched. See
+    /// [`SolveConfig::validate`] for the exact rules. Returned immediately,
+    /// so `solve_time_ms` is ~0.
+    ///
+    /// (Appended after the 0.9 variants, so previously serialized statuses
+    /// keep their postcard wire values.)
+    InvalidConfig,
 }
 
 /// A failed plate-solve attempt: why it failed and how long it took.
@@ -567,6 +575,77 @@ impl SolveConfig {
             0.0
         }
     }
+
+    /// Check that this configuration can produce a meaningful solve.
+    ///
+    /// `solve_from_centroids` runs this first and returns
+    /// [`SolveStatus::InvalidConfig`] on failure (previously such configs
+    /// only logged a warning and burned the full search to a guaranteed
+    /// `NoMatch`). Rules:
+    ///
+    /// - [`camera_model`](Self::camera_model) passes
+    ///   [`CameraModel::validate`] (finite positive focal length, non-zero
+    ///   dimensions, finite CRPIX, consistent distortion) — the
+    ///   `SolveConfig::default()` placeholder model fails this.
+    /// - [`match_radius`](Self::match_radius) and
+    ///   [`match_threshold`](Self::match_threshold) are finite and positive
+    ///   (NaN silently disables all matching / rejects every candidate).
+    /// - [`fov_max_error_rad`](Self::fov_max_error_rad), if set, is finite
+    ///   and non-negative (`0.0` means "no sweep beyond the estimate").
+    /// - [`match_max_error`](Self::match_max_error), if set, is finite and
+    ///   positive.
+    /// - [`observer_velocity_km_s`](Self::observer_velocity_km_s), if set,
+    ///   has finite components.
+    /// - [`hint_uncertainty_rad`](Self::hint_uncertainty_rad) is finite and
+    ///   positive — checked only when an
+    ///   [`attitude_hint`](Self::attitude_hint) is set (the field is inert
+    ///   otherwise).
+    pub fn validate(&self) -> crate::Result<()> {
+        use crate::Error::InvalidInput;
+        self.camera_model.validate()?;
+        if !(self.match_radius.is_finite() && self.match_radius > 0.0) {
+            return Err(InvalidInput(format!(
+                "match_radius must be finite and > 0, got {}",
+                self.match_radius
+            )));
+        }
+        if !(self.match_threshold.is_finite() && self.match_threshold > 0.0) {
+            return Err(InvalidInput(format!(
+                "match_threshold must be finite and > 0, got {}",
+                self.match_threshold
+            )));
+        }
+        if let Some(e) = self.fov_max_error_rad {
+            if !(e.is_finite() && e >= 0.0) {
+                return Err(InvalidInput(format!(
+                    "fov_max_error_rad must be finite and >= 0, got {e}"
+                )));
+            }
+        }
+        if let Some(e) = self.match_max_error {
+            if !(e.is_finite() && e > 0.0) {
+                return Err(InvalidInput(format!(
+                    "match_max_error must be finite and > 0, got {e}"
+                )));
+            }
+        }
+        if let Some(v) = self.observer_velocity_km_s {
+            if !v.iter().all(|c| c.is_finite()) {
+                return Err(InvalidInput(format!(
+                    "observer_velocity_km_s components must be finite, got {v:?}"
+                )));
+            }
+        }
+        if self.attitude_hint.is_some()
+            && !(self.hint_uncertainty_rad.is_finite() && self.hint_uncertainty_rad > 0.0)
+        {
+            return Err(InvalidInput(format!(
+                "hint_uncertainty_rad must be finite and > 0, got {}",
+                self.hint_uncertainty_rad
+            )));
+        }
+        Ok(())
+    }
 }
 
 // ── Solve result ────────────────────────────────────────────────────────────
@@ -713,5 +792,41 @@ mod tests {
         bad(|c| c.catalog_nside = 0);
         bad(|c| c.max_fov_deg = 0.0);
         bad(|c| c.min_fov_deg = Some(40.0)); // > max_fov_deg (30)
+    }
+
+    #[test]
+    fn solve_config_validate() {
+        let good = SolveConfig::new(10.0_f32.to_radians(), 1024, 768);
+        assert!(good.validate().is_ok());
+
+        // The unconfigured Default placeholder camera must fail.
+        assert!(SolveConfig::default().validate().is_err());
+
+        let bad = |f: fn(&mut SolveConfig)| {
+            let mut c = SolveConfig::new(10.0_f32.to_radians(), 1024, 768);
+            f(&mut c);
+            assert!(c.validate().is_err());
+        };
+        bad(|c| c.match_radius = f32::NAN); // silently disables all matching
+        bad(|c| c.match_radius = 0.0);
+        bad(|c| c.match_threshold = f64::NAN); // rejects every candidate
+        bad(|c| c.match_threshold = -1e-5);
+        bad(|c| c.fov_max_error_rad = Some(f32::NAN));
+        bad(|c| c.fov_max_error_rad = Some(f32::INFINITY));
+        bad(|c| c.match_max_error = Some(f32::NAN));
+        bad(|c| c.observer_velocity_km_s = Some([f64::NAN, 0.0, 0.0]));
+        bad(|c| {
+            c.attitude_hint = Some(Quaternion::identity());
+            c.hint_uncertainty_rad = f32::NAN;
+        });
+
+        // hint_uncertainty is inert (and unchecked) without a hint.
+        let mut c = SolveConfig::new(10.0_f32.to_radians(), 1024, 768);
+        c.hint_uncertainty_rad = f32::NAN;
+        assert!(c.validate().is_ok());
+        // Zero fov_max_error means "no sweep" — allowed.
+        c.hint_uncertainty_rad = 1.0;
+        c.fov_max_error_rad = Some(0.0);
+        assert!(c.validate().is_ok());
     }
 }

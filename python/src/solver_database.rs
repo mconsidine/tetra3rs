@@ -204,8 +204,8 @@ impl PySolverDatabase {
     /// Returns:
     ///     SolveResult on success, or a (falsy) SolveFailure carrying the
     ///     failure reason (``status``: ``'no_match'`` / ``'timeout'`` /
-    ///     ``'too_few'``) and ``solve_time_ms``. Use ``if result:`` to
-    ///     distinguish the two.
+    ///     ``'too_few'`` / ``'invalid_config'``) and ``solve_time_ms``. Use
+    ///     ``if result:`` to distinguish the two.
     #[pyo3(signature = (
         centroids,
         fov_estimate_deg = None,

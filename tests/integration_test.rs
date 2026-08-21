@@ -682,6 +682,9 @@ fn test_statistical_1000_random_orientations() {
                     all_solve_times_ms.push(fail.solve_time_ms);
                 }
                 SolveStatus::TooFew => n_too_few += 1,
+                SolveStatus::InvalidConfig => {
+                    panic!("statistical trials use a valid config; got InvalidConfig")
+                }
             },
         }
 
@@ -887,6 +890,27 @@ fn test_save_and_load_database() {
         "pattern_bins inconsistent with pattern_max_error must fail validation"
     );
 
+    // An invalid solve config fails fast with InvalidConfig instead of
+    // burning the search to a guaranteed NoMatch (or warn-and-proceed).
+    let dummy_centroids: Vec<Centroid> = (0..6)
+        .map(|i| Centroid {
+            x: 40.0 * i as f32 - 100.0,
+            y: 25.0 * i as f32 - 60.0,
+            mass: Some(100.0),
+            cov: None,
+        })
+        .collect();
+    let fail = db
+        .solve_from_centroids(&dummy_centroids, &SolveConfig::default())
+        .expect_err("placeholder camera model must not solve");
+    assert_eq!(fail.status, SolveStatus::InvalidConfig);
+    let mut bad_cfg = SolveConfig::new(20.0_f32.to_radians(), 1024, 768);
+    bad_cfg.match_radius = f32::NAN;
+    let fail = db
+        .solve_from_centroids(&dummy_centroids, &bad_cfg)
+        .expect_err("NaN match_radius must not solve");
+    assert_eq!(fail.status, SolveStatus::InvalidConfig);
+
     // And end-to-end: a bit-flipped file either fails to decode (postcard) or
     // fails validation — it must never load successfully with corrupt indices.
     let bad_path = "temp_db_corrupt.bin";
@@ -1062,6 +1086,9 @@ fn test_statistical_1000_noisy_centroids() {
                     all_solve_times_ms.push(fail.solve_time_ms);
                 }
                 SolveStatus::TooFew => n_too_few += 1,
+                SolveStatus::InvalidConfig => {
+                    panic!("statistical trials use a valid config; got InvalidConfig")
+                }
             },
         }
 

@@ -448,6 +448,7 @@ impl PySolveFailure {
             SolveStatus::NoMatch => "no_match",
             SolveStatus::Timeout => "timeout",
             SolveStatus::TooFew => "too_few",
+            SolveStatus::InvalidConfig => "invalid_config",
         }
     }
 }
@@ -456,7 +457,9 @@ impl PySolveFailure {
 impl PySolveFailure {
     /// Why the solve produced no solution: ``'no_match'`` (all pattern
     /// combinations exhausted), ``'timeout'`` (``solve_timeout_ms`` reached),
-    /// or ``'too_few'`` (fewer than 4 usable centroids).
+    /// ``'too_few'`` (fewer than 4 usable centroids), or
+    /// ``'invalid_config'`` (degenerate camera model or non-finite matching
+    /// parameters — nothing was searched).
     #[getter]
     fn status(&self) -> &'static str {
         self.status_str()

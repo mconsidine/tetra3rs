@@ -199,6 +199,23 @@ class TestSolveFromCentroids:
                 attitude_hint=[0.0, 0.0, 0.0, 0.0],
             )
 
+    def test_invalid_config_status(self, skyview_db):
+        """Non-finite matching parameters fail fast with 'invalid_config'
+        instead of burning the search to a guaranteed 'no_match'."""
+        centroids = np.array(
+            [[40.0 * i - 100.0, 25.0 * i - 60.0] for i in range(6)], dtype=np.float64
+        )
+        result = skyview_db.solve_from_centroids(
+            centroids,
+            fov_estimate_deg=10.0,
+            image_width=2048,
+            image_height=2048,
+            match_radius=float("nan"),
+        )
+        assert not result
+        assert result.status == "invalid_config"
+        assert result.solve_time_ms < 100.0
+
     def test_solve_with_numpy_array_3col(self, skyview_db):
         """Verify centroids can be passed as Nx3 numpy array (x, y, brightness)."""
         ra, dec = 83.0, -1.0

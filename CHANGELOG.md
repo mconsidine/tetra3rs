@@ -51,6 +51,16 @@ unchanged.
 
 ### Changed
 
+- **New `SolveStatus::InvalidConfig` variant** (breaking for exhaustive
+  matches): `solve_from_centroids` now runs the new public
+  `SolveConfig::validate()` first and fails fast with `InvalidConfig`
+  instead of warn-and-proceed to a guaranteed `NoMatch` — for the
+  `Default::default()` placeholder camera model, non-finite
+  `match_radius`/`match_threshold`, non-finite `fov_max_error_rad` /
+  `match_max_error` / `observer_velocity_km_s`, and (when a hint is set) a
+  degenerate `hint_uncertainty_rad`. Python: `SolveFailure.status` gains
+  `'invalid_config'`. The variant is appended after the 0.9 ones, so
+  previously serialized statuses keep their wire values.
 - **`CameraModel::from_fov` and `StarCatalog::new` validate in release
   builds** (documented panics). Previously `from_fov` checked only in debug,
   so release builds accepted `fov=0`/`≥180°`/NaN and silently produced

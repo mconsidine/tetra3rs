@@ -90,35 +90,16 @@ impl SolverDatabase {
     ) -> SolveResult {
         let t0 = Instant::now();
 
-        // The `SolveConfig::default()` camera model is a placeholder with a zero
-        // image size / focal length; a config left at those defaults yields a
-        // degenerate FOV and silently NoMatches. Warn loudly so the cause is
-        // visible rather than mysterious.
+        // A config that cannot produce a meaningful solve — the
+        // `SolveConfig::default()` placeholder camera model (zero image size),
+        // NaN match parameters that silently disable all matching, etc. —
+        // fails fast with `InvalidConfig` instead of burning the full search
+        // to a guaranteed NoMatch.
+        if let Err(e) = config.validate() {
+            warn!("solve_from_centroids: {e}");
+            return failure(SolveStatus::InvalidConfig, t0);
+        }
         let cam = &config.camera_model;
-        let focal_ok = cam.focal_length_px.is_finite() && cam.focal_length_px > 0.0;
-        if cam.image_width == 0 || cam.image_height == 0 || !focal_ok {
-            warn!(
-                "camera model appears unconfigured (image {}x{}, focal_length_px {}); \
-                 solve will not match — build SolveConfig via new()/with_camera_model()",
-                cam.image_width, cam.image_height, cam.focal_length_px
-            );
-        }
-        // Same spirit for the match parameters: a NaN/non-positive match_radius
-        // makes every `d² <= r²` comparison false (silently disabling all
-        // matching), and a NaN match_threshold rejects every candidate. Warn so
-        // a guaranteed-NoMatch config is diagnosable.
-        if !(config.match_radius.is_finite() && config.match_radius > 0.0) {
-            warn!(
-                "match_radius {} is not a positive finite fraction; no star can match",
-                config.match_radius
-            );
-        }
-        if !(config.match_threshold.is_finite() && config.match_threshold > 0.0) {
-            warn!(
-                "match_threshold {} is not a positive finite probability; no candidate can pass",
-                config.match_threshold
-            );
-        }
 
         // ── Aberration correction: build corrected catalog vectors if velocity is set ──
         let star_vecs: Cow<[[f32; 3]]> = match config.observer_velocity_km_s {
