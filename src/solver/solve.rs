@@ -227,10 +227,19 @@ impl SolverDatabase {
 
         let mut last_status = SolveStatus::NoMatch;
 
+        // Image patterns enumerated so far, summed over the FOV sweep; the
+        // `max_patterns_checked` budget is applied to this total.
+        let mut patterns_checked: u64 = 0;
+
         for &fov_try in &fov_values {
-            // Check timeout
+            // Check search budgets (wall-clock and pattern count)
             if let Some(t) = config.solve_timeout_ms {
                 if elapsed_ms(t0) > t as f32 {
+                    return failure(SolveStatus::Timeout, t0);
+                }
+            }
+            if let Some(max) = config.max_patterns_checked {
+                if patterns_checked >= max {
                     return failure(SolveStatus::Timeout, t0);
                 }
             }
@@ -243,6 +252,7 @@ impl SolverDatabase {
                 fov_try,
                 &star_vecs,
                 &mut candidates_tested,
+                &mut patterns_checked,
                 t0,
             );
             match result {
@@ -277,6 +287,7 @@ impl SolverDatabase {
         fov_estimate: f32,
         star_vectors: &[[f32; 3]],
         candidates_tested: &mut u64,
+        patterns_checked: &mut u64,
         t0: Instant,
     ) -> SolveResult {
         #[cfg(feature = "profile")]
@@ -389,6 +400,7 @@ impl SolverDatabase {
             p_max_err
         };
         let timeout_ms = config.solve_timeout_ms;
+        let max_patterns = config.max_patterns_checked;
 
         // Guard against a corrupt or placeholder database. An empty table
         // makes the hash-probe arithmetic below divide by zero; a non-empty
@@ -412,14 +424,30 @@ impl SolverDatabase {
         for image_pattern_local in
             BreadthFirstCombinations::<PATTERN_SIZE>::new(&pattern_centroid_inds)
         {
-            // Check timeout
+            // Check search budgets (wall-clock and pattern count)
             if let Some(t) = timeout_ms {
                 if elapsed_ms(t0) > t as f32 {
-                    debug!("Timeout after {:.1}ms", elapsed_ms(t0));
+                    debug!(
+                        "Timeout after {:.1}ms ({} patterns checked)",
+                        elapsed_ms(t0),
+                        patterns_checked
+                    );
                     status = SolveStatus::Timeout;
                     break;
                 }
             }
+            if let Some(max) = max_patterns {
+                if *patterns_checked >= max {
+                    debug!(
+                        "Pattern budget exhausted: {} patterns checked in {:.1}ms",
+                        patterns_checked,
+                        elapsed_ms(t0)
+                    );
+                    status = SolveStatus::Timeout;
+                    break;
+                }
+            }
+            *patterns_checked += 1;
 
             // Get image pattern vectors
             let image_vecs: [[f32; 3]; 4] = [

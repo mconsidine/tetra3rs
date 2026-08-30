@@ -216,6 +216,37 @@ class TestSolveFromCentroids:
         assert result.status == "invalid_config"
         assert result.solve_time_ms < 100.0
 
+    def test_pattern_budget_reports_timeout(self, skyview_db):
+        """A field of random centroids never matches; a small
+        max_patterns_checked ends the search deterministically with 'timeout'
+        long before the wall-clock timeout would."""
+        rng = np.random.default_rng(7)
+        centroids = rng.uniform(-900.0, 900.0, size=(12, 2))
+        result = skyview_db.solve_from_centroids(
+            centroids,
+            fov_estimate_deg=10.0,
+            image_width=2048,
+            image_height=2048,
+            max_patterns_checked=3,
+        )
+        assert not result
+        assert result.status == "timeout"
+        assert result.solve_time_ms < 1000.0
+
+    def test_pattern_budget_zero_is_invalid_config(self, skyview_db):
+        centroids = np.array(
+            [[40.0 * i - 100.0, 25.0 * i - 60.0] for i in range(6)], dtype=np.float64
+        )
+        result = skyview_db.solve_from_centroids(
+            centroids,
+            fov_estimate_deg=10.0,
+            image_width=2048,
+            image_height=2048,
+            max_patterns_checked=0,
+        )
+        assert not result
+        assert result.status == "invalid_config"
+
     def test_solve_with_numpy_array_3col(self, skyview_db):
         """Verify centroids can be passed as Nx3 numpy array (x, y, brightness)."""
         ra, dec = 83.0, -1.0

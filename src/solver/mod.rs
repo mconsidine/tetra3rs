@@ -180,7 +180,9 @@ mod pattern_catalog_tests {
 pub enum SolveStatus {
     /// All pattern combinations were exhausted without a match.
     NoMatch,
-    /// The solve timeout was reached before a match was found.
+    /// The search budget was exhausted before a match was found — either
+    /// the wall-clock [`SolveConfig::solve_timeout_ms`] or the pattern
+    /// count [`SolveConfig::max_patterns_checked`], whichever tripped first.
     Timeout,
     /// Too few centroids were provided to form a pattern.
     TooFew,
@@ -386,8 +388,8 @@ impl GenerateDatabaseConfig {
 /// - **Camera geometry** ([`camera_model`]) and **matching/verification**
 ///   ([`match_radius`], [`match_threshold`], [`solve_timeout_ms`]) apply to
 ///   both modes.
-/// - **Lost-in-space** ([`fov_max_error_rad`], [`match_max_error`]) tune the
-///   pattern search; ignored in tracking.
+/// - **Lost-in-space** ([`fov_max_error_rad`], [`match_max_error`],
+///   [`max_patterns_checked`]) tune the pattern search; ignored in tracking.
 /// - **Tracking** ([`attitude_hint`], [`hint_uncertainty_rad`],
 ///   [`strict_hint`]) are inert unless `attitude_hint` is set.
 /// - **Stellar aberration** ([`observer_velocity_km_s`]) applies to both
@@ -399,6 +401,7 @@ impl GenerateDatabaseConfig {
 /// [`solve_timeout_ms`]: SolveConfig::solve_timeout_ms
 /// [`fov_max_error_rad`]: SolveConfig::fov_max_error_rad
 /// [`match_max_error`]: SolveConfig::match_max_error
+/// [`max_patterns_checked`]: SolveConfig::max_patterns_checked
 /// [`attitude_hint`]: SolveConfig::attitude_hint
 /// [`hint_uncertainty_rad`]: SolveConfig::hint_uncertainty_rad
 /// [`strict_hint`]: SolveConfig::strict_hint
@@ -432,7 +435,15 @@ pub struct SolveConfig {
     /// directly. Raising this (e.g. `1e-3`) accepts weaker evidence — useful
     /// for very sparse fields (≲7 stars) at increased false-positive risk.
     pub match_threshold: f64,
-    /// Timeout in milliseconds. None = no timeout. Default 5000.
+    /// Wall-clock timeout in milliseconds. None = no timeout. Default 5000.
+    ///
+    /// This is the operational bound — the guarantee that an answer (or a
+    /// [`SolveStatus::Timeout`]) arrives inside a frame period regardless of
+    /// why the search is slow. Measured with a monotonic clock on every
+    /// target, including browser wasm (`performance.now()`). On a wasm
+    /// module run without a JS host there is no clock at all; bound the
+    /// search with [`max_patterns_checked`](Self::max_patterns_checked)
+    /// there.
     pub solve_timeout_ms: Option<u64>,
 
     // ── Lost-in-space pattern search (ignored in tracking mode) ──
@@ -450,6 +461,21 @@ pub struct SolveConfig {
     /// tighter match tolerance cannot be honored. *Lost-in-space only* —
     /// tracking does not use the pattern hash.
     pub match_max_error: Option<f32>,
+    /// Maximum number of image 4-star patterns the lost-in-space search will
+    /// test before giving up with [`SolveStatus::Timeout`]. None = unbounded.
+    /// Default [`SolveConfig::DEFAULT_MAX_PATTERNS_CHECKED`].
+    ///
+    /// The search cost is the number of centroid 4-combinations enumerated
+    /// (each one is a hash probe plus, per catalog hit, an SVD and a
+    /// verification pass), summed across every FOV value in the sweep. Where
+    /// [`solve_timeout_ms`](Self::solve_timeout_ms) bounds that work in wall
+    /// time, this bounds it directly: the outcome for a given input and
+    /// config is then the same on every machine and target, which makes
+    /// budget-exhaustion reproducible (and testable with a small value) and
+    /// keeps the search finite where no clock exists. The two compose —
+    /// whichever trips first ends the search. *Lost-in-space only* — tracking
+    /// tests a single hinted candidate and never enumerates patterns.
+    pub max_patterns_checked: Option<u64>,
 
     // ── Tracking (ignored unless `attitude_hint` is set) ──
     /// Optional attitude hint for tracking-mode solving.
@@ -510,6 +536,7 @@ impl Default for SolveConfig {
             match_threshold: 1e-5,
             solve_timeout_ms: Some(5000),
             match_max_error: None,
+            max_patterns_checked: Some(Self::DEFAULT_MAX_PATTERNS_CHECKED),
             camera_model: CameraModel {
                 focal_length_px: 1.0,
                 image_width: 0,
@@ -527,6 +554,23 @@ impl Default for SolveConfig {
 }
 
 impl SolveConfig {
+    /// Default [`max_patterns_checked`](Self::max_patterns_checked):
+    /// ten million image patterns.
+    ///
+    /// Sized so that on a native build the 5000 ms default
+    /// [`solve_timeout_ms`](Self::solve_timeout_ms) always trips first: a
+    /// release build enumerates ~1.3 M patterns/s when hash probes miss (the
+    /// fastest case — ~7 s to exhaust this budget) and far fewer when
+    /// candidates reach verification. The budget is a backstop for targets
+    /// with no clock, not the normal exit; lower it on such hosts (browser
+    /// wasm has a clock — see `solver::clock`).
+    ///
+    /// For scale: cluster-buster thinning caps one FOV pass at roughly
+    /// `verification_stars_per_fov` pattern centroids, so a pass over a
+    /// default database is ≲ C(40, 4) ≈ 91 k patterns; the budget matters
+    /// for dense databases and long FOV sweeps.
+    pub const DEFAULT_MAX_PATTERNS_CHECKED: u64 = 10_000_000;
+
     /// Create a solve configuration with the given FOV estimate (radians) and
     /// image dimensions, using a simple pinhole camera model (no distortion,
     /// centered optical axis, no parity flip).
@@ -595,6 +639,8 @@ impl SolveConfig {
     ///   and non-negative (`0.0` means "no sweep beyond the estimate").
     /// - [`match_max_error`](Self::match_max_error), if set, is finite and
     ///   positive.
+    /// - [`max_patterns_checked`](Self::max_patterns_checked), if set, is
+    ///   positive (`Some(0)` would search nothing; use `None` for unbounded).
     /// - [`observer_velocity_km_s`](Self::observer_velocity_km_s), if set,
     ///   has finite components.
     /// - [`hint_uncertainty_rad`](Self::hint_uncertainty_rad) is finite and
@@ -629,6 +675,11 @@ impl SolveConfig {
                     "match_max_error must be finite and > 0, got {e}"
                 )));
             }
+        }
+        if self.max_patterns_checked == Some(0) {
+            return Err(InvalidInput(
+                "max_patterns_checked must be > 0 (None = unbounded)".into(),
+            ));
         }
         if let Some(v) = self.observer_velocity_km_s {
             if !v.iter().all(|c| c.is_finite()) {
@@ -815,6 +866,7 @@ mod tests {
         bad(|c| c.fov_max_error_rad = Some(f32::NAN));
         bad(|c| c.fov_max_error_rad = Some(f32::INFINITY));
         bad(|c| c.match_max_error = Some(f32::NAN));
+        bad(|c| c.max_patterns_checked = Some(0)); // would search nothing
         bad(|c| c.observer_velocity_km_s = Some([f64::NAN, 0.0, 0.0]));
         bad(|c| {
             c.attitude_hint = Some(Quaternion::identity());
@@ -828,6 +880,11 @@ mod tests {
         // Zero fov_max_error means "no sweep" — allowed.
         c.hint_uncertainty_rad = 1.0;
         c.fov_max_error_rad = Some(0.0);
+        assert!(c.validate().is_ok());
+        // Pattern budget: any positive value or None (unbounded) is fine.
+        c.max_patterns_checked = Some(1);
+        assert!(c.validate().is_ok());
+        c.max_patterns_checked = None;
         assert!(c.validate().is_ok());
     }
 }

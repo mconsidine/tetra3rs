@@ -651,6 +651,7 @@ class SolverDatabase:
         match_radius: float = 0.01,
         match_threshold: float = 1e-5,
         solve_timeout_ms: Optional[int] = 5000,
+        max_patterns_checked: Optional[int] = 10_000_000,
         match_max_error: Optional[float] = None,
         camera_model: Optional[CameraModel] = None,
         observer_velocity_km_s: Optional[list[float]] = None,
@@ -670,6 +671,7 @@ class SolverDatabase:
 
         * **Both modes:** ``camera_model`` / ``fov_estimate_*`` / ``image_*``,
           ``match_radius``, ``match_threshold``, ``solve_timeout_ms``,
+          ``max_patterns_checked``,
           ``observer_velocity_km_s``.
         * **Lost-in-space only:** ``fov_max_error_*``, ``match_max_error``.
         * **Tracking only** (ignored unless ``attitude_hint`` is set):
@@ -700,7 +702,14 @@ class SolverDatabase:
                 sequential multiple-comparison correction). Raising it (e.g.
                 1e-3) accepts weaker evidence — useful for very sparse fields
                 at increased false-positive risk.
-            solve_timeout_ms: Timeout in milliseconds. None = no timeout.
+            solve_timeout_ms: Wall-clock timeout in milliseconds. None = no
+                timeout. Default 5000.
+            max_patterns_checked: Maximum number of image 4-star patterns the
+                lost-in-space search tests (summed over the FOV sweep) before
+                giving up with ``'timeout'``. Bounds the search by work rather
+                than wall time, so the outcome is the same on every machine;
+                composes with ``solve_timeout_ms`` (whichever trips first).
+                None = unbounded. Lost-in-space only.
             match_max_error: Maximum edge-ratio error. None = use database value.
                 Values below the database's pattern quantization error are clamped up to it.
                 Lost-in-space only — tracking does not use the pattern hash.

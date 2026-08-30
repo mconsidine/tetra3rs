@@ -7,6 +7,7 @@ Only recent releases are listed. Older entries are in this file's git history (`
 ### Added
 
 - Browser wasm support (`wasm32-unknown-unknown`): the solver clock goes through `solver::clock::Instant` — `std::time::Instant` everywhere with a working clock, `web_time::Instant` (`performance.now()`) on `wasm32-unknown-unknown` where `std`'s `Instant::now()` aborts; WASI/Emscripten keep `std`; `profile`'s `timed!` uses the same clock; CI lints the wasm32 target. Based on #46 by @trams ([#46](https://github.com/ssmichael1/tetra3rs/pull/46), [#48](https://github.com/ssmichael1/tetra3rs/pull/48))
+- `SolveConfig::max_patterns_checked` (Python `max_patterns_checked=`): a search budget in image patterns, summed over the FOV sweep, checked alongside `solve_timeout_ms` — whichever trips first ends the search with `SolveStatus::Timeout`; deterministic across machines and finite on clockless targets. Default 10 M (the 5 s timeout normally trips first natively); `None` = unbounded; `Some(0)` fails `validate()` ([#49](https://github.com/ssmichael1/tetra3rs/pull/49))
 
 ## 0.10.0 - 2026-08-21
 
