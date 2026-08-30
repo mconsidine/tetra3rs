@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Browser wasm support (`wasm32-unknown-unknown`): the solver clock goes through `solver::clock::Instant` — `std::time::Instant` everywhere with a working clock, `web_time::Instant` (`performance.now()`) on `wasm32-unknown-unknown` where `std`'s `Instant::now()` aborts; WASI/Emscripten keep `std`; `profile`'s `timed!` uses the same clock; CI lints the wasm32 target. Based on #46 by @trams ([#46](https://github.com/ssmichael1/tetra3rs/pull/46))
+
 ## 0.10.0
 
 Robustness sweep: validate at every trust boundary (file load, pickle,

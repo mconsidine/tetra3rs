@@ -10,8 +10,8 @@
 //!    c. Verify by projecting catalog stars and counting matches.
 //!    d. Accept if false-positive probability is below threshold.
 
-use std::borrow::Cow;
 use super::clock::Instant;
+use std::borrow::Cow;
 
 use numeris::{Matrix3, Quaternion, Vector3};
 use tracing::{debug, warn};

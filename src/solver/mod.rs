@@ -16,7 +16,7 @@
 macro_rules! timed {
     ($bucket:expr, $e:expr) => {{
         #[cfg(feature = "profile")]
-        let __t0 = std::time::Instant::now();
+        let __t0 = $crate::solver::clock::Instant::now();
         let __res = $e;
         #[cfg(feature = "profile")]
         $crate::solver::profiling::record($bucket, __t0.elapsed().as_nanos(), 1);
