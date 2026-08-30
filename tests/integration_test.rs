@@ -1472,3 +1472,85 @@ fn test_multiscale_database() {
 
     std::fs::remove_file(tmp_path).ok();
 }
+
+/// `max_patterns_checked` bounds the lost-in-space search by work rather
+/// than wall time: a field of random centroids never matches, and a tiny
+/// budget ends the search with `Timeout` deterministically — no clock
+/// involved — while `Some(0)` is rejected up front as `InvalidConfig`.
+#[test]
+fn test_pattern_budget_reports_timeout() {
+    fn centroid(x: f32, y: f32) -> Centroid {
+        Centroid {
+            x,
+            y,
+            mass: None,
+            cov: None,
+        }
+    }
+
+    let config = GenerateDatabaseConfig {
+        max_fov_deg: 20.0,
+        min_fov_deg: None,
+        star_max_magnitude: Some(6.0),
+        pattern_max_error: 0.005,
+        lattice_field_oversampling: 30,
+        patterns_per_lattice_field: 25,
+        verification_stars_per_fov: 50,
+        multiscale_step: 1.5,
+        epoch_proper_motion_year: Some(2025.0),
+        catalog_nside: 8,
+    };
+    let db = SolverDatabase::generate_from_gaia(&gaia_catalog_path(), &config)
+        .expect("Failed to generate database");
+
+    let mut rng = StdRng::seed_from_u64(42);
+    let image_width = 1024u32;
+    let centroids: Vec<Centroid> = (0..16)
+        .map(|_| {
+            centroid(
+                (rng.random::<f32>() - 0.5) * image_width as f32,
+                (rng.random::<f32>() - 0.5) * image_width as f32,
+            )
+        })
+        .collect();
+
+    // Generous wall-clock so the *pattern* budget is what trips.
+    let base = || SolveConfig {
+        solve_timeout_ms: Some(60_000),
+        fov_max_error_rad: Some(2.0_f32.to_radians()),
+        ..SolveConfig::new(15.0_f32.to_radians(), image_width, image_width)
+    };
+
+    let budgeted = SolveConfig {
+        max_patterns_checked: Some(3),
+        ..base()
+    };
+    let err = db
+        .solve_from_centroids(&centroids, &budgeted)
+        .expect_err("random centroids must not solve");
+    assert_eq!(err.status, SolveStatus::Timeout);
+    assert!(
+        err.solve_time_ms < 1000.0,
+        "3-pattern budget should end the search almost immediately, took {} ms",
+        err.solve_time_ms
+    );
+
+    // Unbounded budget on the same field exhausts the combinations instead.
+    let unbounded = SolveConfig {
+        max_patterns_checked: None,
+        ..base()
+    };
+    let err = db
+        .solve_from_centroids(&centroids, &unbounded)
+        .expect_err("random centroids must not solve");
+    assert_eq!(err.status, SolveStatus::NoMatch);
+
+    let zero = SolveConfig {
+        max_patterns_checked: Some(0),
+        ..base()
+    };
+    let err = db
+        .solve_from_centroids(&centroids, &zero)
+        .expect_err("zero budget is an invalid config");
+    assert_eq!(err.status, SolveStatus::InvalidConfig);
+}

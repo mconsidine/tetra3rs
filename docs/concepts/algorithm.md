@@ -40,6 +40,10 @@ The solver uses a breadth-first (brightest-first) search strategy. Brighter star
 
 The search can be bounded by:
 
-- **Timeout** (`solve_timeout_ms`) — stop after a time limit
+- **Timeout** (`solve_timeout_ms`) — stop after a wall-clock limit
+- **Pattern budget** (`max_patterns_checked`) — stop after testing a fixed
+  number of image patterns, whichever of the two limits trips first. This
+  bounds the search by work rather than time, so the outcome is reproducible
+  across machines and the search stays finite on targets with no clock
 - **Match threshold** (`match_threshold`) — a per-solve false-positive *budget*: the k-th candidate tested is accepted when its corrected p-value `p·k` falls below this value (a sequential Bonferroni correction over the candidates actually tested). `SolveResult.prob` reports the corrected p-value. Raising the budget (e.g. to `1e-3`) lets very sparse fields (≲7 stars) solve, at an explicitly chosen false-positive risk
 - **FOV error** (`fov_max_error_rad`) — restrict the search to patterns consistent with the estimated field of view

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `SolveConfig::max_patterns_checked` (Python `max_patterns_checked=`): a search budget in image patterns, summed over the FOV sweep, checked alongside `solve_timeout_ms` — whichever trips first ends the search with `SolveStatus::Timeout`; deterministic across machines and finite on clockless targets. Default 10 M (the 5 s timeout normally trips first natively); `None` = unbounded; `Some(0)` fails `validate()`
+
 ## 0.10.0
 
 Robustness sweep: validate at every trust boundary (file load, pickle,
