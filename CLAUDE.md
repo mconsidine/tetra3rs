@@ -115,6 +115,16 @@ publishing breaks in confusing ways:
 `grep -rn '<old-version>' Cargo.toml pyproject.toml python/Cargo.toml` and
 update `CHANGELOG.md` before tagging.
 
+### Changelog convention
+
+`CHANGELOG.md` is kept concise (same style as `../satkit`): only recent
+releases, `### Added` / `### Changed` / `### Fixed` subsections, **one line
+per item** ending in a PR link (`([#N](https://github.com/ssmichael1/tetra3rs/pull/N))`),
+`**Breaking:**` prefix where applicable, no paragraphs. The full detail — root
+cause, failure scenario, before/after metrics, tests — goes in the **PR
+description**, not the changelog. Older releases live in git history
+(`git show vX.Y.Z:CHANGELOG.md`).
+
 Publishing:
 - **crates.io (Rust):** manual — `cargo publish -p tetra3` (no CI automation).
 - **PyPI (Python):** automated by `.github/workflows/publish.yml` on a `v*` tag
