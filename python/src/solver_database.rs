@@ -134,6 +134,7 @@ impl PySolverDatabase {
     ///
     /// * **Both modes:** ``camera_model`` / ``fov_estimate_*`` / ``image_*``,
     ///   ``match_radius``, ``match_threshold``, ``solve_timeout_ms``,
+    ///   ``max_patterns_checked``,
     ///   ``observer_velocity_km_s``.
     /// * **Lost-in-space only:** ``fov_max_error``, ``match_max_error``.
     /// * **Tracking only** (ignored unless ``attitude_hint`` is set):
@@ -163,7 +164,15 @@ impl PySolverDatabase {
     ///         sequential multiple-comparison correction). Raising it (e.g. 1e-3)
     ///         accepts weaker evidence — useful for very sparse fields at
     ///         increased false-positive risk. Default 1e-5.
-    ///     solve_timeout_ms: Timeout in milliseconds. None = no timeout.
+    ///     solve_timeout_ms: Wall-clock timeout in milliseconds. None = no
+    ///         timeout. Default 5000.
+    ///     max_patterns_checked: Maximum number of image 4-star patterns the
+    ///         lost-in-space search tests (summed over the FOV sweep) before
+    ///         giving up with ``'timeout'``. Bounds the search by work rather
+    ///         than wall time, so the outcome is the same on every machine.
+    ///         Composes with ``solve_timeout_ms`` — whichever trips first
+    ///         ends the search. None = unbounded. Default: sized so the
+    ///         5 s timeout normally trips first. Lost-in-space only.
     ///     match_max_error: Maximum edge-ratio error. None = use database value.
     ///         Values below the database's pattern quantization error are clamped up to it.
     ///     camera_model: A CameraModel specifying focal length, image dimensions,
@@ -218,6 +227,7 @@ impl PySolverDatabase {
         match_radius = 0.01,
         match_threshold = 1e-5,
         solve_timeout_ms = Some(5000),
+        max_patterns_checked = Some(SolveConfig::DEFAULT_MAX_PATTERNS_CHECKED),
         match_max_error = None,
         camera_model = None,
         observer_velocity_km_s = None,
@@ -241,6 +251,7 @@ impl PySolverDatabase {
         match_radius: f32,
         match_threshold: f64,
         solve_timeout_ms: Option<u64>,
+        max_patterns_checked: Option<u64>,
         match_max_error: Option<f32>,
         camera_model: Option<PyCameraModel>,
         observer_velocity_km_s: Option<[f64; 3]>,
@@ -317,6 +328,7 @@ impl PySolverDatabase {
             match_radius,
             match_threshold,
             solve_timeout_ms,
+            max_patterns_checked,
             match_max_error,
             camera_model: cam,
             observer_velocity_km_s,

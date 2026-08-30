@@ -46,6 +46,16 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
 
+      # The solver's clock is cfg-switched for browser wasm
+      # (src/solver/clock.rs); nothing native ever compiles that branch, so
+      # lint it explicitly. Library only — dev-deps (ureq, rand) are not
+      # wasm-clean and aren't needed to check the crate itself.
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Clippy (wasm32-unknown-unknown, all features)
+        run: cargo clippy -p tetra3 --lib --target wasm32-unknown-unknown --all-features -- -D warnings
+
   test:
     runs-on: ubuntu-latest
     steps:
