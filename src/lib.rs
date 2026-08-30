@@ -197,6 +197,7 @@ pub mod error;
 pub mod solver;
 pub mod star;
 pub mod starcatalog;
+pub(crate) mod stats;
 
 pub use aberration::earth_barycentric_velocity;
 pub use camera_model::CameraModel;

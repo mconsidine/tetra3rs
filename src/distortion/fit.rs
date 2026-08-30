@@ -15,6 +15,7 @@ use tracing::debug;
 
 use crate::centroid::Centroid;
 use crate::solver::{SolveResult, SolverDatabase};
+use crate::stats::median_mad_sigma;
 
 use super::polynomial::{num_coeffs, term_pairs, PolynomialDistortion};
 use super::radial::{brown_conrady_forward, RadialDistortion};
@@ -320,8 +321,7 @@ pub(super) fn fit_radial_centered_sigma_clip(
 
     // Outer sigma-clip iterations
     for _outer in 0..config.max_iterations {
-        let n_inliers = mask.iter().filter(|&&m| m).count();
-        if n_inliers < 8 {
+        if mask.iter().filter(|&&m| m).count() < MIN_RADIAL_POINTS {
             break;
         }
         let prev_x = x.clone();
@@ -336,28 +336,29 @@ pub(super) fn fit_radial_centered_sigma_clip(
 
         // Sigma-clip on residuals at current params.
         let residuals = intrinsics_residuals(&npoints, x.as_slice());
-        let inlier_resids: Vec<f64> = residuals
+        let mut inlier_resids: Vec<f64> = residuals
             .iter()
             .zip(&mask)
             .filter(|(_, &m)| m)
             .map(|(&r, _)| r)
             .collect();
-        if inlier_resids.is_empty() {
-            break;
-        }
-        let sigma = mad_sigma(&inlier_resids);
+        let (median, sigma) = median_mad_sigma(&mut inlier_resids);
         if sigma < 1e-12 / norm {
             break;
         }
-        let threshold = config.sigma_clip * sigma;
+        // Residual magnitudes are non-negative (Rayleigh-like), so the clip
+        // must be offset by the median: `k·σ` alone rejects the upper ~14%
+        // of *good* points per pass and collapses under iteration.
+        let threshold = median + config.sigma_clip * sigma;
         let new_mask: Vec<bool> = residuals.iter().map(|&r| r <= threshold).collect();
+        if new_mask.iter().filter(|&&m| m).count() < MIN_RADIAL_POINTS {
+            // Keep the previous (usable) mask rather than commit a degenerate one.
+            break;
+        }
         let mask_changed = mask.iter().zip(&new_mask).any(|(&a, &b)| a != b);
         mask = new_mask;
         let params_changed = (0..8).any(|i| (x[i] - prev_x[i]).abs() > 1e-12);
         if !mask_changed && !params_changed {
-            break;
-        }
-        if mask.iter().filter(|&&m| m).count() < 8 {
             break;
         }
     }
@@ -374,7 +375,7 @@ pub(super) fn fit_radial_centered_sigma_clip(
             .zip(&mask)
             .filter(|(&s2, &s1)| s2 && !s1)
             .count();
-        if n_recovered > 0 && mask_s2.iter().filter(|&&m| m).count() >= 8 {
+        if n_recovered > 0 && mask_s2.iter().filter(|&&m| m).count() >= MIN_RADIAL_POINTS {
             mask = mask_s2;
             if let Ok((new_x, iters)) = run_intrinsics_lm(&npoints, &mask, &x) {
                 x = new_x;
@@ -443,7 +444,7 @@ fn run_intrinsics_lm(
         .enumerate()
         .filter_map(|(i, &m)| if m { Some(i) } else { None })
         .collect();
-    if inlier_indices.len() < 8 {
+    if inlier_indices.len() < MIN_RADIAL_POINTS {
         return Err(());
     }
     // Tie-break weight √μ (normalized coordinates): cost μ·ĉ² ≤ 1e-8 even
@@ -684,7 +685,7 @@ pub(super) fn fit_polynomial_sigma_clip(
         let residuals = poly_point_residuals(points, &pairs, scale, &a_coeffs, &b_coeffs);
 
         // MAD-based robust clipping
-        let inlier_resids: Vec<f64> = residuals
+        let mut inlier_resids: Vec<f64> = residuals
             .iter()
             .zip(&mask)
             .filter(|(_, &m)| m)
@@ -695,28 +696,32 @@ pub(super) fn fit_polynomial_sigma_clip(
             break;
         }
 
-        let sigma = mad_sigma(&inlier_resids);
+        let (median, sigma) = median_mad_sigma(&mut inlier_resids);
 
         if sigma < 1e-12 {
             break;
         }
 
-        let threshold = config.sigma_clip * sigma;
+        // Residual magnitudes are non-negative (Rayleigh-like), so the clip
+        // must be offset by the median: `k·σ` alone rejects the upper ~14%
+        // of *good* points per pass and collapses under iteration.
+        let threshold = median + config.sigma_clip * sigma;
         let new_mask: Vec<bool> = residuals.iter().map(|&r| r <= threshold).collect();
+
+        let n_inliers = new_mask.iter().filter(|&&m| m).count();
+        if n_inliers < ncoeffs {
+            // Keep the previous (usable) mask rather than commit a degenerate one.
+            debug!(
+                "Too few inliers ({}) for polynomial fit after sigma-clip",
+                n_inliers
+            );
+            break;
+        }
 
         let changed = mask.iter().zip(&new_mask).any(|(&a, &b)| a != b);
         mask = new_mask;
 
         if !changed {
-            break;
-        }
-
-        let n_inliers = mask.iter().filter(|&&m| m).count();
-        if n_inliers < ncoeffs {
-            debug!(
-                "Too few inliers ({}) for polynomial fit after sigma-clip",
-                n_inliers
-            );
             break;
         }
 
@@ -992,31 +997,6 @@ pub(super) fn compute_corrected_rmse(
     (sum_sq / count as f64).sqrt()
 }
 
-/// Percentile of a **pre-sorted** slice. `p` is in [0, 1].
-fn percentile_sorted(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let idx = (p * (sorted.len() - 1) as f64).round() as usize;
-    sorted[idx.min(sorted.len() - 1)]
-}
-
-/// MAD-derived σ estimate (`1.4826 · MAD`) of a residual slice.
-///
-/// Sorts once for the median, then reuses the same buffer for the
-/// median-absolute-deviation (two sorts total, one allocation).
-fn mad_sigma(inlier_resids: &[f64]) -> f64 {
-    let mut buf: Vec<f64> = inlier_resids.to_vec();
-    buf.sort_by(f64::total_cmp);
-    let median = percentile_sorted(&buf, 0.5);
-    for v in buf.iter_mut() {
-        *v = (*v - median).abs();
-    }
-    buf.sort_by(f64::total_cmp);
-    let mad = percentile_sorted(&buf, 0.5);
-    mad * 1.4826
-}
-
 /// Fit the forward polynomial (ideal → distorted) by least-squares.
 ///
 /// Model: x_obs = x_ideal + Σ A_pq · u^p · v^q   (u = x_ideal/scale, v = y_ideal/scale, 0 ≤ p+q ≤ order)
@@ -1058,9 +1038,6 @@ pub(super) fn fit_poly_ls(
     // A rank-deficient design matrix (e.g. collinear or too-few points) leaves
     // the coefficients at their previous values; log it so a silently-degraded
     // fit isn't reported as a normal one.
-    // A rank-deficient design matrix (e.g. collinear or too-few points) leaves
-    // the coefficients at their previous values; log it so a silently-degraded
-    // fit isn't reported as a normal one.
     match a_mat.solve_qr(&bx_vec) {
         Ok(cx) => {
             for j in 0..ncoeffs {
@@ -1083,6 +1060,90 @@ pub(super) fn fit_poly_ls(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    use rand_distr::{Distribution, Normal};
+
+    /// ~200 matched points on a jittered grid, distorted by `k1·r²` and
+    /// perturbed with Gaussian centroid noise `sigma_px` per axis.
+    fn noisy_points(k1: f64, sigma_px: f64, seed: u64) -> Vec<MatchedPoint> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let noise = Normal::new(0.0, sigma_px).unwrap();
+        let true_d = RadialDistortion::new(k1, 0.0, 0.0);
+        let mut points = Vec::new();
+        let mut k = 0u32;
+        for ix in -7..=7 {
+            for iy in -6..=6 {
+                let x_ideal = ix as f64 * 130.0 + (k % 11) as f64;
+                let y_ideal = iy as f64 * 130.0 + (k % 7) as f64;
+                k += 1;
+                let (xd, yd) = true_d.distort(x_ideal, y_ideal);
+                points.push(MatchedPoint {
+                    x_obs: xd + noise.sample(&mut rng),
+                    y_obs: yd + noise.sample(&mut rng),
+                    x_ideal,
+                    y_ideal,
+                });
+            }
+        }
+        points
+    }
+
+    /// With stage-2 recovery disabled, the sigma-clip loop itself must keep
+    /// essentially all points under ordinary Gaussian noise. (A threshold of
+    /// `k·σ` without the median offset rejects ~14% per pass and collapses.)
+    #[test]
+    fn test_polynomial_sigma_clip_keeps_good_points_under_noise() {
+        let points = noisy_points(-7e-9, 0.3, 7);
+        let n = points.len();
+        let config = DistortionFitConfig {
+            stage2_threshold_px: None,
+            ..Default::default()
+        };
+        let fit = fit_polynomial_sigma_clip(&points, 3, 1000.0, &config);
+        let kept = fit.mask.iter().filter(|&&m| m).count();
+        assert!(
+            kept as f64 >= 0.95 * n as f64,
+            "sigma-clip kept only {kept}/{n} good points"
+        );
+        let model = Distortion::Polynomial(PolynomialDistortion::new(
+            3,
+            1000.0,
+            fit.a_coeffs,
+            fit.b_coeffs,
+        ));
+        let all = vec![true; n];
+        let rms = compute_corrected_rmse(&points, &all, &model);
+        // 2-D RMS of σ = 0.3 px/axis noise is ≈ 0.42 px.
+        assert!(rms < 0.5, "post-fit RMS over all points {rms:.3} px");
+    }
+
+    #[test]
+    fn test_radial_sigma_clip_keeps_good_points_under_noise() {
+        let true_k1 = -7e-9;
+        let points = noisy_points(true_k1, 0.3, 11);
+        let n = points.len();
+        let config = DistortionFitConfig {
+            stage2_threshold_px: None,
+            ..Default::default()
+        };
+        let fit = fit_radial_centered_sigma_clip(&points, &config);
+        let kept = fit.mask.iter().filter(|&&m| m).count();
+        assert!(
+            kept as f64 >= 0.95 * n as f64,
+            "sigma-clip kept only {kept}/{n} good points"
+        );
+        // The joint 8-parameter fit trades k1 against γ/k2 under noise, so
+        // judge it by prediction accuracy over the whole field instead.
+        let resid = intrinsics_residuals(
+            &points,
+            &[
+                fit.cx, fit.cy, fit.gamma, fit.k1, fit.k2, fit.k3, fit.p1, fit.p2,
+            ],
+        );
+        let rms = masked_rms(&resid, &vec![true; n]);
+        assert!(rms < 0.5, "post-fit RMS over all points {rms:.3} px");
+    }
 
     /// Test that fitting recovers known radial distortion from synthetic data.
     #[test]

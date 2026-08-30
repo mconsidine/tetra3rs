@@ -316,30 +316,11 @@ pub struct WcsRefineResult {
 
 // ── Main refinement entry point ─────────────────────────────────────────────
 
-/// MAD → σ scale factor for a Gaussian distribution.
-const MAD_SCALE: f64 = 1.4826;
-
 /// Robust statistics of a residual list: the median residual and the
-/// MAD-derived standard-deviation estimate (`MAD_SCALE · MAD`).
-///
-/// Both the median and the median-absolute-deviation use the simple midpoint of
-/// the sorted values (`v[len / 2]`) — the refinement's existing convention.
+/// MAD-derived standard-deviation estimate. See [`crate::stats::median_mad_sigma`].
 fn residual_median_sigma(residuals: &[(usize, f64)]) -> (f64, f64) {
-    // Only the single midpoint order statistic `v[len/2]` is needed from each
-    // list (the refinement's existing "median = sorted midpoint" convention), so
-    // a partial selection yields the identical element with less work than a full
-    // sort. `select_nth_unstable_by` places the k-th smallest at index k under
-    // the given comparator — the same value `sort_by` would put there.
-    let cmp = |a: &f64, b: &f64| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
     let mut res_vals: Vec<f64> = residuals.iter().map(|&(_, r)| r).collect();
-    let mid = res_vals.len() / 2;
-    res_vals.select_nth_unstable_by(mid, cmp);
-    let median = res_vals[mid];
-    let mut abs_devs: Vec<f64> = res_vals.iter().map(|r| (r - median).abs()).collect();
-    let mid_dev = abs_devs.len() / 2;
-    abs_devs.select_nth_unstable_by(mid_dev, cmp);
-    let mad = abs_devs[mid_dev];
-    (median, MAD_SCALE * mad)
+    crate::stats::median_mad_sigma(&mut res_vals)
 }
 
 /// Sigma-clip factor for MAD-based outlier rejection (Phase C and the final
