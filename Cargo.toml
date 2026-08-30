@@ -32,6 +32,12 @@ numeris = { version = "0.5.17", features = ["std", "serde", "optim"] }
 image = { version = "0.25", optional = true, default-features = false }
 rayon = { version = "1", optional = true }
 
+# Browser wasm (wasm32-unknown-unknown) has no monotonic clock in `std`;
+# web-time provides a drop-in `Instant` backed by `performance.now()`. Only
+# pulled in on that target — see src/solver/clock.rs.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+web-time = "1"
+
 [features]
 default = []
 hipparcos = []
