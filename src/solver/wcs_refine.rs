@@ -79,7 +79,9 @@ pub fn inverse_tan_project(xi: f64, eta: f64, crval_ra: f64, crval_dec: f64) -> 
     let sin_c = c.sin();
     let cos_c = c.cos();
 
-    let dec = (cos_c * sin_dec0 + eta * sin_c * cos_dec0 / rho).asin();
+    let dec = (cos_c * sin_dec0 + eta * sin_c * cos_dec0 / rho)
+        .clamp(-1.0, 1.0)
+        .asin();
     let ra = crval_ra + (xi * sin_c).atan2(rho * cos_dec0 * cos_c - eta * sin_dec0 * sin_c);
     (ra, dec)
 }
@@ -150,8 +152,8 @@ fn solve_3x3(a: &[[f64; 3]; 3], b: &[f64; 3]) -> Option<[f64; 3]> {
                 max_row = row;
             }
         }
-        if max_abs < 1e-30 {
-            return None; // singular
+        if max_abs < 1e-30 || !max_abs.is_finite() {
+            return None; // singular, or NaN/inf contaminated
         }
 
         // Swap rows
@@ -184,7 +186,12 @@ fn solve_3x3(a: &[[f64; 3]; 3], b: &[f64; 3]) -> Option<[f64; 3]> {
         x[i] = sum / m[i][i];
     }
 
-    Some(x)
+    // NaN/inf anywhere in the system propagates here; never hand it back.
+    if x.iter().all(|v| v.is_finite()) {
+        Some(x)
+    } else {
+        None
+    }
 }
 
 // ── Constrained prediction helpers ──────────────────────────────────────────
@@ -489,7 +496,8 @@ pub fn wcs_refine(
     let by = initial_rotation[(2, 1)] as f64;
     let bz = initial_rotation[(2, 2)] as f64;
     let mut crval_ra = by.atan2(bx);
-    let mut crval_dec = bz.asin();
+    // f32 rotation rows can round a hair past ±1; asin would return NaN.
+    let mut crval_dec = bz.clamp(-1.0, 1.0).asin();
 
     // Extract initial theta from rotation matrix
     // Camera +X direction in ICRS = first row of R

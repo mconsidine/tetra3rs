@@ -164,7 +164,7 @@ pub fn calibrate_camera(
         ));
     }
 
-    if n_valid == 1 {
+    let result = if n_valid == 1 {
         single_image_calibrate(
             solve_results,
             centroids,
@@ -172,7 +172,7 @@ pub fn calibrate_camera(
             image_width,
             image_height,
             config,
-        )
+        )?
     } else {
         multi_image_calibrate(
             solve_results,
@@ -181,8 +181,17 @@ pub fn calibrate_camera(
             image_width,
             image_height,
             config,
-        )
-    }
+        )?
+    };
+
+    // The fitters guard their own inputs, but a model that fails the same
+    // invariants every load path enforces must never be handed back as `Ok`.
+    result.camera_model.validate().map_err(|e| {
+        crate::Error::InvalidInput(format!(
+            "calibrate_camera: fitted camera model is invalid ({e})"
+        ))
+    })?;
+    Ok(result)
 }
 
 /// Extract optical center offset from polynomial order-0 terms into crpix.
@@ -464,8 +473,12 @@ fn multi_image_calibrate(
 
             // Build initial matches from the solution's matched pairs
             // (centroid indices are into the original centroid array).
+            // Non-finite centroids (e.g. a caller passing a different array
+            // than the one solved) would poison the 3×3 normal equations.
             let initial_matches: Vec<(usize, usize)> =
-                matched_pairs(img.sol, cents.len(), &id_to_idx).collect();
+                matched_pairs(img.sol, cents.len(), &id_to_idx)
+                    .filter(|&(ci, _)| cents[ci].x.is_finite() && cents[ci].y.is_finite())
+                    .collect();
 
             if initial_matches.len() < 4 {
                 continue;

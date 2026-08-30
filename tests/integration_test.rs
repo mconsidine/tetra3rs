@@ -309,6 +309,175 @@ fn test_matched_indices_survive_dropped_centroid() {
     }
 }
 
+/// Small single-scale test database used by the non-finite-input tests below.
+fn small_test_db() -> SolverDatabase {
+    let config = GenerateDatabaseConfig {
+        max_fov_deg: 20.0,
+        min_fov_deg: None,
+        star_max_magnitude: Some(6.0),
+        pattern_max_error: 0.005,
+        lattice_field_oversampling: 30,
+        patterns_per_lattice_field: 25,
+        verification_stars_per_fov: 50,
+        multiscale_step: 1.5,
+        epoch_proper_motion_year: Some(2025.0),
+        catalog_nside: 8,
+    };
+    SolverDatabase::generate_from_gaia(&gaia_catalog_path(), &config)
+        .expect("Failed to generate database")
+}
+
+/// Noiseless synthetic centroids for the Orion's-belt pointing used by
+/// `test_generate_and_solve` (15° FOV, 1024×1024), brightest first by mass.
+fn orion_synthetic_centroids(db: &SolverDatabase, fov_rad: f32, image_width: u32) -> Vec<Centroid> {
+    let target_ra = 83.0_f32.to_radians();
+    let target_dec = (-1.0_f32).to_radians();
+    let boresight_icrs = Vector3::from_array([
+        target_dec.cos() * target_ra.cos(),
+        target_dec.cos() * target_ra.sin(),
+        target_dec.sin(),
+    ]);
+    let cam_z = boresight_icrs.normalize();
+    let cam_x = Vector3::from_array([0.0, 0.0, 1.0])
+        .cross(&cam_z)
+        .normalize();
+    let cam_y = cam_z.cross(&cam_x);
+    let rot = Matrix3::new([
+        [cam_x[0], cam_x[1], cam_x[2]],
+        [cam_y[0], cam_y[1], cam_y[2]],
+        [cam_z[0], cam_z[1], cam_z[2]],
+    ]);
+    let half_fov = fov_rad / 2.0;
+    let pixel_scale = 1.0 / ((image_width as f32 / 2.0) / (fov_rad / 2.0).tan());
+
+    let mut centroids = Vec::new();
+    for &idx in &db
+        .star_catalog
+        .query_indices_from_uvec(boresight_icrs, half_fov * 1.2)
+    {
+        let sv = &db.star_vectors[idx];
+        let cam_v = rot * Vector3::from_array([sv[0], sv[1], sv[2]]);
+        if cam_v[2] > 0.01 {
+            let (cx_rad, cy_rad) = (cam_v[0] / cam_v[2], cam_v[1] / cam_v[2]);
+            if cx_rad.abs() < half_fov && cy_rad.abs() < half_fov {
+                centroids.push(Centroid {
+                    x: cx_rad / pixel_scale,
+                    y: cy_rad / pixel_scale,
+                    mass: Some(10.0 - db.star_catalog.stars()[idx].mag),
+                    cov: None,
+                });
+            }
+        }
+    }
+    centroids
+}
+
+/// `calibrate_camera` must tolerate a non-finite centroid at a *matched*
+/// index (e.g. the caller passes a differently-filtered array than the one
+/// solved). It used to feed NaN through the WCS normal equations and the
+/// pooled polynomial fit and return `Ok` with an all-NaN model.
+#[test]
+fn test_calibrate_tolerates_nan_centroid() {
+    let db = small_test_db();
+    let fov_rad = 15.0_f32.to_radians();
+    let (w, h) = (1024u32, 1024u32);
+    let centroids = orion_synthetic_centroids(&db, fov_rad, w);
+
+    let solve_config = SolveConfig {
+        fov_max_error_rad: Some(5.0_f32.to_radians()),
+        solve_timeout_ms: Some(30_000),
+        ..SolveConfig::new(fov_rad, w, h)
+    };
+    let solution = db
+        .solve_from_centroids(&centroids, &solve_config)
+        .expect("solve should succeed");
+    assert!(solution.matched_centroid_indices.len() >= 6);
+
+    let cal_config = tetra3::CalibrateConfig {
+        model: tetra3::DistortionModelType::Polynomial { order: 2 },
+        ..Default::default()
+    };
+    let sr: tetra3::SolveResult = Ok(solution.clone());
+
+    let clean = tetra3::calibrate_camera(&[&sr], &[&centroids], &db, w, h, &cal_config)
+        .expect("clean calibration");
+
+    let mut poisoned = centroids.clone();
+    poisoned[solution.matched_centroid_indices[0]].x = f32::NAN;
+    let dirty = tetra3::calibrate_camera(&[&sr], &[&poisoned], &db, w, h, &cal_config)
+        .expect("calibration with one NaN centroid must still succeed");
+
+    dirty
+        .camera_model
+        .validate()
+        .expect("fitted model must validate");
+    assert!(dirty.rmse_after_px.is_finite());
+    assert!(dirty.n_inliers > 0);
+    // Exactly the poisoned match is lost; the fit itself is unchanged.
+    assert!(
+        dirty.n_inliers + 1 >= clean.n_inliers,
+        "{} vs {}",
+        dirty.n_inliers,
+        clean.n_inliers
+    );
+    assert!(
+        (dirty.rmse_after_px - clean.rmse_after_px).abs() < 0.05,
+        "rmse {} vs {}",
+        dirty.rmse_after_px,
+        clean.rmse_after_px
+    );
+    assert!((dirty.camera_model.focal_length_px - clean.camera_model.focal_length_px).abs() < 1e-6);
+}
+
+/// A `Some(NaN)` mass must be treated exactly like `None` (unknown), not fed
+/// into the brightness sort's comparator.
+#[test]
+fn test_nan_mass_treated_as_unknown() {
+    let db = small_test_db();
+    let fov_rad = 15.0_f32.to_radians();
+    let (w, h) = (1024u32, 1024u32);
+    let centroids = orion_synthetic_centroids(&db, fov_rad, w);
+
+    let with_none: Vec<Centroid> = centroids
+        .iter()
+        .enumerate()
+        .map(|(i, c)| Centroid {
+            mass: if i % 3 == 0 { None } else { c.mass },
+            ..*c
+        })
+        .collect();
+    let with_nan: Vec<Centroid> = centroids
+        .iter()
+        .enumerate()
+        .map(|(i, c)| Centroid {
+            mass: if i % 3 == 0 { Some(f32::NAN) } else { c.mass },
+            ..*c
+        })
+        .collect();
+
+    let solve_config = SolveConfig {
+        fov_max_error_rad: Some(5.0_f32.to_radians()),
+        solve_timeout_ms: Some(30_000),
+        ..SolveConfig::new(fov_rad, w, h)
+    };
+    let a = db
+        .solve_from_centroids(&with_none, &solve_config)
+        .expect("solve with None masses");
+    let b = db
+        .solve_from_centroids(&with_nan, &solve_config)
+        .expect("solve with NaN masses");
+
+    assert_eq!(a.matched_centroid_indices, b.matched_centroid_indices);
+    assert_eq!(a.matched_catalog_ids, b.matched_catalog_ids);
+    let qa = a.qicrs2cam.to_rotation_matrix();
+    let qb = b.qicrs2cam.to_rotation_matrix();
+    for r in 0..3 {
+        for c in 0..3 {
+            assert!((qa[(r, c)] - qb[(r, c)]).abs() < 1e-6);
+        }
+    }
+}
+
 /// Solve a mirrored (parity-flipped) synthetic field end to end.
 ///
 /// Regression test: the finalize path used to rebuild the rotation with a

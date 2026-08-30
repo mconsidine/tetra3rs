@@ -125,7 +125,7 @@ pub struct CentroidExtractionConfig {
     /// A value of 2.0 means the blob can be at most 2× longer than wide.
     /// Set to a large value (e.g. 100) or `None` to disable.
     ///
-    /// Default: None (disabled)
+    /// Default: `Some(3.0)`
     pub max_elongation: Option<f32>,
 
     /// Apply a Gaussian matched filter to the bg-subtracted image before
@@ -1318,6 +1318,67 @@ mod tests {
             "saturated star CoM off: ({}, {})",
             c.x,
             c.y
+        );
+    }
+
+    /// A `+inf` or `NaN` pixel must not become a centroid on either path: it
+    /// used to flow through `residual.max(0.0)` in the CCL path and emerge as
+    /// a `(NaN, NaN)` centroid with infinite mass, ranked brightest.
+    #[test]
+    fn test_non_finite_pixels_do_not_become_centroids() {
+        let (w, h) = (256u32, 256u32);
+        let stars = [
+            (60.0, 70.0, 3000.0),
+            (180.0, 50.0, 2500.0),
+            (120.0, 200.0, 2000.0),
+            (210.0, 190.0, 1500.0),
+        ];
+        let clean = render_stars(w, h, 100.0, 0.0, 2.0, 1.5, &stars);
+        let mut dirty = clean.clone();
+        dirty[10 * w as usize + 10] = f32::INFINITY;
+        dirty[60 * w as usize + 100] = f32::NAN;
+        dirty[150 * w as usize + 30] = f32::NEG_INFINITY;
+
+        let check =
+            |name: &str, clean: &CentroidExtractionResult, dirty: &CentroidExtractionResult| {
+                assert_eq!(
+                    clean.centroids.len(),
+                    stars.len(),
+                    "{name}: baseline star count"
+                );
+                assert_eq!(
+                    dirty.centroids.len(),
+                    clean.centroids.len(),
+                    "{name}: non-finite pixels changed the star count"
+                );
+                for c in &dirty.centroids {
+                    assert!(
+                        c.x.is_finite() && c.y.is_finite() && c.mass.is_some_and(f32::is_finite),
+                        "{name}: non-finite centroid {c:?}"
+                    );
+                }
+            };
+
+        let ccl_cfg = CentroidExtractionConfig::default();
+        check(
+            "ccl",
+            &extract_centroids_from_raw(&clean, w, h, &ccl_cfg).unwrap(),
+            &extract_centroids_from_raw(&dirty, w, h, &ccl_cfg).unwrap(),
+        );
+        let global_cfg = CentroidExtractionConfig {
+            local_bg_block_size: None,
+            ..Default::default()
+        };
+        check(
+            "ccl-global-bg",
+            &extract_centroids_from_raw(&clean, w, h, &global_cfg).unwrap(),
+            &extract_centroids_from_raw(&dirty, w, h, &global_cfg).unwrap(),
+        );
+        let fast_cfg = FastCentroidConfig::default();
+        check(
+            "fast",
+            &extract_centroids_fast(&clean, w, h, &fast_cfg).unwrap(),
+            &extract_centroids_fast(&dirty, w, h, &fast_cfg).unwrap(),
         );
     }
 

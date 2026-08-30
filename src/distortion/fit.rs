@@ -927,8 +927,8 @@ fn gather_matched_points(
 /// pinhole pixel coordinates and pair it with an observed centroid `(x_obs,
 /// y_obs)`.
 ///
-/// Returns `None` when the star projects behind the camera (`cam_z ≤ 0`).
-/// `parity_sign` is `-1.0` when the image x-axis is flipped; `pixel_scale` is
+/// Returns `None` when the star projects behind the camera (`cam_z ≤ 0`) or
+/// the observed position is non-finite. `parity_sign` is `-1.0` when the image x-axis is flipped; `pixel_scale` is
 /// radians per pixel (`1/focal_length_px`). Shared by the single-image gather
 /// and the multi-image calibration Phase 2.
 pub(super) fn project_to_matched_point(
@@ -939,6 +939,9 @@ pub(super) fn project_to_matched_point(
     x_obs: f64,
     y_obs: f64,
 ) -> Option<MatchedPoint> {
+    if !(x_obs.is_finite() && y_obs.is_finite()) {
+        return None;
+    }
     let icrs_v = numeris::Vector3::from_array([sv[0], sv[1], sv[2]]);
     let cam_v = rot * icrs_v;
     if cam_v[2] <= 0.0 {

@@ -104,7 +104,15 @@ pub(super) fn extract_from_gray(
                 let rp = bg.row_params(y);
                 let row = y * w;
                 for x in 0..w {
-                    let r = gray_input[row + x] - bg.value_at(x, rp);
+                    // Non-finite pixels (dead/hot columns, NaN padding) are
+                    // treated as background: `inf.max(0.0)` is `inf`, and one
+                    // such pixel otherwise becomes a NaN centroid ranked first.
+                    let p = gray_input[row + x];
+                    let r = if p.is_finite() {
+                        p - bg.value_at(x, rp)
+                    } else {
+                        0.0
+                    };
                     cr[x] = r.max(0.0);
                     ur[x] = r;
                 }
@@ -115,16 +123,32 @@ pub(super) fn extract_from_gray(
                 let rp = bg.row_params(y);
                 let row = y * w;
                 for (x, out) in cr.iter_mut().enumerate() {
-                    *out = (gray_input[row + x] - bg.value_at(x, rp)).max(0.0);
+                    let p = gray_input[row + x];
+                    *out = if p.is_finite() {
+                        (p - bg.value_at(x, rp)).max(0.0)
+                    } else {
+                        0.0
+                    };
                 }
             });
         }
         gray = Cow::Owned(clamped);
     } else {
         (bg_mean, bg_sigma) = estimate_background(gray_input, width, height, config);
-        gray = Cow::Borrowed(gray_input);
+        // Same non-finite policy as the local-background branch; the copy is
+        // only made when the image actually contains such pixels.
+        gray = if gray_input.iter().all(|p| p.is_finite()) {
+            Cow::Borrowed(gray_input)
+        } else {
+            Cow::Owned(
+                gray_input
+                    .iter()
+                    .map(|&p| if p.is_finite() { p } else { bg_mean })
+                    .collect(),
+            )
+        };
         if filter_sigma.is_some() {
-            filter_input = Some(DynMatrix::from_vec(w, h, gray_input.to_vec()));
+            filter_input = Some(DynMatrix::from_vec(w, h, gray.to_vec()));
         }
     }
     let gray: &[f32] = &gray;
