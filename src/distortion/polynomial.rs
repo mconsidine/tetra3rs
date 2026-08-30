@@ -295,7 +295,7 @@ pub fn term_pairs(order: u32) -> Vec<(u32, u32)> {
 
 /// Evaluate a polynomial correction: Σ c_i · x^p_i · y^q_i
 /// `coeffs` is a flat vector indexed by `coeff_index(p, q)`.
-fn eval_poly(coeffs: &[f64], order: u32, x: f64, y: f64) -> f64 {
+pub(super) fn eval_poly(coeffs: &[f64], order: u32, x: f64, y: f64) -> f64 {
     let mut result = 0.0;
     let mut idx = 0;
     for s in 0..=order {

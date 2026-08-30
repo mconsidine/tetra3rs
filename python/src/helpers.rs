@@ -12,7 +12,9 @@ use crate::solve_result::{PySolveFailure, PySolveResult};
 
 /// Parse solve_results and centroids from Python objects.
 ///
-/// Accepts either a single SolveResult + centroids, or lists of each.
+/// Accepts either a single SolveResult + one centroid set, or a list of
+/// solves + a list of centroid sets of the same length (a one-element list
+/// is still the list form).
 pub(crate) fn parse_solve_results_and_centroids(
     solve_results: &Bound<'_, pyo3::PyAny>,
     centroids: &Bound<'_, pyo3::PyAny>,
@@ -21,9 +23,13 @@ pub(crate) fn parse_solve_results_and_centroids(
     // SolveResult and SolveFailure items — the Rust calibrate API accepts
     // failures and skips them, so a caller can pass its solve outputs
     // straight through without filtering.
-    let sr_vec: Vec<SolveResult> = if let Ok(single) = solve_results.extract::<PySolveResult>() {
-        vec![Ok(single.inner)]
-    } else if let Ok(list) = solve_results.cast::<pyo3::types::PyList>() {
+    if let Ok(single) = solve_results.extract::<PySolveResult>() {
+        return Ok((
+            vec![Ok(single.inner)],
+            vec![parse_centroids_single(centroids)?],
+        ));
+    }
+    let sr_vec: Vec<SolveResult> = if let Ok(list) = solve_results.cast::<pyo3::types::PyList>() {
         list.iter()
             .map(|item| {
                 if let Ok(sr) = item.extract::<PySolveResult>() {
@@ -43,10 +49,10 @@ pub(crate) fn parse_solve_results_and_centroids(
         ));
     };
 
-    // Parse centroids: if a single solve result, wrap in a list
-    let cent_vec: Vec<Vec<Centroid>> = if sr_vec.len() == 1 {
-        vec![parse_centroids_single(centroids)?]
-    } else if let Ok(list) = centroids.cast::<pyo3::types::PyList>() {
+    // List form: centroids must be a list of the same length (the single
+    // form returned above — keying on `len() == 1` here used to reject a
+    // one-element list of solves paired with a one-element list of centroids).
+    let cent_vec: Vec<Vec<Centroid>> = if let Ok(list) = centroids.cast::<pyo3::types::PyList>() {
         if list.len() != sr_vec.len() {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "centroids list has {} elements but solve_results has {}",
@@ -166,24 +172,32 @@ pub(crate) fn from_postcard_bytes<T: DeserializeOwned>(data: &[u8]) -> PyResult<
 
 /// Resolve image dimensions from either `image_shape=(height, width)` (numpy
 /// convention) or separate `image_width`/`image_height`. Exactly one form must
-/// be supplied. Returns `(width, height)`.
+/// be supplied and both dimensions must be non-zero. Returns `(width, height)`.
 pub(crate) fn resolve_image_dims(
     image_shape: Option<(u32, u32)>,
     image_width: Option<u32>,
     image_height: Option<u32>,
 ) -> PyResult<(u32, u32)> {
-    match (image_shape, image_width, image_height) {
-        (Some((h, w)), None, None) => Ok((w, h)),
-        (None, Some(w), Some(h)) => Ok((w, h)),
-        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => Err(
-            pyo3::exceptions::PyValueError::new_err(
+    let (w, h) = match (image_shape, image_width, image_height) {
+        (Some((h, w)), None, None) => (w, h),
+        (None, Some(w), Some(h)) => (w, h),
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+            return Err(pyo3::exceptions::PyValueError::new_err(
                 "Specify either image_shape or image_width/image_height, not both",
-            ),
-        ),
-        _ => Err(pyo3::exceptions::PyValueError::new_err(
-            "Must specify image dimensions via image_shape=(height, width) or image_width + image_height",
-        )),
+            ))
+        }
+        _ => {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Must specify image dimensions via image_shape=(height, width) or image_width + image_height",
+            ))
+        }
+    };
+    if w == 0 || h == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "image dimensions must be non-zero, got {w}x{h}"
+        )));
     }
+    Ok((w, h))
 }
 
 /// Resolve an angle given as **exactly one** of a `*_deg` or `*_rad` option,

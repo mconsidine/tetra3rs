@@ -69,8 +69,8 @@ largest internal cost.
 | `solver/wcs_refine.rs` | Constrained 3-DOF refinement: rotation angle θ + CRVAL offset (dξ₀, dη₀). Pixel scale locked. Sigma-clipped |
 | `camera_model/` | `CameraModel` struct: `focal_length_px`, `image_width`, `image_height`, `crpix`, `parity_flip`, `distortion`. Methods `fov_deg()` / `fov_rad()`, `pixel_to_tanplane` / `tanplane_to_pixel` |
 | `distortion/` | SIP polynomial + radial distortion; `calibrate_camera` for multi-image fits |
-| `distortion/calibrate.rs` | Branches on `n_valid` solves: 1 image → `fit_polynomial_distortion`; 2+ → alternating per-image WCS refine + global sigma-clip poly fit (3 outer iterations) |
-| `distortion/fit.rs` | Legacy `fit_polynomial_distortion`; `fit_polynomial_sigma_clip` reusable helper |
+| `distortion/calibrate.rs` | Branches on `n_valid` solves: 1 image → pooled fit with the solve's own attitude; 2+ → alternating per-image WCS refine + global fit (3 outer iterations). Both call `fit::fit_pooled` |
+| `distortion/fit.rs` | `fit_pooled` (polynomial / radial dispatch, before/after RMSE); `fit_polynomial_sigma_clip`, `fit_radial_centered_sigma_clip` loops |
 | `distortion/polynomial.rs` | `term_pairs_range(min_order, max_order)` — SIP convention (order ≥ 2) |
 | `centroid_extraction/` (feature `image`) | Local background subtraction, CCL, quadratic sub-pixel peak refinement |
 | `centroid/`, `star/` | Data types |

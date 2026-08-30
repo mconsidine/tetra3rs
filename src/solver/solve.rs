@@ -143,7 +143,9 @@ impl SolverDatabase {
             preprocessed.push(Centroid {
                 x: ux,
                 y: uy,
-                mass: c.mass,
+                // A non-finite mass would feed NaN into the brightness sort's
+                // comparator (not a total order — std may panic); treat as unknown.
+                mass: c.mass.filter(|m| m.is_finite()),
                 cov: c.cov,
             });
             orig_indices.push(idx);
@@ -867,7 +869,6 @@ impl SolverDatabase {
     /// it, so a tighter radius (e.g. derived from a refined fit's RMSE) makes
     /// every true match worth quadratically more evidence.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn verify_attitude(
         &self,
         rotation_matrix: &Matrix3<f32>,
@@ -1180,7 +1181,9 @@ fn build_fov_sweep(
             let step_rel = pattern_max_error as f64 / curvature;
             let step = ((step_rel * fov_estimate as f64) as f32).max(0.001_f32.to_radians());
             let mut offset = step;
-            while offset <= max_error {
+            // Also stop once the upward branch reaches π: every candidate at
+            // such a FOV is rejected later anyway, after a full pattern search.
+            while offset <= max_error && fov_estimate + offset < std::f32::consts::PI {
                 values.push(fov_estimate + offset);
                 if fov_estimate - offset > 0.0 {
                     values.push(fov_estimate - offset);
@@ -1559,6 +1562,10 @@ mod tests {
         for max_error in [f32::INFINITY, f32::MAX, 1e30] {
             let values = build_fov_sweep(fov, Some(max_error), 0.003, 1.2);
             assert!(!values.is_empty());
+            assert!(
+                values.iter().all(|&v| v > 0.0 && v < std::f32::consts::PI),
+                "sweep emitted a FOV outside (0, π)"
+            );
             assert!(
                 values.len() < 100_000,
                 "sweep exploded to {} values for max_error {max_error}",

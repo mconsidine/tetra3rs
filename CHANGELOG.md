@@ -9,6 +9,23 @@ Only recent releases are listed. Older entries are in this file's git history (`
 - Browser wasm support (`wasm32-unknown-unknown`): the solver clock goes through `solver::clock::Instant` — `std::time::Instant` everywhere with a working clock, `web_time::Instant` (`performance.now()`) on `wasm32-unknown-unknown` where `std`'s `Instant::now()` aborts; WASI/Emscripten keep `std`; `profile`'s `timed!` uses the same clock; CI lints the wasm32 target. Based on #46 by @trams ([#46](https://github.com/ssmichael1/tetra3rs/pull/46), [#48](https://github.com/ssmichael1/tetra3rs/pull/48))
 - `SolveConfig::max_patterns_checked` (Python `max_patterns_checked=`): a search budget in image patterns, summed over the FOV sweep, checked alongside `solve_timeout_ms` — whichever trips first ends the search with `SolveStatus::Timeout`; deterministic across machines and finite on clockless targets. Default 10 M (the 5 s timeout normally trips first natively); `None` = unbounded; `Some(0)` fails `validate()` ([#49](https://github.com/ssmichael1/tetra3rs/pull/49))
 
+### Changed
+
+- Distortion-fit sigma-clip estimates σ over all points (MAD) so the inlier set converges instead of shrinking onto bright stars; the fixed 5 px stage-2 recovery is removed (it re-admitted mismatches). TESS model residuals improve ~2×; inlier counts drop ~17%. ([#51](https://github.com/ssmichael1/tetra3rs/pull/51))
+- Single- and multi-image calibration share one pooled fitter (`fit::fit_pooled`); the legacy `fit_polynomial_distortion` / `fit_radial_distortion` path is removed (crate-private; results unchanged). ([#51](https://github.com/ssmichael1/tetra3rs/pull/51))
+- The CCL and fast centroiders share the region extent/border gate and the sharpness/refine/assembly tail (bit-identical output). ([#51](https://github.com/ssmichael1/tetra3rs/pull/51))
+
+### Fixed
+
+- Sigma-clip in polynomial/radial distortion fits used `k·σ` without the median offset on non-negative residual magnitudes, rejecting ~14% of good points per pass; now `median + k·σ` (matches `wcs_refine`), and a mask with fewer inliers than parameters is never committed. ([#51](https://github.com/ssmichael1/tetra3rs/pull/51))
+- CCL centroid extraction turned a single `+inf`/`NaN` pixel into a `(NaN, NaN)` centroid with infinite mass ranked brightest; non-finite pixels are now background on every path. ([#51](https://github.com/ssmichael1/tetra3rs/pull/51))
+- `calibrate_camera` fed non-finite centroids at matched indices through the WCS and pooled fits and returned `Ok` with an all-NaN model; such centroids are skipped, `solve_3x3` bails on NaN/inf, and the fitted `CameraModel` is validated before returning. ([#51](https://github.com/ssmichael1/tetra3rs/pull/51))
+- `Some(NaN)` centroid mass reached the brightness sort's comparator (not a total order — std may panic); now treated as `None`. ([#51](https://github.com/ssmichael1/tetra3rs/pull/51))
+- FOV sweep emitted values above π when `fov_max_error_rad` was large, each costing a full pattern search that could only be rejected later. ([#51](https://github.com/ssmichael1/tetra3rs/pull/51))
+- `asin` arguments at the pole are clamped in `wcs_refine` (f32 rotation rows can round past ±1). ([#51](https://github.com/ssmichael1/tetra3rs/pull/51))
+- Python: `calibrate_camera([res], [cents], ...)` (one-element list form) raised `TypeError`; `calibrate_camera` with zero image dimensions returned a model that could not be unpickled — both now behave like the single/solve forms. ([#51](https://github.com/ssmichael1/tetra3rs/pull/51))
+- Docs: `CentroidExtractionConfig::max_elongation` default is `Some(3.0)`, not `None`. ([#51](https://github.com/ssmichael1/tetra3rs/pull/51))
+
 ## 0.10.0 - 2026-08-21
 
 Robustness sweep: validate at every trust boundary (file load, pickle, public constructors) so corrupt data and degenerate arguments fail with a descriptive error instead of a deferred panic, hang, or silently-wrong result. No solver-algorithm changes; outputs on valid inputs are unchanged ([#47](https://github.com/ssmichael1/tetra3rs/pull/47)).
