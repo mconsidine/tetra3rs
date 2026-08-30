@@ -31,14 +31,16 @@ pub(super) const MIN_RADIAL_POINTS: usize = 8;
 /// Configuration for distortion fitting.
 #[derive(Debug, Clone)]
 pub struct DistortionFitConfig {
-    /// Sigma threshold for iterative outlier rejection. Default 3.0.
+    /// Sigma threshold for iterative outlier rejection: a point is an inlier
+    /// when its residual is within `median + sigma_clip · σ`, where both the
+    /// median and the MAD-derived σ are taken over **all** points' residuals
+    /// under the current model (robust to < 50% contamination). Estimating σ
+    /// over the shrinking inlier set instead ratchets the threshold down on
+    /// heteroscedastic data (faint stars scatter more; each refit tightens
+    /// on the bright ones) until the mask collapses. Default 3.0.
     pub sigma_clip: f64,
     /// Maximum iterations for iterative fitting. Default 20.
     pub max_iterations: u32,
-    /// If provided, a second stage re-applies the model with this loose pixel
-    /// threshold to recover stars rejected in the tight sigma-clip stage.
-    /// Stars with residuals below this threshold are kept. Default 5.0 px.
-    pub stage2_threshold_px: Option<f64>,
 }
 
 impl Default for DistortionFitConfig {
@@ -46,7 +48,6 @@ impl Default for DistortionFitConfig {
         Self {
             sigma_clip: 3.0,
             max_iterations: 20,
-            stage2_threshold_px: Some(5.0),
         }
     }
 }
@@ -304,6 +305,7 @@ pub(super) fn fit_radial_centered_sigma_clip(
     ]);
     let mut mask = initial_mask;
     let mut total_lm_iters = 0u32;
+    let mut scratch: Vec<f64> = Vec::with_capacity(npoints.len());
 
     // Outer sigma-clip iterations
     for _outer in 0..config.max_iterations {
@@ -320,21 +322,18 @@ pub(super) fn fit_radial_centered_sigma_clip(
             Err(()) => break,
         }
 
-        // Sigma-clip on residuals at current params.
+        // Sigma-clip on residuals at current params. Median and MAD-σ are
+        // taken over ALL points (not the shrinking inlier set), so the
+        // threshold tracks the model rather than ratcheting down with each
+        // refit; the residual magnitudes are non-negative (Rayleigh-like),
+        // hence the median offset. See `DistortionFitConfig::sigma_clip`.
         let residuals = intrinsics_residuals(&npoints, x.as_slice());
-        let mut inlier_resids: Vec<f64> = residuals
-            .iter()
-            .zip(&mask)
-            .filter(|(_, &m)| m)
-            .map(|(&r, _)| r)
-            .collect();
-        let (median, sigma) = median_mad_sigma(&mut inlier_resids);
+        scratch.clear();
+        scratch.extend_from_slice(&residuals);
+        let (median, sigma) = median_mad_sigma(&mut scratch);
         if sigma < 1e-12 / norm {
             break;
         }
-        // Residual magnitudes are non-negative (Rayleigh-like), so the clip
-        // must be offset by the median: `k·σ` alone rejects the upper ~14%
-        // of *good* points per pass and collapses under iteration.
         let threshold = median + config.sigma_clip * sigma;
         let new_mask: Vec<bool> = residuals.iter().map(|&r| r <= threshold).collect();
         if new_mask.iter().filter(|&&m| m).count() < MIN_RADIAL_POINTS {
@@ -346,27 +345,6 @@ pub(super) fn fit_radial_centered_sigma_clip(
         let params_changed = (0..8).any(|i| (x[i] - prev_x[i]).abs() > 1e-12);
         if !mask_changed && !params_changed {
             break;
-        }
-    }
-
-    // Stage 2: optional fixed-pixel-threshold recovery — pull back inliers
-    // whose Euclidean residual is below `stage2_threshold_px` regardless of
-    // sigma-clip rejection. Refit once if any new inliers join.
-    if let Some(threshold_px) = config.stage2_threshold_px {
-        let residuals = intrinsics_residuals(&npoints, x.as_slice());
-        let threshold = threshold_px / norm;
-        let mask_s2: Vec<bool> = residuals.iter().map(|&r| r <= threshold).collect();
-        let n_recovered = mask_s2
-            .iter()
-            .zip(&mask)
-            .filter(|(&s2, &s1)| s2 && !s1)
-            .count();
-        if n_recovered > 0 && mask_s2.iter().filter(|&&m| m).count() >= MIN_RADIAL_POINTS {
-            mask = mask_s2;
-            if let Ok((new_x, iters)) = run_intrinsics_lm(&npoints, &mask, &x) {
-                x = new_x;
-                total_lm_iters += iters;
-            }
         }
     }
 
@@ -627,8 +605,9 @@ fn poly_point_residuals(
 ///
 /// The core polynomial loop behind [`fit_pooled`]:
 /// 1. Initial forward polynomial LS fit.
-/// 2. Iterative MAD-based sigma-clipping.
-/// 3. Stage 2 outlier recovery (optional, controlled by `config.stage2_threshold_px`).
+/// 2. Iterative sigma-clipping at `median + k·σ`, with both statistics
+///    estimated (MAD) over all points so the mask converges instead of
+///    shrinking onto the brightest stars.
 ///
 /// `points` are matched observations, `order` is the polynomial order,
 /// `scale` is the normalization factor (typically image_width / 2).
@@ -646,6 +625,7 @@ pub(super) fn fit_polynomial_sigma_clip(
     let mut iterations = 0u32;
     let mut a_coeffs = vec![0.0; ncoeffs];
     let mut b_coeffs = vec![0.0; ncoeffs];
+    let mut scratch: Vec<f64> = Vec::with_capacity(n);
 
     // Initial fit
     fit_poly_ls(points, &mask, &pairs, scale, &mut a_coeffs, &mut b_coeffs);
@@ -656,27 +636,19 @@ pub(super) fn fit_polynomial_sigma_clip(
         // Compute residuals using current model
         let residuals = poly_point_residuals(points, order, scale, &a_coeffs, &b_coeffs);
 
-        // MAD-based robust clipping
-        let mut inlier_resids: Vec<f64> = residuals
-            .iter()
-            .zip(&mask)
-            .filter(|(_, &m)| m)
-            .map(|(&r, _)| r)
-            .collect();
-
-        if inlier_resids.is_empty() {
-            break;
-        }
-
-        let (median, sigma) = median_mad_sigma(&mut inlier_resids);
+        // MAD-based robust clipping. Median and MAD-σ are taken over ALL
+        // points (not the shrinking inlier set), so the threshold tracks the
+        // model rather than ratcheting down with each refit; the residual
+        // magnitudes are non-negative (Rayleigh-like), hence the median
+        // offset. See `DistortionFitConfig::sigma_clip`.
+        scratch.clear();
+        scratch.extend_from_slice(&residuals);
+        let (median, sigma) = median_mad_sigma(&mut scratch);
 
         if sigma < 1e-12 {
             break;
         }
 
-        // Residual magnitudes are non-negative (Rayleigh-like), so the clip
-        // must be offset by the median: `k·σ` alone rejects the upper ~14%
-        // of *good* points per pass and collapses under iteration.
         let threshold = median + config.sigma_clip * sigma;
         let new_mask: Vec<bool> = residuals.iter().map(|&r| r <= threshold).collect();
 
@@ -698,26 +670,6 @@ pub(super) fn fit_polynomial_sigma_clip(
         }
 
         fit_poly_ls(points, &mask, &pairs, scale, &mut a_coeffs, &mut b_coeffs);
-    }
-
-    // Stage 2: recover outliers below a threshold
-    if let Some(threshold_px) = config.stage2_threshold_px {
-        let residuals = poly_point_residuals(points, order, scale, &a_coeffs, &b_coeffs);
-
-        let mask_s2: Vec<bool> = residuals.iter().map(|&r| r <= threshold_px).collect();
-        let n_recovered = mask_s2
-            .iter()
-            .zip(&mask)
-            .filter(|(&s2, &s1)| s2 && !s1)
-            .count();
-
-        if n_recovered > 0 {
-            mask = mask_s2;
-            let n_inliers = mask.iter().filter(|&&m| m).count();
-            if n_inliers >= ncoeffs {
-                fit_poly_ls(points, &mask, &pairs, scale, &mut a_coeffs, &mut b_coeffs);
-            }
-        }
     }
 
     // The inverse polynomial (distorted → ideal) is no longer fit:
@@ -947,22 +899,26 @@ mod tests {
         points
     }
 
-    /// With stage-2 recovery disabled, the sigma-clip loop itself must keep
-    /// essentially all points under ordinary Gaussian noise. (A threshold of
-    /// `k·σ` without the median offset rejects ~14% per pass and collapses.)
+    /// The sigma-clip loop must keep essentially all points under ordinary
+    /// Gaussian noise. (A threshold of `k·σ` without the median offset
+    /// rejects ~14% per pass and collapses.)
     #[test]
     fn test_polynomial_sigma_clip_keeps_good_points_under_noise() {
         let points = noisy_points(-7e-9, 0.3, 7);
         let n = points.len();
-        let config = DistortionFitConfig {
-            stage2_threshold_px: None,
-            ..Default::default()
-        };
+        let config = DistortionFitConfig::default();
         let fit = fit_polynomial_sigma_clip(&points, 3, 1000.0, &config);
         let kept = fit.mask.iter().filter(|&&m| m).count();
         assert!(
             kept as f64 >= 0.95 * n as f64,
             "sigma-clip kept only {kept}/{n} good points"
+        );
+        // With σ over all points the mask must settle quickly rather than
+        // ratchet toward max_iterations (20).
+        assert!(
+            fit.iterations <= 5,
+            "clip loop took {} passes to converge",
+            fit.iterations
         );
         let model = Distortion::Polynomial(PolynomialDistortion::new(
             3,
@@ -981,10 +937,7 @@ mod tests {
         let true_k1 = -7e-9;
         let points = noisy_points(true_k1, 0.3, 11);
         let n = points.len();
-        let config = DistortionFitConfig {
-            stage2_threshold_px: None,
-            ..Default::default()
-        };
+        let config = DistortionFitConfig::default();
         let fit = fit_radial_centered_sigma_clip(&points, &config);
         let kept = fit.mask.iter().filter(|&&m| m).count();
         assert!(

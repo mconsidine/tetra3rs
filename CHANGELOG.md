@@ -15,6 +15,7 @@
 
 ### Changed
 
+- Distortion-fit sigma-clip estimates σ over all points (MAD) so the inlier set converges instead of shrinking onto bright stars; the fixed 5 px stage-2 recovery is removed (it re-admitted mismatches). TESS model residuals improve ~2×; inlier counts drop ~17%.
 - Single- and multi-image calibration share one pooled fitter (`fit::fit_pooled`); the legacy `fit_polynomial_distortion` / `fit_radial_distortion` path is removed (crate-private; results unchanged).
 - The CCL and fast centroiders share the region extent/border gate and the sharpness/refine/assembly tail (bit-identical output).
 

@@ -71,13 +71,11 @@ impl Default for CalibrateConfig {
 }
 
 impl From<&CalibrateConfig> for DistortionFitConfig {
-    /// The fitter settings a calibration run passes down: the calibration's
-    /// sigma-clip parameters plus the default stage-2 recovery threshold.
+    /// The fitter settings a calibration run passes down.
     fn from(config: &CalibrateConfig) -> Self {
         Self {
             sigma_clip: config.sigma_clip,
             max_iterations: config.max_iterations,
-            ..Default::default()
         }
     }
 }
