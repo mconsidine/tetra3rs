@@ -4,8 +4,8 @@
 //! [`extract_centroids_fast`].
 
 use super::{
-    accepted_peak_refine, check_pixel_len, elongation_from_cov, peak_sharpness, runs,
-    sort_and_truncate_by_mass, BackgroundGrid, CentroidExtractionResult,
+    check_pixel_len, elongation_from_cov, finish_region, runs, sort_and_truncate_by_mass,
+    BackgroundGrid, CentroidExtractionResult,
 };
 use crate::centroid::Centroid;
 use crate::error::{Error, Result};
@@ -179,32 +179,13 @@ pub fn extract_centroids_fast(
     let num_blobs_raw = regions.n_regions;
     'region: for kreg in 0..regions.n_regions {
         let region_runs = &order[offsets[kreg] as usize..offsets[kreg + 1] as usize];
-        let npix: usize = region_runs
-            .iter()
-            .map(|&i| regions.runs[i as usize].len())
-            .sum();
+        let extent = regions.extent(region_runs);
+        let npix = extent.npix;
         if npix < config.min_pixels || npix > config.max_pixels {
             continue;
         }
-
-        // Border gate on the run-list bounding box (truncated PSFs bias the
-        // CoM inward).
-        if config.border_margin > 0 {
-            let m = config.border_margin as usize;
-            let mut min_row = usize::MAX;
-            let mut max_row = 0usize;
-            let mut min_col = usize::MAX;
-            let mut max_col = 0usize;
-            for &i in region_runs {
-                let run = regions.runs[i as usize];
-                min_row = min_row.min(run.row as usize);
-                max_row = max_row.max(run.row as usize);
-                min_col = min_col.min(run.c0 as usize);
-                max_col = max_col.max(run.c1 as usize);
-            }
-            if min_row < m || min_col < m || max_row >= h - m || max_col >= w - m {
-                continue;
-            }
+        if !extent.clear_of_border(config.border_margin as usize, w, h) {
+            continue;
         }
 
         // Intensity-weighted moments over the run list, background
@@ -244,8 +225,8 @@ pub fn extract_centroids_fast(
             continue;
         }
 
-        let mut fx = sum_wx / sum_w;
-        let mut fy = sum_wy / sum_w;
+        let fx = sum_wx / sum_w;
+        let fy = sum_wy / sum_w;
 
         // Intensity-weighted central second moments — the same statistic the
         // CCL path reports as `cov` and judges elongation on.
@@ -266,35 +247,23 @@ pub fn extract_centroids_fast(
             pixels[rr * w + cc] as f64 - peak_bg
         };
 
-        // Hot-pixel / cosmic-ray sharpness gate (shared with the CCL path).
-        if let Some(max_sharp) = config.max_sharpness {
-            if let Some(s) = peak_sharpness((pc, pr), (w, h), v) {
-                if s > max_sharp as f64 {
-                    continue;
-                }
-            }
-        }
-
-        // Optional 3×3 parabola refine on the raw image at the peak (shared
-        // gate with the CCL path — see `accepted_peak_refine`). Skipped for
-        // saturated peaks (no meaningful sub-pixel maximum on a flat top).
+        // Sharpness gate, peak refinement, and assembly are shared with the
+        // CCL path (see `finish_region`).
         let saturated = config.saturation_level.is_some_and(|s| peak_val >= s);
-        if !saturated {
-            if let Some((qx, qy)) = accepted_peak_refine(npix, (pc, pr), (w, h), (fx, fy), v) {
-                fx = qx;
-                fy = qy;
-            }
+        if let Some(c) = finish_region(
+            npix,
+            (pc, pr),
+            (w, h),
+            (fx, fy),
+            (cxx, cyy, cxy),
+            sum_w,
+            saturated,
+            config.max_sharpness,
+            (cx, cy),
+            v,
+        ) {
+            centroids.push(c);
         }
-
-        centroids.push(Centroid {
-            x: fx as f32 - cx,
-            y: fy as f32 - cy,
-            mass: Some(sum_w as f32),
-            cov: Some(crate::Matrix2::new([
-                [cxx as f32, cxy as f32],
-                [cxy as f32, cyy as f32],
-            ])),
-        });
     }
 
     sort_and_truncate_by_mass(&mut centroids, config.max_centroids);

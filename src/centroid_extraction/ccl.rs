@@ -10,9 +10,8 @@ use numeris::imageproc::{gaussian_blur, BorderMode};
 use numeris::DynMatrix;
 
 use super::{
-    accepted_peak_refine, elongation_from_cov, median_f32, par, peak_sharpness, runs,
-    sort_and_truncate_by_mass, BackgroundGrid, CentroidExtractionConfig, CentroidExtractionResult,
-    DeblendMode,
+    elongation_from_cov, finish_region, median_f32, par, runs, sort_and_truncate_by_mass,
+    BackgroundGrid, CentroidExtractionConfig, CentroidExtractionResult, DeblendMode,
 };
 use crate::centroid::Centroid;
 use crate::error::{Error, Result};
@@ -188,38 +187,26 @@ pub(super) fn extract_from_gray(
     let regions = runs::sweep_runs(w, h, |r, c| thresh_src[r * w + c] > mask_threshold);
 
     // ── Step 5: compute centroids ──
-    let raw_centroids = compute_blob_centroids(
-        gray,
-        gray_input,
-        thresh_src,
-        mask_threshold,
-        &regions,
-        width,
-        height,
-        config,
-    );
-    // "Raw" blob count = connected regions before the size/elongation/mass
-    // filters, matching the field's documented meaning and the fast path's
-    // pre-`min_pixels` region count.
-    let num_blobs_raw = regions.n_regions;
-
-    // ── Step 5: convert to centered pixel coordinates ──
     // Origin at the geometric image center, (W-1)/2 and (H-1)/2 (pixel centers
     // are at integer indices, so for even dimensions this is the intersection
     // of the four central pixels — matching the FITS / astropy / OpenCV
     // convention). +X right, +Y down.
     let cx = (width - 1) as f32 / 2.0;
     let cy = (height - 1) as f32 / 2.0;
-
-    let mut centroids: Vec<Centroid> = raw_centroids
-        .into_iter()
-        .map(|rc| Centroid {
-            x: rc.x_px - cx,
-            y: rc.y_px - cy,
-            mass: Some(rc.mass),
-            cov: Some(rc.cov),
-        })
-        .collect();
+    let mut centroids = compute_blob_centroids(
+        gray,
+        gray_input,
+        thresh_src,
+        mask_threshold,
+        &regions,
+        (w, h),
+        (cx, cy),
+        config,
+    );
+    // "Raw" blob count = connected regions before the size/elongation/mass
+    // filters, matching the field's documented meaning and the fast path's
+    // pre-`min_pixels` region count.
+    let num_blobs_raw = regions.n_regions;
 
     sort_and_truncate_by_mass(&mut centroids, config.max_centroids);
 
@@ -341,15 +328,6 @@ pub(super) fn estimate_background(
     (median, sigma)
 }
 
-/// Raw pixel-coordinate centroid with mass and covariance.
-struct RawCentroid {
-    x_px: f32,
-    y_px: f32,
-    mass: f32,
-    /// Intensity-weighted 2×2 covariance matrix [[cxx, cxy], [cxy, cyy]] in pixels².
-    cov: crate::Matrix2,
-}
-
 /// Compute intensity-weighted centroids for each connected region.
 ///
 /// Consumes the run-length regions from [`runs::sweep_runs`]; each stage
@@ -365,6 +343,10 @@ struct RawCentroid {
 ///    interpolate the sub-pixel intensity maximum. The quadratic position is
 ///    used only when it agrees with the CoM (within 0.5 px); otherwise the CoM
 ///    is kept as-is.
+///
+/// Centroids are returned in image-center-origin coordinates (`(cx, cy)` is
+/// the origin in pixel coordinates), with mass and the intensity-weighted
+/// 2×2 covariance `[[cxx, cxy], [cxy, cyy]]` in pixels².
 ///
 /// When `max_elongation` is set in config, blobs with elongation ratio
 /// (major/minor axis) exceeding the threshold are rejected as non-stellar.
@@ -384,13 +366,10 @@ fn compute_blob_centroids(
     thresh_src: &[f32],
     mask_threshold: f32,
     regions: &runs::RunRegions,
-    width: u32,
-    height: u32,
+    (w, h): (usize, usize),
+    (cx, cy): (f32, f32),
     config: &CentroidExtractionConfig,
-) -> Vec<RawCentroid> {
-    let w = width as usize;
-    let h = height as usize;
-
+) -> Vec<Centroid> {
     let (offsets, order) = regions.group_by_region();
 
     // Reused across blobs to avoid a fresh allocation per region (dense
@@ -398,37 +377,24 @@ fn compute_blob_centroids(
     let mut annulus_vals: Vec<f32> = Vec::new();
     let mut maxima: Vec<(f32, usize, usize)> = Vec::new();
     let mut kept: Vec<(usize, usize)> = Vec::new();
-    let mut out: Vec<RawCentroid> = Vec::new();
+    let mut out: Vec<Centroid> = Vec::new();
 
     'region: for k in 0..regions.n_regions {
         let region_runs = &order[offsets[k] as usize..offsets[k + 1] as usize];
-        let pixel_count: usize = region_runs
-            .iter()
-            .map(|&i| regions.runs[i as usize].len())
-            .sum();
+        let extent = regions.extent(region_runs);
+        let pixel_count = extent.npix;
         if pixel_count < config.min_pixels || pixel_count > config.max_pixels {
             continue;
         }
-
-        // Bounding box from the (row-major) run list.
-        let mut min_row = usize::MAX;
-        let mut max_row = 0usize;
-        let mut min_col = usize::MAX;
-        let mut max_col = 0usize;
-        for &i in region_runs {
-            let run = regions.runs[i as usize];
-            min_row = min_row.min(run.row as usize);
-            max_row = max_row.max(run.row as usize);
-            min_col = min_col.min(run.c0 as usize);
-            max_col = max_col.max(run.c1 as usize);
-        }
-
-        // Border gate: a star cut by the frame edge has a truncated PSF and
-        // a CoM biased toward the interior — a plausible but wrong position.
-        let m = config.border_margin as usize;
-        if m > 0 && (min_row < m || min_col < m || max_row >= h - m || max_col >= w - m) {
+        if !extent.clear_of_border(config.border_margin as usize, w, h) {
             continue;
         }
+        let (min_row, max_row, min_col, max_col) = (
+            extent.min_row,
+            extent.max_row,
+            extent.min_col,
+            extent.max_col,
+        );
 
         // Reference pixel = bbox top-left, to keep moments numerically stable.
         let ref_col = min_col;
@@ -590,36 +556,22 @@ fn compute_blob_centroids(
             gray[r * w + c] as f64 - local_bg
         };
 
-        // --- Hot-pixel / cosmic-ray sharpness gate ---
-        if let Some(max_sharp) = config.max_sharpness {
-            if let Some(s) = peak_sharpness((pc, pr), (w, h), v) {
-                if s > max_sharp as f64 {
-                    continue;
-                }
-            }
+        // Sharpness gate, peak refinement, and assembly are shared with the
+        // fast path (see `finish_region`).
+        if let Some(c) = finish_region(
+            pixel_count,
+            (pc, pr),
+            (w, h),
+            (xbar, ybar),
+            (cxx, cyy, cxy),
+            sum_i,
+            saturated,
+            config.max_sharpness,
+            (cx, cy),
+            v,
+        ) {
+            out.push(c);
         }
-
-        // --- Quadratic peak refinement (shared gate; see accepted_peak_refine) ---
-        // Skipped when the peak is saturated: a flat-topped or bloomed
-        // profile has no meaningful sub-pixel maximum, and a 2-3 px flat
-        // top can still "pass" the parabola with a skewed vertex.
-        let mut final_x = xbar;
-        let mut final_y = ybar;
-        if !saturated {
-            if let Some((qx, qy)) =
-                accepted_peak_refine(pixel_count, (pc, pr), (w, h), (xbar, ybar), v)
-            {
-                final_x = qx;
-                final_y = qy;
-            }
-        }
-
-        out.push(RawCentroid {
-            x_px: final_x as f32,
-            y_px: final_y as f32,
-            mass: sum_i as f32,
-            cov: crate::Matrix2::new([[cxx as f32, cxy as f32], [cxy as f32, cyy as f32]]),
-        });
     }
 
     out

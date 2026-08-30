@@ -34,7 +34,56 @@ pub(super) struct RunRegions {
     pub n_regions: usize,
 }
 
+/// Pixel count and bounding box of one region's run list.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RegionExtent {
+    pub npix: usize,
+    pub min_row: usize,
+    pub max_row: usize,
+    pub min_col: usize,
+    pub max_col: usize,
+}
+
+impl RegionExtent {
+    /// Border gate shared by both extraction paths: `false` when the bounding
+    /// box comes within `margin` pixels of any edge of a `w`×`h` image (a
+    /// star cut by the frame edge has a truncated PSF and a CoM biased
+    /// toward the interior — a plausible but wrong position). `margin == 0`
+    /// disables the gate. The `min_*` tests come first so a margin larger
+    /// than the image cannot underflow `h - margin`.
+    #[inline]
+    pub(super) fn clear_of_border(&self, margin: usize, w: usize, h: usize) -> bool {
+        margin == 0
+            || !(self.min_row < margin
+                || self.min_col < margin
+                || self.max_row >= h - margin
+                || self.max_col >= w - margin)
+    }
+}
+
 impl RunRegions {
+    /// Pixel count and bounding box of the region whose (row-major) run
+    /// indices are `region_runs` (a slice of the `order` returned by
+    /// [`Self::group_by_region`]).
+    pub(super) fn extent(&self, region_runs: &[u32]) -> RegionExtent {
+        let mut e = RegionExtent {
+            npix: 0,
+            min_row: usize::MAX,
+            max_row: 0,
+            min_col: usize::MAX,
+            max_col: 0,
+        };
+        for &i in region_runs {
+            let run = self.runs[i as usize];
+            e.npix += run.len();
+            e.min_row = e.min_row.min(run.row as usize);
+            e.max_row = e.max_row.max(run.row as usize);
+            e.min_col = e.min_col.min(run.c0 as usize);
+            e.max_col = e.max_col.max(run.c1 as usize);
+        }
+        e
+    }
+
     /// Group runs by region: `order[offsets[k] as usize..offsets[k + 1] as
     /// usize]` are the (ascending, hence row-major) run indices of region
     /// `k`. Counting sort — O(runs + regions).

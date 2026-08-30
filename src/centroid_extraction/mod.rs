@@ -654,6 +654,54 @@ fn accepted_peak_refine(
     }
 }
 
+/// Shared tail of the per-region pipeline in both extraction paths, run after
+/// the moments, elongation gate, and (CCL only) deblending: the hot-pixel
+/// sharpness gate, the quadratic peak refinement (skipped for saturated
+/// peaks — a flat top has no meaningful sub-pixel maximum), and assembly of
+/// the [`Centroid`] in image-center-origin coordinates. `v(dy, dx)` samples
+/// background-subtracted values relative to the integer peak `(pc, pr)`;
+/// `(com_x, com_y)` is the center of mass in pixel coordinates,
+/// `(cxx, cyy, cxy)` the intensity-weighted central second moments, and
+/// `(cx, cy)` the image-center origin. Returns `None` when the blob is
+/// rejected as a hot pixel / cosmic ray.
+#[allow(clippy::too_many_arguments)]
+fn finish_region(
+    npix: usize,
+    (pc, pr): (usize, usize),
+    (w, h): (usize, usize),
+    (com_x, com_y): (f64, f64),
+    (cxx, cyy, cxy): (f64, f64, f64),
+    mass: f64,
+    saturated: bool,
+    max_sharpness: Option<f32>,
+    (cx, cy): (f32, f32),
+    v: impl Fn(isize, isize) -> f64,
+) -> Option<Centroid> {
+    if let Some(max_sharp) = max_sharpness {
+        if let Some(s) = peak_sharpness((pc, pr), (w, h), &v) {
+            if s > max_sharp as f64 {
+                return None;
+            }
+        }
+    }
+    let (mut fx, mut fy) = (com_x, com_y);
+    if !saturated {
+        if let Some((qx, qy)) = accepted_peak_refine(npix, (pc, pr), (w, h), (fx, fy), &v) {
+            fx = qx;
+            fy = qy;
+        }
+    }
+    Some(Centroid {
+        x: fx as f32 - cx,
+        y: fy as f32 - cy,
+        mass: Some(mass as f32),
+        cov: Some(crate::Matrix2::new([
+            [cxx as f32, cxy as f32],
+            [cxy as f32, cyy as f32],
+        ])),
+    })
+}
+
 /// DAOFIND-style sharpness of a blob peak: `(peak − mean(8 neighbors)) / peak`
 /// on background-subtracted values (`v(dy, dx)` samples relative to the peak,
 /// the same accessor convention as [`accepted_peak_refine`]). Out-of-bounds
