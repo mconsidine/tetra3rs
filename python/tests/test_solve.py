@@ -395,6 +395,67 @@ class TestCalibration:
         assert cal.rmse_after_px <= cal.rmse_before_px + 0.01
         assert cal.n_inliers > 0
 
+    def test_single_element_list_form(self, skyview_db):
+        """A one-element list of solves + one-element list of centroid sets is
+        the documented list form and must behave like the single form."""
+        ra, dec = 83.0, -1.0
+        fov_deg = 10.0
+        image_size = 2048
+        f_px = image_size / (2.0 * math.tan(math.radians(fov_deg / 2.0)))
+        stars = skyview_db.cone_search(ra, dec, fov_deg)
+        centroids = project_stars_tan(stars[:50], ra, dec, f_px, image_size)
+        result = skyview_db.solve_from_centroids(
+            centroids,
+            fov_estimate_deg=fov_deg,
+            image_width=image_size,
+            image_height=image_size,
+            fov_max_error_deg=3.0,
+        )
+        assert result
+
+        single = skyview_db.calibrate_camera(
+            result, centroids, image_width=image_size, image_height=image_size, order=2
+        )
+        listed = skyview_db.calibrate_camera(
+            [result],
+            [centroids],
+            image_width=image_size,
+            image_height=image_size,
+            order=2,
+        )
+        assert listed.n_inliers == single.n_inliers
+        assert abs(listed.rmse_after_px - single.rmse_after_px) < 1e-9
+
+        # List of solves with a bare centroid set is not the list form
+        # (here a 50-element list of Centroid vs. 1 solve → length mismatch).
+        with pytest.raises((TypeError, ValueError)):
+            skyview_db.calibrate_camera(
+                [result], centroids, image_width=image_size, image_height=image_size
+            )
+
+    def test_zero_image_dims_rejected(self, skyview_db):
+        ra, dec = 83.0, -1.0
+        fov_deg = 10.0
+        image_size = 2048
+        f_px = image_size / (2.0 * math.tan(math.radians(fov_deg / 2.0)))
+        stars = skyview_db.cone_search(ra, dec, fov_deg)
+        centroids = project_stars_tan(stars[:50], ra, dec, f_px, image_size)
+        result = skyview_db.solve_from_centroids(
+            centroids,
+            fov_estimate_deg=fov_deg,
+            image_width=image_size,
+            image_height=image_size,
+            fov_max_error_deg=3.0,
+        )
+        with pytest.raises(ValueError, match="non-zero"):
+            skyview_db.calibrate_camera(
+                result, centroids, image_width=0, image_height=0, order=2
+            )
+        with pytest.raises(ValueError, match="non-zero"):
+            skyview_db.solve_from_centroids(
+                centroids, fov_estimate_deg=fov_deg, image_width=0, image_height=0
+            )
+
     def test_calibrate_result_pickle(self, skyview_db):
         ra, dec = 83.0, -1.0
         fov_deg = 10.0

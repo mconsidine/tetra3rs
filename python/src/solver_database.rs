@@ -293,11 +293,6 @@ impl PySolverDatabase {
                 }
                 let (img_width, img_height) =
                     resolve_image_dims(image_shape, image_width, image_height)?;
-                if img_width == 0 || img_height == 0 {
-                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                        "image dimensions must be non-zero, got {img_width}x{img_height}"
-                    )));
-                }
                 CameraModel::from_fov(fov_rad as f64, img_width, img_height)
             }
         };
