@@ -14,10 +14,11 @@ use numeris::{DynMatrix, DynVector, Matrix3};
 use tracing::debug;
 
 use crate::centroid::Centroid;
-use crate::solver::{SolveResult, SolverDatabase};
+use crate::solver::SolverDatabase;
 use crate::stats::median_mad_sigma;
 
-use super::polynomial::{num_coeffs, term_pairs, PolynomialDistortion};
+use super::calibrate::DistortionModelType;
+use super::polynomial::{eval_poly, num_coeffs, term_pairs, PolynomialDistortion};
 use super::radial::{brown_conrady_forward, RadialDistortion};
 use super::Distortion;
 
@@ -50,52 +51,6 @@ impl Default for DistortionFitConfig {
     }
 }
 
-/// Result of a distortion fitting procedure.
-///
-/// Note there is no jointly-fit CRPIX here: polynomial fits absorb the optical
-/// center into their order-0 terms (moved into `CameraModel::crpix` later by
-/// `extract_crpix`), and radial fits carry the optical-axis position inside the
-/// model ([`RadialDistortion::center`]). Both leave the projection origin
-/// (`crpix`) at the image center for the solver's geometry.
-#[derive(Debug, Clone)]
-pub struct DistortionFitResult {
-    /// The fitted distortion model.
-    pub model: Distortion,
-    /// Correction factor for the anchor focal length (the focal length
-    /// implied by the solve FOV used to project the ideal points):
-    /// `f_true = focal_scale · f_anchor`. Always `1.0` for polynomial fits;
-    /// for radial fits this carries the jointly-fit linear scale term (the
-    /// Brown-Conrady model itself has no linear degree of freedom).
-    pub focal_scale: f64,
-    /// RMS residual in pixels BEFORE distortion correction.
-    pub rmse_before_px: f64,
-    /// RMS residual in pixels AFTER distortion correction.
-    pub rmse_after_px: f64,
-    /// Number of inlier matches used in the final fit.
-    pub n_inliers: usize,
-    /// Number of outlier matches rejected.
-    pub n_outliers: usize,
-    /// Number of sigma-clip iterations performed.
-    pub iterations: u32,
-}
-
-impl DistortionFitResult {
-    /// A "no fit performed" result: identity model, `rmse_px` echoed as both
-    /// the before and after RMSE. Used when too few matched points exist for
-    /// the requested model.
-    fn no_fit(rmse_px: f64, n_inliers: usize) -> Self {
-        Self {
-            model: Distortion::None,
-            focal_scale: 1.0,
-            rmse_before_px: rmse_px,
-            rmse_after_px: rmse_px,
-            n_inliers,
-            n_outliers: 0,
-            iterations: 0,
-        }
-    }
-}
-
 // ── Data structures for internal use ────────────────────────────────────────
 
 /// A single matched observation: observed centroid pixel position + ideal (projected) position.
@@ -110,95 +65,126 @@ pub(super) struct MatchedPoint {
     pub y_ideal: f64,
 }
 
-// ── Radial distortion fitting ───────────────────────────────────────────────
-
-/// Fit a radial Brown-Conrady distortion model `(k1, k2, k3)` plus optical
-/// center `(cx, cy)` from plate-solve results.
+/// Outcome of [`fit_pooled`]: a sigma-clipped distortion fit over a pooled
+/// set of matched points.
 ///
-/// Joint nonlinear least squares (Gauss-Newton, MAD sigma-clipped). The
-/// model is OpenCV-style: the radial term is centered on the fitted optical
-/// axis, not on the geometric image center —
-///
-/// ```text
-///     x_n = x_ideal − cx,   y_n = y_ideal − cy
-///     r²  = x_n² + y_n²
-///     x_obs = cx + x_n · (1 + k1·r² + k2·r⁴ + k3·r⁶)
-///     y_obs = cy + y_n · (1 + k1·r² + k2·r⁴ + k3·r⁶)
-/// ```
-///
-/// Returns the radial coefficients (with the optical center carried inside the
-/// model, per [`RadialDistortion::center`]) in [`DistortionFitResult::model`].
-/// Same interface as [`fit_polynomial_distortion`] otherwise. Suitable for
-/// most photographic / computer-vision lens calibrations; for cameras with
-/// significant tangential / decentering distortion (e.g. TESS), prefer
-/// [`fit_polynomial_distortion`] which has more parameters to absorb it.
-///
-/// # Panics
-///
-/// Panics when `solve_results` and `centroids` differ in length.
-/// [`crate::calibrate_camera`] validates this (returning an error) before
-/// delegating here.
-pub fn fit_radial_distortion(
-    solve_results: &[&SolveResult],
-    centroids: &[&[Centroid]],
-    database: &SolverDatabase,
-    image_width: u32,
-    config: &DistortionFitConfig,
-) -> DistortionFitResult {
-    assert_eq!(
-        solve_results.len(),
-        centroids.len(),
-        "solve_results and centroids must have the same length"
-    );
+/// Note there is no jointly-fit CRPIX here: polynomial fits absorb the optical
+/// center into their order-0 terms (moved into `CameraModel::crpix` later by
+/// `extract_crpix`), and radial fits carry the optical-axis position inside the
+/// model ([`RadialDistortion::center`]). Both leave the projection origin
+/// (`crpix`) at the image center for the solver's geometry.
+pub(super) struct PooledFit {
+    /// The fitted distortion model.
+    pub model: Distortion,
+    /// Correction factor for the anchor focal length (the focal length
+    /// implied by the solve FOV used to project the ideal points):
+    /// `f_true = focal_scale · f_anchor`. Always `1.0` for polynomial fits;
+    /// for radial fits this carries the jointly-fit linear scale term (the
+    /// Brown-Conrady model itself has no linear degree of freedom).
+    pub focal_scale: f64,
+    /// Inlier mask over the input points.
+    pub mask: Vec<bool>,
+    /// Number of sigma-clip iterations performed.
+    pub iterations: u32,
+    /// RMS residual in pixels BEFORE distortion correction (inliers only).
+    pub rmse_before_px: f64,
+    /// RMS residual in pixels AFTER distortion correction (inliers only).
+    pub rmse_after_px: f64,
+}
 
-    let id_to_idx = build_id_lookup(database);
-    let points = gather_matched_points(solve_results, centroids, database, &id_to_idx, image_width);
-
-    // Below MIN_RADIAL_POINTS the 8-parameter fit is under-determined and the LM
-    // returns its (identity) warm start, which would masquerade as a real fit.
-    // Report a clean no-op result instead.
-    if points.len() < MIN_RADIAL_POINTS {
-        return DistortionFitResult::no_fit(0.0, 0);
-    }
-
-    let n = points.len();
-    let fit = fit_radial_centered_sigma_clip(&points, config);
-    // Re-express in the scale-corrected frame (γ folded into the focal
-    // length via `focal_scale`). Predicted pixels are unchanged, so
-    // residuals are evaluated with the raw fitted params including γ.
-    let model = fit.rescaled_model();
-
-    // Compute before/after RMSE on the SAME inlier set for a fair comparison.
-    // Identity intrinsics → predicted == ideal, so this is the raw
-    // (pre-correction) obs-vs-ideal RMS over the inliers.
-    let rmse_before = masked_rms(
-        &intrinsics_residuals(&points, &[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        &fit.mask,
-    );
-    let residuals = intrinsics_residuals(
-        &points,
-        &[
-            fit.cx, fit.cy, fit.gamma, fit.k1, fit.k2, fit.k3, fit.p1, fit.p2,
-        ],
-    );
-    let rmse_after = masked_rms(&residuals, &fit.mask);
-    let n_inliers = fit.mask.iter().filter(|&&m| m).count();
-
-    debug!(
-        "Brown-Conrady fit: cx={:.2}, cy={:.2}, gamma={:.6}, k1={:.3e}, k2={:.3e}, k3={:.3e}, p1={:.3e}, p2={:.3e}, inliers={}/{}, RMSE {:.3} → {:.3} px",
-        fit.cx, fit.cy, fit.gamma, fit.k1, fit.k2, fit.k3, fit.p1, fit.p2, n_inliers, n, rmse_before, rmse_after
-    );
-
-    DistortionFitResult {
-        model: Distortion::Radial(model),
-        focal_scale: fit.gamma,
-        rmse_before_px: rmse_before,
-        rmse_after_px: rmse_after,
-        n_inliers,
-        n_outliers: n - n_inliers,
-        iterations: fit.iterations,
+impl PooledFit {
+    pub fn n_inliers(&self) -> usize {
+        self.mask.iter().filter(|&&m| m).count()
     }
 }
+
+/// Minimum matched points for `model` to be determined at all.
+pub(super) fn min_points(model: DistortionModelType) -> usize {
+    match model {
+        DistortionModelType::Polynomial { order } => num_coeffs(order),
+        DistortionModelType::Radial => MIN_RADIAL_POINTS,
+    }
+}
+
+/// Fit `model` to pooled matched points with iterative sigma-clipping,
+/// reporting before/after RMSE on the same final inlier set. `scale` is the
+/// polynomial normalization (typically `image_width / 2`); ignored for radial.
+///
+/// Returns `None` when there are fewer points than [`min_points`] — below
+/// that the fit is under-determined and the LM/LS would hand back its
+/// (identity) warm start masquerading as a real fit. Shared by the
+/// single-image and multi-image calibration paths.
+pub(super) fn fit_pooled(
+    points: &[MatchedPoint],
+    model: DistortionModelType,
+    scale: f64,
+    config: &DistortionFitConfig,
+) -> Option<PooledFit> {
+    if points.len() < min_points(model) {
+        return None;
+    }
+    let fit = match model {
+        DistortionModelType::Polynomial { order } => {
+            let fit = fit_polynomial_sigma_clip(points, order, scale, config);
+            let dist = Distortion::Polynomial(PolynomialDistortion::new(
+                order,
+                scale,
+                fit.a_coeffs,
+                fit.b_coeffs,
+            ));
+            let rmse_after_px = compute_corrected_rmse(points, &fit.mask, &dist);
+            PooledFit {
+                model: dist,
+                focal_scale: 1.0,
+                mask: fit.mask,
+                iterations: fit.iterations,
+                rmse_before_px: 0.0,
+                rmse_after_px,
+            }
+        }
+        DistortionModelType::Radial => {
+            let fit = fit_radial_centered_sigma_clip(points, config);
+            // Residuals under the raw fit (including γ) — identical to the
+            // rescaled model evaluated in the corrected frame.
+            let residuals = intrinsics_residuals(
+                points,
+                &[
+                    fit.cx, fit.cy, fit.gamma, fit.k1, fit.k2, fit.k3, fit.p1, fit.p2,
+                ],
+            );
+            let rmse_after_px = masked_rms(&residuals, &fit.mask);
+            debug!(
+                "Brown-Conrady fit: cx={:.2}, cy={:.2}, gamma={:.6}, k1={:.3e}, k2={:.3e}, k3={:.3e}, p1={:.3e}, p2={:.3e}",
+                fit.cx, fit.cy, fit.gamma, fit.k1, fit.k2, fit.k3, fit.p1, fit.p2,
+            );
+            PooledFit {
+                model: Distortion::Radial(fit.rescaled_model()),
+                focal_scale: fit.gamma,
+                mask: fit.mask,
+                iterations: fit.iterations,
+                rmse_before_px: 0.0,
+                rmse_after_px,
+            }
+        }
+    };
+    // Raw (uncorrected) obs-vs-ideal RMS on the SAME inlier set, so the
+    // before/after pair is a fair comparison.
+    let rmse_before_px = compute_corrected_rmse(points, &fit.mask, &Distortion::None);
+    debug!(
+        "{:?} fit: inliers={}/{}, RMSE {:.3} → {:.3} px",
+        model,
+        fit.n_inliers(),
+        points.len(),
+        rmse_before_px,
+        fit.rmse_after_px
+    );
+    Some(PooledFit {
+        rmse_before_px,
+        ..fit
+    })
+}
+
+// ── Radial distortion fitting ───────────────────────────────────────────────
 
 /// Result of a sigma-clipped camera-intrinsics fit: optical center,
 /// focal-scale factor, and Brown-Conrady distortion (radial + tangential).
@@ -615,14 +601,12 @@ pub(super) struct PolyFitResult {
     pub iterations: u32,
 }
 
-/// Per-point radial residual (in pixels) of the forward SIP polynomial model.
-///
-/// For each matched point: evaluate the forward polynomial at the normalized
-/// ideal coordinates `(u, v) = (x_ideal, y_ideal) / scale`, then return the
-/// Euclidean distance between the observed offset and the modeled offset.
+/// Per-point radial residual (in pixels) of the forward SIP polynomial model:
+/// the Euclidean distance between the observed position and
+/// `distort(ideal)` under the given coefficients.
 fn poly_point_residuals(
     points: &[MatchedPoint],
-    pairs: &[(u32, u32)],
+    order: u32,
     scale: f64,
     a_coeffs: &[f64],
     b_coeffs: &[f64],
@@ -632,18 +616,8 @@ fn poly_point_residuals(
         .map(|p| {
             let u = p.x_ideal / scale;
             let v = p.y_ideal / scale;
-            let dx_model: f64 = pairs
-                .iter()
-                .enumerate()
-                .map(|(i, &(pp, qq))| a_coeffs[i] * u.powi(pp as i32) * v.powi(qq as i32))
-                .sum();
-            let dy_model: f64 = pairs
-                .iter()
-                .enumerate()
-                .map(|(i, &(pp, qq))| b_coeffs[i] * u.powi(pp as i32) * v.powi(qq as i32))
-                .sum();
-            let rx = p.x_obs - p.x_ideal - dx_model * scale;
-            let ry = p.y_obs - p.y_ideal - dy_model * scale;
+            let rx = p.x_obs - p.x_ideal - eval_poly(a_coeffs, order, u, v) * scale;
+            let ry = p.y_obs - p.y_ideal - eval_poly(b_coeffs, order, u, v) * scale;
             (rx * rx + ry * ry).sqrt()
         })
         .collect()
@@ -651,12 +625,10 @@ fn poly_point_residuals(
 
 /// Fit a polynomial distortion model with iterative sigma-clipping.
 ///
-/// This is the core fitting loop extracted for reuse by multi-image calibration.
-/// It performs:
+/// The core polynomial loop behind [`fit_pooled`]:
 /// 1. Initial forward polynomial LS fit.
 /// 2. Iterative MAD-based sigma-clipping.
 /// 3. Stage 2 outlier recovery (optional, controlled by `config.stage2_threshold_px`).
-/// 4. Inverse polynomial fit on the final inlier set.
 ///
 /// `points` are matched observations, `order` is the polynomial order,
 /// `scale` is the normalization factor (typically image_width / 2).
@@ -682,7 +654,7 @@ pub(super) fn fit_polynomial_sigma_clip(
         iterations = iter + 1;
 
         // Compute residuals using current model
-        let residuals = poly_point_residuals(points, &pairs, scale, &a_coeffs, &b_coeffs);
+        let residuals = poly_point_residuals(points, order, scale, &a_coeffs, &b_coeffs);
 
         // MAD-based robust clipping
         let mut inlier_resids: Vec<f64> = residuals
@@ -730,7 +702,7 @@ pub(super) fn fit_polynomial_sigma_clip(
 
     // Stage 2: recover outliers below a threshold
     if let Some(threshold_px) = config.stage2_threshold_px {
-        let residuals = poly_point_residuals(points, &pairs, scale, &a_coeffs, &b_coeffs);
+        let residuals = poly_point_residuals(points, order, scale, &a_coeffs, &b_coeffs);
 
         let mask_s2: Vec<bool> = residuals.iter().map(|&r| r <= threshold_px).collect();
         let n_recovered = mask_s2
@@ -759,95 +731,6 @@ pub(super) fn fit_polynomial_sigma_clip(
     }
 }
 
-/// Fit a polynomial (SIP-like) distortion model from plate-solve results.
-///
-/// This model fits arbitrary 2D polynomial correction terms:
-///   x_obs = x_ideal + Σ A_pq · (x_ideal/s)^p · (y_ideal/s)^q   (s = scale, 0 ≤ p+q ≤ order)
-///   y_obs = y_ideal + Σ B_pq · (x_ideal/s)^p · (y_ideal/s)^q
-/// for 2 ≤ p+q ≤ order.
-///
-/// An inverse polynomial (distorted → ideal) is also fitted for efficient
-/// undistortion in the solver.
-///
-/// The `order` parameter determines the polynomial complexity:
-/// - order 2: 6 terms per axis (12 total) — offset + linear + quadratic
-/// - order 3: 10 terms per axis (20 total) — + cubic
-/// - order 4: 15 terms per axis (30 total) — + quartic (recommended for TESS)
-///
-/// # Panics
-///
-/// Panics when `solve_results` and `centroids` differ in length or `order` is
-/// outside `[2, 6]`. [`crate::calibrate_camera`] validates both (returning an
-/// error) before delegating here.
-/// - order 5: 21 terms per axis (42 total) — + quintic
-///
-/// Order-0 terms absorb optical center offset; order-1 terms absorb residual
-/// plate scale and rotation errors.
-pub fn fit_polynomial_distortion(
-    solve_results: &[&SolveResult],
-    centroids: &[&[Centroid]],
-    database: &SolverDatabase,
-    image_width: u32,
-    order: u32,
-    config: &DistortionFitConfig,
-) -> DistortionFitResult {
-    assert_eq!(
-        solve_results.len(),
-        centroids.len(),
-        "solve_results and centroids must have the same length"
-    );
-    assert!(
-        (2..=6).contains(&order),
-        "polynomial order must be in [2, 6]"
-    );
-
-    let id_to_idx = build_id_lookup(database);
-    let points = gather_matched_points(solve_results, centroids, database, &id_to_idx, image_width);
-
-    if points.is_empty() {
-        return DistortionFitResult::no_fit(0.0, 0);
-    }
-
-    let n = points.len();
-    let ncoeffs = num_coeffs(order);
-    let scale = image_width as f64 / 2.0;
-
-    // Minimum data points: need at least ncoeffs matched pairs
-    if n < ncoeffs {
-        let rmse_raw = compute_rmse_px(&points);
-        debug!(
-            "Too few matched points ({}) for order-{} polynomial fit ({} coefficients needed)",
-            n, order, ncoeffs
-        );
-        return DistortionFitResult::no_fit(rmse_raw, n);
-    }
-
-    // Delegate to the reusable sigma-clip helper
-    let fit = fit_polynomial_sigma_clip(&points, order, scale, config);
-
-    let model = PolynomialDistortion::new(order, scale, fit.a_coeffs, fit.b_coeffs);
-    let dist = Distortion::Polynomial(model.clone());
-    // Compute before/after RMSE on the SAME inlier set for a fair comparison
-    let rmse_before = compute_corrected_rmse(&points, &fit.mask, &Distortion::None);
-    let rmse_after = compute_corrected_rmse(&points, &fit.mask, &dist);
-    let n_inliers = fit.mask.iter().filter(|&&m| m).count();
-
-    debug!(
-        "Polynomial (order {}) fit: {} coefficients/axis, inliers={}/{}, RMSE {:.3} → {:.3} px",
-        order, ncoeffs, n_inliers, n, rmse_before, rmse_after
-    );
-
-    DistortionFitResult {
-        model: dist,
-        focal_scale: 1.0,
-        rmse_before_px: rmse_before,
-        rmse_after_px: rmse_after,
-        n_inliers,
-        n_outliers: n - n_inliers,
-        iterations: fit.iterations,
-    }
-}
-
 // ── Internal helpers ────────────────────────────────────────────────────────
 
 /// Build a HashMap from catalog_id → index into star_vectors.
@@ -860,10 +743,6 @@ pub(super) fn build_id_lookup(database: &SolverDatabase) -> HashMap<i64, usize> 
         .collect()
 }
 
-/// Gather all matched points across multiple solve results.
-///
-/// For each matched pair, project the catalog star to pixel coordinates using
-/// the solve result's rotation and FOV, and pair it with the observed centroid.
 /// Iterate a solution's matched `(centroid_idx, catalog_star_idx)` pairs.
 ///
 /// Zips the two parallel match vectors (so a length mismatch can't panic),
@@ -887,40 +766,33 @@ pub(super) fn matched_pairs<'a>(
         })
 }
 
-fn gather_matched_points(
-    solve_results: &[&SolveResult],
-    centroids: &[&[Centroid]],
-    database: &SolverDatabase,
-    id_to_idx: &HashMap<i64, usize>,
-    image_width: u32,
-) -> Vec<MatchedPoint> {
-    let mut points = Vec::new();
-
-    for (sr, cents) in solve_results.iter().zip(centroids.iter()) {
-        let Ok(sr) = sr else {
-            continue; // skip failed solves
-        };
-
-        // True pinhole pixel scale (1/f), in f64 like every other pixel-scale
-        // computation in the calibration pipeline.
-        let pixel_scale = crate::solver::pixel_scale_from_fov(image_width, sr.fov_rad as f64);
-        let rot: Matrix3<f32> = sr.qicrs2cam.to_rotation_matrix();
-
-        let parity_sign: f64 = if sr.parity_flip { -1.0 } else { 1.0 };
-
-        for (cent_idx, star_idx) in matched_pairs(sr, cents.len(), id_to_idx) {
-            let sv = &database.star_vectors[star_idx];
-            let x_obs = cents[cent_idx].x as f64;
-            let y_obs = cents[cent_idx].y as f64;
-            if let Some(mp) =
-                project_to_matched_point(rot, sv, parity_sign, pixel_scale, x_obs, y_obs)
-            {
-                points.push(mp);
-            }
+/// Append one [`MatchedPoint`] per `(centroid_idx, catalog_star_idx)` pair:
+/// the observed centroid paired with the catalog star projected through `rot`
+/// at `pixel_scale`. Pairs whose star is behind the camera or whose centroid
+/// is non-finite are skipped. Shared by the single-image gather (solve's own
+/// rotation) and the multi-image Phase 2 (refined per-image rotations).
+pub(super) fn project_matches(
+    rot: Matrix3<f32>,
+    pairs: impl IntoIterator<Item = (usize, usize)>,
+    centroids: &[Centroid],
+    star_vectors: &[[f32; 3]],
+    parity_sign: f64,
+    pixel_scale: f64,
+    out: &mut Vec<MatchedPoint>,
+) {
+    for (cent_idx, star_idx) in pairs {
+        let c = &centroids[cent_idx];
+        if let Some(mp) = project_to_matched_point(
+            rot,
+            &star_vectors[star_idx],
+            parity_sign,
+            pixel_scale,
+            c.x as f64,
+            c.y as f64,
+        ) {
+            out.push(mp);
         }
     }
-
-    points
 }
 
 /// Project a catalog star (ICRS unit vector `sv`) through `rot` into ideal
@@ -929,9 +801,8 @@ fn gather_matched_points(
 ///
 /// Returns `None` when the star projects behind the camera (`cam_z ≤ 0`) or
 /// the observed position is non-finite. `parity_sign` is `-1.0` when the image x-axis is flipped; `pixel_scale` is
-/// radians per pixel (`1/focal_length_px`). Shared by the single-image gather
-/// and the multi-image calibration Phase 2.
-pub(super) fn project_to_matched_point(
+/// radians per pixel (`1/focal_length_px`).
+fn project_to_matched_point(
     rot: Matrix3<f32>,
     sv: &[f32; 3],
     parity_sign: f64,
@@ -955,22 +826,6 @@ pub(super) fn project_to_matched_point(
         x_ideal,
         y_ideal,
     })
-}
-
-/// Compute RMS pixel residual (uncorrected) across all points.
-fn compute_rmse_px(points: &[MatchedPoint]) -> f64 {
-    if points.is_empty() {
-        return 0.0;
-    }
-    let sum_sq: f64 = points
-        .iter()
-        .map(|p| {
-            let dx = p.x_obs - p.x_ideal;
-            let dy = p.y_obs - p.y_ideal;
-            dx * dx + dy * dy
-        })
-        .sum();
-    (sum_sq / points.len() as f64).sqrt()
 }
 
 /// Compute RMS pixel residual after applying distortion correction to inliers.

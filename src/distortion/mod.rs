@@ -7,7 +7,7 @@
 //!
 //! # Supported models
 //!
-//! - [`Distortion::Radial`] — classic radial distortion with up to 3 coefficients (k1, k2, k3)
+//! - [`Distortion::Radial`] — Brown-Conrady radial (k1, k2, k3) + tangential (p1, p2) about a fitted optical center
 //! - [`Distortion::Polynomial`] — SIP-like polynomial distortion with arbitrary cross-terms
 //!
 //! # Usage
