@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Sigma-clip in polynomial/radial distortion fits used `k·σ` without the median offset on non-negative residual magnitudes, rejecting ~14% of good points per pass; now `median + k·σ` (matches `wcs_refine`), and a mask with fewer inliers than parameters is never committed.
+- CCL centroid extraction turned a single `+inf`/`NaN` pixel into a `(NaN, NaN)` centroid with infinite mass ranked brightest; non-finite pixels are now background on every path.
+- `calibrate_camera` fed non-finite centroids at matched indices through the WCS and pooled fits and returned `Ok` with an all-NaN model; such centroids are skipped, `solve_3x3` bails on NaN/inf, and the fitted `CameraModel` is validated before returning.
+- `Some(NaN)` centroid mass reached the brightness sort's comparator (not a total order — std may panic); now treated as `None`.
+- FOV sweep emitted values above π when `fov_max_error_rad` was large, each costing a full pattern search that could only be rejected later.
+- `asin` arguments at the pole are clamped in `wcs_refine` (f32 rotation rows can round past ±1).
+- Python: `calibrate_camera([res], [cents], ...)` (one-element list form) raised `TypeError`; `calibrate_camera` with zero image dimensions returned a model that could not be unpickled — both now behave like the single/solve forms.
+- Docs: `CentroidExtractionConfig::max_elongation` default is `Some(3.0)`, not `None`.
+
+### Changed
+
+- Single- and multi-image calibration share one pooled fitter (`fit::fit_pooled`); the legacy `fit_polynomial_distortion` / `fit_radial_distortion` path is removed (crate-private; results unchanged).
+- The CCL and fast centroiders share the region extent/border gate and the sharpness/refine/assembly tail (bit-identical output).
+
 ## 0.10.0
 
 Robustness sweep: validate at every trust boundary (file load, pickle,
