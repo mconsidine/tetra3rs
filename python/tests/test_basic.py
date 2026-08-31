@@ -474,6 +474,48 @@ class TestExtractCentroids:
         # Same values in → same centroid position out.
         assert abs(r_native.centroids[0].x - r_big.centroids[0].x) < 1e-4
 
+    @pytest.mark.parametrize(
+        "extract",
+        [tetra3rs.extract_centroids, tetra3rs.extract_centroids_fast],
+        ids=["ccl", "fast"],
+    )
+    def test_layout_and_dtype_give_identical_centroids(self, extract):
+        """C-contiguous input takes a slice fast path; strided views and
+        other dtypes must produce bit-identical centroids."""
+        h, w = 256, 320
+        rng = np.random.default_rng(7)
+        image = rng.normal(500, 8, (h, w))
+        yy, xx = np.mgrid[0:h, 0:w]
+        for cy, cx in [(40, 60), (120, 200), (200, 90), (180, 280)]:
+            image += 20000 * np.exp(
+                -((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * 1.8**2)
+            )
+        u16 = np.ascontiguousarray(np.clip(image, 0, 65535).astype(np.uint16))
+        assert u16.flags.c_contiguous
+
+        def key(img):
+            r = extract(img, sigma_threshold=5.0, max_centroids=20)
+            assert len(r.centroids) >= 3
+            return [(c.x, c.y, c.brightness) for c in r.centroids]
+
+        ref = key(u16)
+        # Same pixels, non-contiguous layouts (strided fallback path).
+        fortran = np.asfortranarray(u16)
+        assert not fortran.flags.c_contiguous
+        assert key(fortran) == ref
+        padded = np.zeros((h, w + 8), dtype=np.uint16)
+        padded[:, 4 : 4 + w] = u16
+        window = padded[:, 4 : 4 + w]  # row stride != w: not contiguous
+        assert not window.flags.c_contiguous
+        assert key(window) == ref
+        # Same pixels, other dtypes (each exactly representable in f32).
+        for dtype in (np.int16, np.float32, np.float64):
+            assert key(u16.astype(dtype)) == ref, dtype
+        # A step-sliced view vs. its contiguous copy.
+        view = u16[::2, ::2]
+        assert not view.flags.c_contiguous
+        assert key(view) == key(np.ascontiguousarray(view))
+
     def test_fast_result_pickle_and_drop_in(self):
         """Fast path returns a pickleable ExtractionResult with usable centroids."""
         h, w = 64, 64

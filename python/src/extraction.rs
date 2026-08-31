@@ -34,6 +34,39 @@ impl From<CentroidExtractionResult> for ExtractionData {
     }
 }
 
+/// A numpy element type accepted as an image pixel.
+trait Pixel: numpy::Element + Copy {
+    fn to_f32(self) -> f32;
+
+    /// Convert a contiguous run of pixels. Default is the element-wise cast;
+    /// `f32` overrides it with a plain memcpy.
+    fn slice_to_f32(s: &[Self]) -> Vec<f32> {
+        s.iter().map(|&v| v.to_f32()).collect()
+    }
+}
+
+macro_rules! impl_pixel_as_f32 {
+    ($($t:ty),*) => {$(
+        impl Pixel for $t {
+            #[inline]
+            fn to_f32(self) -> f32 {
+                self as f32
+            }
+        }
+    )*};
+}
+impl_pixel_as_f32!(f64, u8, u16, i16);
+
+impl Pixel for f32 {
+    #[inline]
+    fn to_f32(self) -> f32 {
+        self
+    }
+    fn slice_to_f32(s: &[f32]) -> Vec<f32> {
+        s.to_vec()
+    }
+}
+
 /// Convert a 2D numpy array of any supported dtype to Vec<f32>.
 ///
 /// Supported dtypes: float64, float32, uint8, uint16, int16. Non-native byte
@@ -70,23 +103,29 @@ fn image_to_f32(image: &Bound<'_, pyo3::PyAny>) -> PyResult<(Vec<f32>, u32, u32)
     let itemsize: usize = dtype.getattr("itemsize")?.extract()?;
 
     /// Extract one supported dtype and convert element-wise to f32.
-    fn arr_to_f32<T: numpy::Element + Copy>(
-        image: &Bound<'_, pyo3::PyAny>,
-        to_f32: impl Fn(T) -> f32,
-    ) -> PyResult<(Vec<f32>, u32, u32)> {
+    ///
+    /// A C-contiguous array converts straight from its flat slice (~5x cheaper
+    /// than ndarray's generic strided iterator on a 2048² frame); any other
+    /// layout (Fortran order, negative/step strides) takes the strided path.
+    /// Both produce identical values.
+    fn arr_to_f32<T: Pixel>(image: &Bound<'_, pyo3::PyAny>) -> PyResult<(Vec<f32>, u32, u32)> {
         let arr: PyReadonlyArray2<T> = image.extract()?;
         let a = arr.as_array();
         let h = a.shape()[0] as u32;
         let w = a.shape()[1] as u32;
-        Ok((a.iter().map(|&v| to_f32(v)).collect(), w, h))
+        let pixels = match a.as_slice() {
+            Some(s) => T::slice_to_f32(s),
+            None => a.iter().map(|&v| v.to_f32()).collect(),
+        };
+        Ok((pixels, w, h))
     }
 
     match (kind.as_str(), itemsize) {
-        ("f", 8) => arr_to_f32::<f64>(image, |v| v as f32),
-        ("f", 4) => arr_to_f32::<f32>(image, |v| v),
-        ("u", 1) => arr_to_f32::<u8>(image, |v| v as f32),
-        ("u", 2) => arr_to_f32::<u16>(image, |v| v as f32),
-        ("i", 2) => arr_to_f32::<i16>(image, |v| v as f32),
+        ("f", 8) => arr_to_f32::<f64>(image),
+        ("f", 4) => arr_to_f32::<f32>(image),
+        ("u", 1) => arr_to_f32::<u8>(image),
+        ("u", 2) => arr_to_f32::<u16>(image),
+        ("i", 2) => arr_to_f32::<i16>(image),
         _ => {
             let dtype_str: String = dtype.str()?.extract()?;
             Err(pyo3::exceptions::PyTypeError::new_err(format!(
