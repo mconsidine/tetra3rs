@@ -605,6 +605,11 @@ impl BackgroundGrid {
         self.stride
     }
 
+    /// Number of grid columns — the length [`Self::blend_row`] expects.
+    pub(super) fn grid_width(&self) -> usize {
+        self.nx
+    }
+
     /// Representative background level: the midpoint of the block medians.
     pub(super) fn level(&self) -> f32 {
         midpoint_f32(&mut self.grid.clone())

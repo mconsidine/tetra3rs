@@ -96,35 +96,40 @@ pub(super) fn extract_from_gray(
 
         // Fused residual pass (rows in parallel under the `parallel` feature;
         // each row writes disjoint output, results independent of threads).
+        // The bilinear surface is evaluated per row as `blend_row` +
+        // `blend_columns` — the same expression and operation order as
+        // `value_at`, with the per-pixel divide / floor / clamp hoisted into
+        // the grid's column plan — so the residuals are bit-identical to the
+        // per-pixel form.
+        let nx = bg.grid_width();
         let mut clamped = vec![0.0_f32; w * h];
         if filter_sigma.is_some() {
             let mut unclamped = vec![0.0_f32; w * h];
             par::for_each_chunk_pair_mut(&mut clamped, &mut unclamped, w, |y, cr, ur| {
-                let rp = bg.row_params(y);
-                let row = y * w;
-                for x in 0..w {
+                let mut row_blend = vec![0.0_f32; nx];
+                bg.blend_row(bg.row_params(y), &mut row_blend);
+                // Surface into `ur`, then residuals in place.
+                bg.blend_columns(&row_blend, ur, |v| v);
+                let src = &gray_input[y * w..(y + 1) * w];
+                for ((c, u), &p) in cr.iter_mut().zip(ur.iter_mut()).zip(src) {
                     // Non-finite pixels (dead/hot columns, NaN padding) are
                     // treated as background: `inf.max(0.0)` is `inf`, and one
                     // such pixel otherwise becomes a NaN centroid ranked first.
-                    let p = gray_input[row + x];
-                    let r = if p.is_finite() {
-                        p - bg.value_at(x, rp)
-                    } else {
-                        0.0
-                    };
-                    cr[x] = r.max(0.0);
-                    ur[x] = r;
+                    let r = if p.is_finite() { p - *u } else { 0.0 };
+                    *c = r.max(0.0);
+                    *u = r;
                 }
             });
             filter_input = Some(DynMatrix::from_vec(w, h, unclamped));
         } else {
             par::for_each_chunk_mut(&mut clamped, w, |y, cr| {
-                let rp = bg.row_params(y);
-                let row = y * w;
-                for (x, out) in cr.iter_mut().enumerate() {
-                    let p = gray_input[row + x];
-                    *out = if p.is_finite() {
-                        (p - bg.value_at(x, rp)).max(0.0)
+                let mut row_blend = vec![0.0_f32; nx];
+                bg.blend_row(bg.row_params(y), &mut row_blend);
+                bg.blend_columns(&row_blend, cr, |v| v);
+                let src = &gray_input[y * w..(y + 1) * w];
+                for (c, &p) in cr.iter_mut().zip(src) {
+                    *c = if p.is_finite() {
+                        (p - *c).max(0.0)
                     } else {
                         0.0
                     };
