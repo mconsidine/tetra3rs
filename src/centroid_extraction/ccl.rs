@@ -180,16 +180,19 @@ pub(super) fn extract_from_gray(
             bg_mean + config.sigma_threshold * bg_sigma,
         ),
     };
-    let thresh_src: &[f32] = &thresh_src;
 
-    // ── Step 4: threshold into runs and group into regions ──
-    // The run-length union-find core replaces the u8 mask + u32 labels
-    // buffers of the old generic connected-component labeling; downstream
-    // stages iterate each region's run list instead of testing labels, and
-    // the annulus's "not in any blob" test becomes
-    // `thresh_src[i] <= mask_threshold` (equivalent: every lit pixel was in
-    // some region). 8-connectivity is inherent to the run merging.
-    let regions = runs::sweep_runs(w, h, |r, c| thresh_src[r * w + c] > mask_threshold);
+    // ── Step 4: threshold into a bit mask, sweep into runs and regions ──
+    // The thresholded image is packed one row at a time into a 1-bit-per-
+    // pixel mask (`thresh_src[i] > mask_threshold`), and the run-length
+    // union-find core reads runs straight off the words, so the sweep costs
+    // runs rather than pixels. Downstream stages iterate each region's run
+    // list; the annulus's "not in any blob" test is a bit test on the same
+    // mask (equivalent: every lit pixel was in some region). 8-connectivity
+    // is inherent to the run merging. The filtered image is released here —
+    // nothing downstream reads it.
+    let (mask, words_per_row) = threshold_to_mask(&thresh_src, w, h, mask_threshold);
+    drop(thresh_src);
+    let regions = runs::sweep_runs_mask(w, h, words_per_row, &mask);
 
     // ── Step 5: compute centroids ──
     // Origin at the geometric image center, (W-1)/2 and (H-1)/2 (pixel centers
@@ -201,8 +204,7 @@ pub(super) fn extract_from_gray(
     let mut centroids = compute_blob_centroids(
         gray,
         gray_input,
-        thresh_src,
-        mask_threshold,
+        (&mask, words_per_row),
         &regions,
         (w, h),
         (cx, cy),
@@ -224,6 +226,24 @@ pub(super) fn extract_from_gray(
         threshold: mask_threshold,
         num_blobs_raw,
     })
+}
+
+/// Pack `src > thr` into a 1-bit-per-pixel mask, `words_per_row =
+/// ⌈w/64⌉` `u64`s per image row (returned with the mask; padding bits are
+/// zero). Rows are packed in independent 16-row chunks — multi-threaded
+/// under the `parallel` feature — with [`runs::pack_above_row`], so the mask
+/// is identical either way.
+fn threshold_to_mask(src: &[f32], w: usize, h: usize, thr: f32) -> (Vec<u64>, usize) {
+    const ROWS_PER_CHUNK: usize = 16;
+    let words_per_row = w.div_ceil(64);
+    let mut mask = vec![0u64; words_per_row * h];
+    par::for_each_chunk_mut(&mut mask, words_per_row * ROWS_PER_CHUNK, |ci, chunk| {
+        for (i, words) in chunk.chunks_exact_mut(words_per_row).enumerate() {
+            let r = ci * ROWS_PER_CHUNK + i;
+            runs::pack_above_row(&src[r * w..(r + 1) * w], thr, words);
+        }
+    });
+    (mask, words_per_row)
 }
 
 /// Background-subtracted residuals at the block subsample lattice (the same
@@ -335,7 +355,7 @@ pub(super) fn estimate_background(
 
 /// Compute intensity-weighted centroids for each connected region.
 ///
-/// Consumes the run-length regions from [`runs::sweep_runs`]; each stage
+/// Consumes the run-length regions from [`runs::sweep_runs_mask`]; each stage
 /// iterates the region's run list (row-major, so accumulation order matches
 /// the historical bbox-scan order exactly). For each blob that passes size
 /// and elongation filters:
@@ -368,8 +388,7 @@ pub(super) fn estimate_background(
 fn compute_blob_centroids(
     gray: &[f32],
     raw: &[f32],
-    thresh_src: &[f32],
-    mask_threshold: f32,
+    (mask, words_per_row): (&[u64], usize),
     regions: &runs::RunRegions,
     (w, h): (usize, usize),
     (cx, cy): (f32, f32),
@@ -407,7 +426,7 @@ fn compute_blob_centroids(
 
         // --- Per-blob local background from annulus ---
         // Expand bounding box by margin, collect pixels that are not part of
-        // *any* region (below the detection threshold — every lit pixel was
+        // *any* region (not lit in the detection mask — every lit pixel was
         // grouped into some region).
         const ANNULUS_MARGIN: usize = 5;
         let r0 = min_row.saturating_sub(ANNULUS_MARGIN);
@@ -417,11 +436,11 @@ fn compute_blob_centroids(
 
         annulus_vals.clear();
         for r in r0..r1 {
-            let row_off = r * w;
+            let row = &gray[r * w..(r + 1) * w];
+            let bits = &mask[r * words_per_row..(r + 1) * words_per_row];
             for c in c0..c1 {
-                let i = row_off + c;
-                if thresh_src[i] <= mask_threshold {
-                    annulus_vals.push(gray[i]);
+                if (bits[c / 64] >> (c % 64)) & 1 == 0 {
+                    annulus_vals.push(row[c]);
                 }
             }
         }

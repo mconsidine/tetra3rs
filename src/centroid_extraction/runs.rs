@@ -1,10 +1,11 @@
 //! Run-length connected-region core shared by both extraction paths.
 //!
-//! A single raster sweep turns an arbitrary per-pixel `lit` predicate
-//! ([`sweep_runs`]) — or a packed detection bit mask ([`sweep_runs_mask`]),
-//! where work scales with the number of runs rather than pixels — into
-//! horizontal runs, merging 8-connected runs across rows with union-find.
-//! Both produce identical [`RunRegions`] for the same lit set.
+//! A single raster sweep turns a packed detection bit mask
+//! ([`sweep_runs_mask`]) — where work scales with the number of runs rather
+//! than pixels — into horizontal runs, merging 8-connected runs across rows
+//! with union-find. The pixel-by-pixel predicate form ([`sweep_runs`]) is
+//! kept as the test reference; both produce identical [`RunRegions`] for
+//! the same lit set.
 //! Region payloads live with the callers: the fast path computes moments
 //! from the run lists in a post-pass (lit pixels are ≪1% of the image, so
 //! the second touch is nearly free), while the quality path runs its
@@ -12,6 +13,9 @@
 //! mask → labels connected-component labeling, which materialized a u8 mask
 //! and a u32 labels buffer (~10 MB at 2 Mpix) and required a per-pixel label
 //! test in every downstream stage.
+//!
+//! The row packers ([`pack_lit_row`], [`pack_above_row`]) build that bit mask
+//! one image row at a time with a vectorizable compare and a byte→bit fold.
 
 /// A horizontal run of lit pixels: columns `c0..=c1` of `row`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,10 +113,13 @@ impl RunRegions {
     }
 }
 
-/// Run-length 8-connected labeling over `lit(row, col)`.
+/// Run-length 8-connected labeling over `lit(row, col)` — the pixel-by-pixel
+/// reference that [`sweep_runs_mask`] (and its banded variant) is tested
+/// against; both extraction paths use the mask form.
 ///
 /// The predicate is called exactly once per pixel in raster order, so callers
 /// may keep per-row state inside the closure (e.g. a row-blended background).
+#[cfg(test)]
 pub(super) fn sweep_runs(
     w: usize,
     h: usize,
@@ -155,27 +162,55 @@ pub(super) fn sweep_runs_mask(
     words_per_row: usize,
     mask: &[u64],
 ) -> RunRegions {
-    let n_words = w.div_ceil(64);
-    assert!(
-        words_per_row >= n_words && mask.len() >= words_per_row * h,
-        "bit mask too small for a {w}x{h} image ({words_per_row} words/row, {} words)",
-        mask.len()
-    );
-    // Clears the padding bits of a row's last word (no-op when 64 | w).
-    let tail_mask = if w.is_multiple_of(64) {
-        u64::MAX
-    } else {
-        (1u64 << (w % 64)) - 1
-    };
-
+    let geom = MaskGeometry::new(w, h, words_per_row, mask.len());
     let mut sweep = Sweep::new();
     for (r, row) in mask.chunks_exact(words_per_row).take(h).enumerate() {
+        geom.push_row(&mut sweep, r, row);
+        sweep.end_row();
+    }
+    sweep.finish()
+}
+
+/// Per-image constants of a packed mask: the words that hold real columns
+/// and the mask that clears a row's padding bits (see [`sweep_runs_mask`]).
+#[derive(Clone, Copy)]
+struct MaskGeometry {
+    w: usize,
+    n_words: usize,
+    tail_mask: u64,
+}
+
+impl MaskGeometry {
+    fn new(w: usize, h: usize, words_per_row: usize, mask_len: usize) -> Self {
+        let n_words = w.div_ceil(64);
+        assert!(
+            words_per_row >= n_words && mask_len >= words_per_row * h,
+            "bit mask too small for a {w}x{h} image ({words_per_row} words/row, {mask_len} words)"
+        );
+        // Clears the padding bits of a row's last word (no-op when 64 | w).
+        let tail_mask = if w.is_multiple_of(64) {
+            u64::MAX
+        } else {
+            (1u64 << (w % 64)) - 1
+        };
+        Self {
+            w,
+            n_words,
+            tail_mask,
+        }
+    }
+
+    /// Push the runs of mask row `r` (its `words_per_row` words, of which
+    /// the first `n_words` are read) onto `sweep`, left to right.
+    #[inline]
+    fn push_row(&self, sweep: &mut Sweep, r: usize, row: &[u64]) {
+        let n_words = self.n_words;
         // Start column of a run that reached the top bit of the previous word.
         let mut open: Option<usize> = None;
         for (wi, &word) in row[..n_words].iter().enumerate() {
             let base = wi * 64;
             let mut bits = if wi + 1 == n_words {
-                word & tail_mask
+                word & self.tail_mask
             } else {
                 word
             };
@@ -207,11 +242,61 @@ pub(super) fn sweep_runs_mask(
             }
         }
         if let Some(s) = open {
-            sweep.push_run(r, s, w - 1);
+            sweep.push_run(r, s, self.w - 1);
         }
-        sweep.end_row();
     }
-    sweep.finish()
+}
+
+/// Pack one image row's detection mask: bit `c % 64` of `words[c / 64]` is
+/// set when `row[c]` is finite and exceeds `thr[c]`. `(p > t) & (p < +∞)` is
+/// exactly `p.is_finite() && p > t` (NaN fails both compares, −∞ fails the
+/// first, +∞ the second) but branch-free: the compares fill a 64-byte
+/// scratch (a vectorizable loop), then each 8 bytes fold to 8 bits with the
+/// multiply-shift trick. Padding bits at or beyond `row.len()` are zero.
+#[inline]
+pub(super) fn pack_lit_row(row: &[f32], thr: &[f32], words: &mut [u64]) {
+    debug_assert_eq!(row.len(), thr.len());
+    debug_assert_eq!(words.len(), row.len().div_ceil(64));
+    for (wi, word) in words.iter_mut().enumerate() {
+        let c0 = wi * 64;
+        let c1 = (c0 + 64).min(row.len());
+        let mut bytes = [0u8; 64];
+        for ((m, &p), &t) in bytes.iter_mut().zip(&row[c0..c1]).zip(&thr[c0..c1]) {
+            *m = ((p > t) & (p < f32::INFINITY)) as u8;
+        }
+        *word = pack_bytes(&bytes);
+    }
+}
+
+/// Pack one image row against a single threshold: bit `c % 64` of
+/// `words[c / 64]` is set exactly when `row[c] > thr` (the plain `>`
+/// predicate — a NaN is never lit, `+∞` always is). Same packing as
+/// [`pack_lit_row`]; padding bits are zero.
+#[inline]
+pub(super) fn pack_above_row(row: &[f32], thr: f32, words: &mut [u64]) {
+    debug_assert_eq!(words.len(), row.len().div_ceil(64));
+    for (wi, word) in words.iter_mut().enumerate() {
+        let c0 = wi * 64;
+        let c1 = (c0 + 64).min(row.len());
+        let mut bytes = [0u8; 64];
+        for (m, &p) in bytes.iter_mut().zip(&row[c0..c1]) {
+            *m = (p > thr) as u8;
+        }
+        *word = pack_bytes(&bytes);
+    }
+}
+
+/// Fold 64 bytes, each 0 or 1, into a u64 with byte `i` → bit `i`.
+#[inline]
+fn pack_bytes(bytes: &[u8; 64]) -> u64 {
+    let mut acc = 0u64;
+    for (k, chunk) in bytes.as_chunks::<8>().0.iter().enumerate() {
+        let x = u64::from_le_bytes(*chunk);
+        // Each byte is 0 or 1; the multiply gathers the low bit of each
+        // byte into the top byte, lowest byte → lowest bit.
+        acc |= (x.wrapping_mul(0x0102_0408_1020_4080) >> 56) << (8 * k);
+    }
+    acc
 }
 
 /// Union-find state shared by the sweeps: one provisional label per run
@@ -486,5 +571,61 @@ mod tests {
                 assert_same(&a, &c);
             }
         }
+    }
+    #[test]
+    fn test_pack_lit_row_matches_predicate() {
+        let w = 2136usize; // not a multiple of 64
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let thr: Vec<f32> = (0..w).map(|c| c as f32 * 0.5).collect();
+        let mut row: Vec<f32> = (0..w)
+            .map(|c| c as f32 * 0.5 + (next() % 5) as f32 - 2.0)
+            .collect();
+        // Non-finite values must never be lit, whatever the threshold.
+        row[3] = f32::NAN;
+        row[64] = f32::INFINITY;
+        row[65] = f32::NEG_INFINITY;
+        row[w - 1] = f32::INFINITY;
+        let mut words = vec![u64::MAX; w.div_ceil(64)];
+        pack_lit_row(&row, &thr, &mut words);
+        for c in 0..w {
+            let expect = row[c].is_finite() && row[c] > thr[c];
+            let got = words[c / 64] >> (c % 64) & 1 == 1;
+            assert_eq!(got, expect, "column {c}");
+        }
+        // Padding bits are zero.
+        assert_eq!(words[w / 64] >> (w % 64), 0);
+    }
+
+    #[test]
+    fn test_pack_above_row_matches_predicate() {
+        let w = 2136usize;
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let thr = 2.0_f32;
+        let mut row: Vec<f32> = (0..w).map(|_| (next() % 5) as f32).collect();
+        // Plain `>`: NaN never lit, +inf lit, -inf not.
+        row[3] = f32::NAN;
+        row[64] = f32::INFINITY;
+        row[65] = f32::NEG_INFINITY;
+        row[w - 1] = f32::INFINITY;
+        let mut words = vec![u64::MAX; w.div_ceil(64)];
+        pack_above_row(&row, thr, &mut words);
+        for c in 0..w {
+            let expect = row[c] > thr;
+            let got = words[c / 64] >> (c % 64) & 1 == 1;
+            assert_eq!(got, expect, "column {c}");
+        }
+        assert_eq!(words[w / 64] >> (w % 64), 0);
     }
 }
