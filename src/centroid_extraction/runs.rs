@@ -17,6 +17,8 @@
 //! The row packers ([`pack_lit_row`], [`pack_above_row`]) build that bit mask
 //! one image row at a time with a vectorizable compare and a byte→bit fold.
 
+use super::par;
+
 /// A horizontal run of lit pixels: columns `c0..=c1` of `row`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Run {
@@ -169,6 +171,76 @@ pub(super) fn sweep_runs_mask(
         sweep.end_row();
     }
     sweep.finish()
+}
+
+/// [`sweep_runs_mask`] with the rows labeled in independent bands of
+/// `band_rows` rows (one task per band — multi-threaded under the `parallel`
+/// feature), then stitched: the bands' run lists are concatenated in row
+/// order with their provisional labels offset, each band's first row is
+/// merged with its predecessor's last row exactly as consecutive rows are
+/// inside a band, and the shared root-compaction pass assigns region ids.
+/// The runs are the same row-major list, the union-find partition is the
+/// same set of connected components, and ids are assigned in first-
+/// appearance order over that list — so the result is identical to
+/// [`sweep_runs_mask`] regardless of `band_rows` or thread count.
+///
+/// The CCL path uses it under `parallel`; the sequential build keeps the
+/// plain sweep (the function stays compiled so its tests run in both).
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub(super) fn sweep_runs_mask_banded(
+    w: usize,
+    h: usize,
+    words_per_row: usize,
+    mask: &[u64],
+    band_rows: usize,
+) -> RunRegions {
+    let geom = MaskGeometry::new(w, h, words_per_row, mask.len());
+    let band_rows = band_rows.max(1);
+    let n_bands = h.div_ceil(band_rows);
+
+    /// One band's labeling: its `Sweep` (runs, local parents, `prev` = last
+    /// row's runs) plus the runs of its first row.
+    struct Band {
+        sweep: Sweep,
+        first: Vec<(u32, u32, u32)>,
+    }
+    let bands: Vec<Band> = par::map_indices(n_bands, |b| {
+        let y0 = b * band_rows;
+        let y1 = (y0 + band_rows).min(h);
+        let mut sweep = Sweep::new();
+        let mut first = Vec::new();
+        for r in y0..y1 {
+            geom.push_row(
+                &mut sweep,
+                r,
+                &mask[r * words_per_row..(r + 1) * words_per_row],
+            );
+            if r == y0 {
+                first = sweep.cur.clone();
+            }
+            sweep.end_row();
+        }
+        Band { sweep, first }
+    });
+
+    // Concatenate (run order stays row-major) with labels offset by each
+    // band's first global run index, stitching every band boundary.
+    let total: usize = bands.iter().map(|b| b.sweep.runs.len()).sum();
+    let mut all = Sweep::new();
+    all.runs.reserve_exact(total);
+    all.parents.reserve_exact(total);
+    let mut prev_last: Vec<(u32, u32, u32)> = Vec::new();
+    for band in bands {
+        let off = all.runs.len() as u32;
+        let offset = |&(c0, c1, l): &(u32, u32, u32)| (c0, c1, l + off);
+        all.runs.extend_from_slice(&band.sweep.runs);
+        all.parents
+            .extend(band.sweep.parents.iter().map(|&p| p + off));
+        let first: Vec<_> = band.first.iter().map(offset).collect();
+        merge_rows(&mut all.parents, &first, &prev_last);
+        prev_last = band.sweep.prev.iter().map(offset).collect();
+    }
+    all.finish()
 }
 
 /// Per-image constants of a packed mask: the words that hold real columns
@@ -567,9 +639,40 @@ mod tests {
                 assert_same(&a, &b);
                 // Padding words beyond `w.div_ceil(64)` are ignored too.
                 let wpr = w.div_ceil(64) + 2;
-                let c = sweep_runs_mask(w, h, wpr, &pack(&mask, wpr));
+                let packed = pack(&mask, wpr);
+                let c = sweep_runs_mask(w, h, wpr, &packed);
                 assert_same(&a, &c);
+                // Banded labeling is identical for every band height,
+                // including bands that split the image unevenly (h not a
+                // multiple of the band), single-row bands, and one band.
+                for band_rows in [1usize, 2, 3, 7, 16, 64, h, h + 5] {
+                    let d = sweep_runs_mask_banded(w, h, wpr, &packed, band_rows);
+                    assert_same(&a, &d);
+                }
             }
+        }
+    }
+
+    #[test]
+    fn test_sweep_runs_mask_banded_stitches_boundaries() {
+        // Regions that cross band boundaries: a vertical bar through every
+        // band, a diagonal staircase (8-connected only through the corner
+        // touch at each boundary), and a bar that ends exactly at a boundary.
+        let (w, h) = (70usize, 20usize);
+        let rows: Vec<Vec<u8>> = (0..h)
+            .map(|r| {
+                (0..w)
+                    .map(|c| (c == 5 || c == 20 + r || (c == 60 && r < 8)) as u8)
+                    .collect()
+            })
+            .collect();
+        let mask: Vec<&[u8]> = rows.iter().map(|r| r.as_slice()).collect();
+        let a = regions_of(&mask);
+        assert_eq!(a.n_regions, 3);
+        let wpr = w.div_ceil(64);
+        let packed = pack(&mask, wpr);
+        for band_rows in [1usize, 2, 4, 8, 9, 20, 32] {
+            assert_same(&a, &sweep_runs_mask_banded(w, h, wpr, &packed, band_rows));
         }
     }
     #[test]

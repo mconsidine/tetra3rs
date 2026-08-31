@@ -192,6 +192,11 @@ pub(super) fn extract_from_gray(
     // nothing downstream reads it.
     let (mask, words_per_row) = threshold_to_mask(&thresh_src, w, h, mask_threshold);
     drop(thresh_src);
+    // Under `parallel` the rows are labeled in 64-row bands (one task each)
+    // and stitched — the same `RunRegions` as the sequential sweep.
+    #[cfg(feature = "parallel")]
+    let regions = runs::sweep_runs_mask_banded(w, h, words_per_row, &mask, 64);
+    #[cfg(not(feature = "parallel"))]
     let regions = runs::sweep_runs_mask(w, h, words_per_row, &mask);
 
     // ── Step 5: compute centroids ──
