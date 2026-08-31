@@ -368,12 +368,12 @@ fn check_pixel_len(len: usize, width: u32, height: u32) -> Result<()> {
 /// fixed output slot, so results are independent of thread count and the
 /// non-`parallel` build is bit-identical to the original sequential code.
 ///
-/// Scope is deliberately narrow. Profiling (`smrecording.fits`, 2.1 Mpix) shows
-/// `estimate_local_background` is ~60% of extraction wall-clock; the per-blob
-/// centroid loop is ~2% and connected-component labeling lives in numeris and
-/// is sequential there, so neither is parallelized here. The fast path
-/// parallelizes its background grid (one task per block row) and its
-/// detection bit mask (16-row chunks); its run sweep stays sequential.
+/// Both paths parallelize their background grid (one task per block row)
+/// and their detection bit mask (16-row chunks). The CCL path additionally
+/// runs its residual pass by rows, its run sweep in 64-row bands, and its
+/// per-region annulus / moment / deblend stage as one task per region
+/// (`map_indices_init`, order preserved by index); the fast path's run
+/// sweep stays sequential.
 pub(super) mod par {
     #[cfg(feature = "parallel")]
     use rayon::prelude::*;
@@ -393,6 +393,30 @@ pub(super) mod par {
         F: Fn(usize) -> T,
     {
         (0..n).map(f).collect()
+    }
+
+    /// Map `f(&mut state, i)` over `0..n` into a `Vec`, preserving index
+    /// order. `state` is created by `init` once per worker (once in total
+    /// without the feature) and reused across the indices that worker
+    /// handles — scratch buffers for a per-item body. `f` must not let its
+    /// result depend on what `state` held from earlier indices.
+    #[cfg(feature = "parallel")]
+    pub fn map_indices_init<S, T, I, F>(n: usize, init: I, f: F) -> Vec<T>
+    where
+        T: Send,
+        I: Fn() -> S + Sync + Send,
+        F: Fn(&mut S, usize) -> T + Sync + Send,
+    {
+        (0..n).into_par_iter().map_init(init, f).collect()
+    }
+    #[cfg(not(feature = "parallel"))]
+    pub fn map_indices_init<S, T, I, F>(n: usize, init: I, mut f: F) -> Vec<T>
+    where
+        I: FnOnce() -> S,
+        F: FnMut(&mut S, usize) -> T,
+    {
+        let mut state = init();
+        (0..n).map(|i| f(&mut state, i)).collect()
     }
 
     /// Apply `f(i, chunk)` to each disjoint `chunk_len`-sized chunk of `buf`

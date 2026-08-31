@@ -386,10 +386,11 @@ pub(super) fn estimate_background(
 /// halos, etc. — which destabilizes downstream calibration on dense fields
 /// like TESS).
 ///
-/// This loop is ~2% of extraction wall-clock, so it is left sequential even
-/// under the `parallel` feature — the threading overhead would not pay off and
-/// keeps the two builds bit-identical here.
-#[allow(clippy::too_many_arguments)]
+/// On dense fields (thousands of blobs) this stage is a third or more of
+/// extraction wall-clock, so under the `parallel` feature regions are
+/// processed as independent tasks: every region reads only shared inputs
+/// and writes its own `Option<Centroid>` slot, and the results are collected
+/// in region order, so the output is identical to the sequential loop.
 fn compute_blob_centroids(
     gray: &[f32],
     raw: &[f32],
@@ -400,23 +401,80 @@ fn compute_blob_centroids(
     config: &CentroidExtractionConfig,
 ) -> Vec<Centroid> {
     let (offsets, order) = regions.group_by_region();
+    let ctx = BlobContext {
+        gray,
+        raw,
+        mask,
+        words_per_row,
+        regions,
+        offsets: &offsets,
+        order: &order,
+        w,
+        h,
+        cx,
+        cy,
+        config,
+    };
+    let per_region = par::map_indices_init(regions.n_regions, BlobScratch::default, |s, k| {
+        ctx.region_centroid(k, s)
+    });
+    per_region.into_iter().flatten().collect()
+}
 
-    // Reused across blobs to avoid a fresh allocation per region (dense
-    // fields can have thousands).
-    let mut annulus_vals: Vec<f32> = Vec::new();
-    let mut maxima: Vec<(f32, usize, usize)> = Vec::new();
-    let mut kept: Vec<(usize, usize)> = Vec::new();
-    let mut out: Vec<Centroid> = Vec::new();
+/// Read-only inputs shared by every region of one extraction.
+struct BlobContext<'a> {
+    /// Measurement image (clamped residuals, or the raw image without local
+    /// background).
+    gray: &'a [f32],
+    /// Raw sensor image (saturation is judged on it).
+    raw: &'a [f32],
+    /// Detection bit mask and its words per row (see `threshold_to_mask`).
+    mask: &'a [u64],
+    words_per_row: usize,
+    regions: &'a runs::RunRegions,
+    /// `group_by_region` output: region `k`'s runs are
+    /// `order[offsets[k]..offsets[k + 1]]`.
+    offsets: &'a [u32],
+    order: &'a [u32],
+    w: usize,
+    h: usize,
+    /// Pixel coordinates of the output origin.
+    cx: f32,
+    cy: f32,
+    config: &'a CentroidExtractionConfig,
+}
 
-    'region: for k in 0..regions.n_regions {
-        let region_runs = &order[offsets[k] as usize..offsets[k + 1] as usize];
+/// Buffers reused across the regions one worker handles (dense fields have
+/// thousands; a fresh allocation per region would dominate).
+#[derive(Default)]
+struct BlobScratch {
+    annulus_vals: Vec<f32>,
+    maxima: Vec<(f32, usize, usize)>,
+    kept: Vec<(usize, usize)>,
+}
+
+impl BlobContext<'_> {
+    /// The centroid of region `k`, or `None` when a filter rejects it.
+    fn region_centroid(&self, k: usize, scratch: &mut BlobScratch) -> Option<Centroid> {
+        let Self {
+            gray,
+            raw,
+            mask,
+            words_per_row,
+            regions,
+            w,
+            h,
+            config,
+            ..
+        } = *self;
+        let region_runs = &self.order[self.offsets[k] as usize..self.offsets[k + 1] as usize];
         let extent = regions.extent(region_runs);
         let pixel_count = extent.npix;
         if pixel_count < config.min_pixels || pixel_count > config.max_pixels {
-            continue;
+            return None;
         }
         if !extent.clear_of_border(config.border_margin as usize, w, h) {
-            continue;
+            return None;
         }
         let (min_row, max_row, min_col, max_col) = (
             extent.min_row,
@@ -438,20 +496,18 @@ fn compute_blob_centroids(
         let r1 = (max_row + ANNULUS_MARGIN + 1).min(h);
         let c0 = min_col.saturating_sub(ANNULUS_MARGIN);
         let c1 = (max_col + ANNULUS_MARGIN + 1).min(w);
-
-        annulus_vals.clear();
-        for r in r0..r1 {
-            let row = &gray[r * w..(r + 1) * w];
-            let bits = &mask[r * words_per_row..(r + 1) * words_per_row];
-            for c in c0..c1 {
-                if (bits[c / 64] >> (c % 64)) & 1 == 0 {
-                    annulus_vals.push(row[c]);
-                }
-            }
-        }
+        let annulus_vals = &mut scratch.annulus_vals;
+        gather_unlit(
+            gray,
+            (mask, words_per_row),
+            w,
+            (r0, r1),
+            (c0, c1),
+            annulus_vals,
+        );
 
         // Median of annulus (residual local background in bg-subtracted image).
-        let local_bg = median_f32(&mut annulus_vals) as f64;
+        let local_bg = median_f32(annulus_vals) as f64;
 
         // --- Single moment pass: intensity-weighted moments with the
         // annulus-local background, tracking the peak in the same sweep ---
@@ -489,7 +545,7 @@ fn compute_blob_centroids(
         }
 
         if sum_i <= 0.0 {
-            continue;
+            return None;
         }
 
         let dx_bar = sum_x / sum_i;
@@ -504,7 +560,7 @@ fn compute_blob_centroids(
         // reported as `cov`.
         if let Some(max_elong) = config.max_elongation {
             if elongation_from_cov(cxx, cyy, cxy) > max_elong {
-                continue;
+                return None;
             }
         }
 
@@ -528,6 +584,7 @@ fn compute_blob_centroids(
         // genuinely single star).
         if config.deblend == DeblendMode::Reject && !saturated {
             let thresh = local_bg + 0.3 * (peak_val as f64 - local_bg);
+            let maxima = &mut scratch.maxima;
             maxima.clear();
             for &i in region_runs {
                 let run = regions.runs[i as usize];
@@ -561,8 +618,9 @@ fn compute_blob_centroids(
                 }
             }
             maxima.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            let kept = &mut scratch.kept;
             kept.clear();
-            for &(_, c, r) in &maxima {
+            for &(_, c, r) in maxima.iter() {
                 let distinct = kept.iter().all(|&(kc, kr)| {
                     let dx = c as f64 - kc as f64;
                     let dy = r as f64 - kr as f64;
@@ -571,7 +629,7 @@ fn compute_blob_centroids(
                 if distinct {
                     kept.push((c, r));
                     if kept.len() > 1 {
-                        continue 'region;
+                        return None;
                     }
                 }
             }
@@ -587,7 +645,7 @@ fn compute_blob_centroids(
 
         // Sharpness gate, peak refinement, and assembly are shared with the
         // fast path (see `finish_region`).
-        if let Some(c) = finish_region(
+        finish_region(
             pixel_count,
             (pc, pr),
             (w, h),
@@ -596,12 +654,102 @@ fn compute_blob_centroids(
             sum_i,
             saturated,
             config.max_sharpness,
-            (cx, cy),
+            (self.cx, self.cy),
             v,
-        ) {
-            out.push(c);
+        )
+    }
+}
+
+/// Gather into `out` (cleared first), in raster order, the `gray` values of
+/// the window rows `r0..r1` × columns `c0..c1` whose detection-mask bit is
+/// clear. Branch-free: every window value is written to the next slot and
+/// the slot index advances only for unlit pixels (`out` is sized to the
+/// window, then truncated) — a mostly-unlit annulus makes the branchy
+/// `if !lit { push }` form mispredict on every star pixel.
+fn gather_unlit(
+    gray: &[f32],
+    (mask, words_per_row): (&[u64], usize),
+    w: usize,
+    (r0, r1): (usize, usize),
+    (c0, c1): (usize, usize),
+    out: &mut Vec<f32>,
+) {
+    out.clear();
+    out.resize((r1 - r0) * (c1 - c0), 0.0);
+    let mut n = 0usize;
+    for r in r0..r1 {
+        let row = &gray[r * w + c0..r * w + c1];
+        let bits = &mask[r * words_per_row..(r + 1) * words_per_row];
+        for (i, &v) in row.iter().enumerate() {
+            let c = c0 + i;
+            let lit = (bits[c / 64] >> (c % 64)) & 1;
+            out[n] = v;
+            n += (lit == 0) as usize;
         }
     }
+    out.truncate(n);
+}
 
-    out
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gather_unlit_matches_branchy_gather() {
+        let (w, h) = (150usize, 40usize);
+        let words_per_row = w.div_ceil(64);
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let gray: Vec<f32> = (0..w * h).map(|_| (next() % 1000) as f32 * 0.25).collect();
+        for density in [0u64, 4, 32, 60, 64] {
+            let mut mask = vec![0u64; words_per_row * h];
+            for r in 0..h {
+                for c in 0..w {
+                    if next() % 64 < density {
+                        mask[r * words_per_row + c / 64] |= 1 << (c % 64);
+                    }
+                }
+                // Garbage padding bits must not matter (never indexed).
+                mask[r * words_per_row + words_per_row - 1] |= u64::MAX << (w % 64);
+            }
+            let windows = [
+                (0usize, h, 0usize, w),
+                (0, 1, 0, 1),
+                (3, 17, 60, 70),
+                (10, 11, 0, 150),
+                (5, 30, 63, 65),
+                (20, 40, 127, 150),
+            ];
+            for &(r0, r1, c0, c1) in &windows {
+                let mut expect = Vec::new();
+                for r in r0..r1 {
+                    for c in c0..c1 {
+                        if (mask[r * words_per_row + c / 64] >> (c % 64)) & 1 == 0 {
+                            expect.push(gray[r * w + c]);
+                        }
+                    }
+                }
+                let mut got = vec![1.0; 7]; // stale contents are discarded
+                gather_unlit(
+                    &gray,
+                    (&mask, words_per_row),
+                    w,
+                    (r0, r1),
+                    (c0, c1),
+                    &mut got,
+                );
+                assert_eq!(
+                    got,
+                    expect,
+                    "density {density} window {:?}",
+                    (r0, r1, c0, c1)
+                );
+            }
+        }
+    }
 }
