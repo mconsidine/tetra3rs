@@ -1,7 +1,10 @@
 //! Run-length connected-region core shared by both extraction paths.
 //!
-//! A single raster sweep turns an arbitrary per-pixel `lit` predicate into
+//! A single raster sweep turns an arbitrary per-pixel `lit` predicate
+//! ([`sweep_runs`]) — or a packed detection bit mask ([`sweep_runs_mask`]),
+//! where work scales with the number of runs rather than pixels — into
 //! horizontal runs, merging 8-connected runs across rows with union-find.
+//! Both produce identical [`RunRegions`] for the same lit set.
 //! Region payloads live with the callers: the fast path computes moments
 //! from the run lists in a post-pass (lit pixels are ≪1% of the image, so
 //! the second touch is nearly free), while the quality path runs its
@@ -11,7 +14,7 @@
 //! test in every downstream stage.
 
 /// A horizontal run of lit pixels: columns `c0..=c1` of `row`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Run {
     pub row: u32,
     pub c0: u32,
@@ -25,7 +28,7 @@ impl Run {
     }
 }
 
-/// Result of [`sweep_runs`]: the runs in creation (row-major) order, each
+/// Result of [`sweep_runs`] / [`sweep_runs_mask`]: the runs in creation (row-major) order, each
 /// run's dense region id, and the region count. Region ids are assigned in
 /// order of first appearance, so iterating regions is deterministic.
 pub(super) struct RunRegions {
@@ -115,15 +118,8 @@ pub(super) fn sweep_runs(
     h: usize,
     mut lit: impl FnMut(usize, usize) -> bool,
 ) -> RunRegions {
-    // One provisional union-find label per run; label id == run index.
-    let mut parents: Vec<u32> = Vec::new();
-    let mut runs: Vec<Run> = Vec::new();
-    // Runs of the previous / current row: (c0, c1, label).
-    let mut prev: Vec<(u32, u32, u32)> = Vec::new();
-    let mut cur: Vec<(u32, u32, u32)> = Vec::new();
-
+    let mut sweep = Sweep::new();
     for r in 0..h {
-        cur.clear();
         let mut start: Option<usize> = None;
         for c in 0..w {
             if lit(r, c) {
@@ -131,68 +127,180 @@ pub(super) fn sweep_runs(
                     start = Some(c);
                 }
             } else if let Some(s) = start.take() {
-                let label = runs.len() as u32;
-                parents.push(label);
-                runs.push(Run {
-                    row: r as u32,
-                    c0: s as u32,
-                    c1: (c - 1) as u32,
-                });
-                cur.push((s as u32, (c - 1) as u32, label));
+                sweep.push_run(r, s, c - 1);
             }
         }
         if let Some(s) = start.take() {
-            let label = runs.len() as u32;
-            parents.push(label);
-            runs.push(Run {
-                row: r as u32,
-                c0: s as u32,
-                c1: (w - 1) as u32,
-            });
-            cur.push((s as u32, (w - 1) as u32, label));
+            sweep.push_run(r, s, w - 1);
         }
+        sweep.end_row();
+    }
+    sweep.finish()
+}
 
-        // Merge current-row runs with 8-connected previous-row runs. Both
-        // lists are column-sorted, so a two-pointer sweep finds all overlaps.
-        let (mut i, mut j) = (0usize, 0usize);
-        while i < cur.len() && j < prev.len() {
-            let (cs, ce, cl) = cur[i];
-            let (ps, pe, pl) = prev[j];
-            if ce + 1 < ps {
-                i += 1; // current run ends left of (and not adjacent to) prev
-            } else if pe + 1 < cs {
-                j += 1; // prev run ends left of current
+/// Run-length 8-connected labeling over a packed bit mask.
+///
+/// `mask` holds `words_per_row` `u64` words per image row (`h` rows, row
+/// `r` at `mask[r * words_per_row..]`); column `c` is lit when bit `c % 64`
+/// of word `c / 64` is set. Bits at or beyond `w` in the last word of a row
+/// are ignored, so `w` need not be a multiple of 64. Runs are read off the
+/// words with `trailing_zeros` / `trailing_ones` (a run that reaches the top
+/// bit of a word is carried into the next), so the cost is proportional to
+/// the number of runs, not pixels. Yields exactly the [`RunRegions`] that
+/// [`sweep_runs`] gives for the same lit set — runs in row-major order,
+/// same connectivity, same first-appearance region ids.
+pub(super) fn sweep_runs_mask(
+    w: usize,
+    h: usize,
+    words_per_row: usize,
+    mask: &[u64],
+) -> RunRegions {
+    let n_words = w.div_ceil(64);
+    assert!(
+        words_per_row >= n_words && mask.len() >= words_per_row * h,
+        "bit mask too small for a {w}x{h} image ({words_per_row} words/row, {} words)",
+        mask.len()
+    );
+    // Clears the padding bits of a row's last word (no-op when 64 | w).
+    let tail_mask = if w.is_multiple_of(64) {
+        u64::MAX
+    } else {
+        (1u64 << (w % 64)) - 1
+    };
+
+    let mut sweep = Sweep::new();
+    for (r, row) in mask.chunks_exact(words_per_row).take(h).enumerate() {
+        // Start column of a run that reached the top bit of the previous word.
+        let mut open: Option<usize> = None;
+        for (wi, &word) in row[..n_words].iter().enumerate() {
+            let base = wi * 64;
+            let mut bits = if wi + 1 == n_words {
+                word & tail_mask
             } else {
-                union(&mut parents, cl, pl);
-                if ce < pe {
-                    i += 1;
-                } else {
-                    j += 1;
+                word
+            };
+            // Bits of this word already consumed (shifted out of `bits`).
+            let mut pos = 0u32;
+            if let Some(s) = open {
+                let ones = bits.trailing_ones();
+                if ones == 64 {
+                    continue; // whole word lit: the run stays open
                 }
+                sweep.push_run(r, s, base + ones as usize - 1);
+                open = None;
+                bits >>= ones;
+                pos = ones;
+            }
+            while bits != 0 {
+                let tz = bits.trailing_zeros();
+                bits >>= tz;
+                pos += tz;
+                let start = base + pos as usize;
+                let ones = bits.trailing_ones();
+                if pos + ones >= 64 {
+                    open = Some(start); // reaches the top bit: may continue
+                    break;
+                }
+                sweep.push_run(r, start, start + ones as usize - 1);
+                bits >>= ones;
+                pos += ones;
             }
         }
-
-        std::mem::swap(&mut prev, &mut cur);
-    }
-
-    // Resolve roots and compact them to dense region ids in first-appearance
-    // (row-major) order.
-    let mut region_of_run = vec![0u32; runs.len()];
-    let mut id_of_root = vec![u32::MAX; parents.len()];
-    let mut n_regions = 0usize;
-    for (i, reg) in region_of_run.iter_mut().enumerate() {
-        let root = find(&mut parents, i as u32) as usize;
-        if id_of_root[root] == u32::MAX {
-            id_of_root[root] = n_regions as u32;
-            n_regions += 1;
+        if let Some(s) = open {
+            sweep.push_run(r, s, w - 1);
         }
-        *reg = id_of_root[root];
+        sweep.end_row();
+    }
+    sweep.finish()
+}
+
+/// Union-find state shared by the sweeps: one provisional label per run
+/// (label id == run index), rows merged with their predecessor as they
+/// complete, roots compacted to dense region ids at the end.
+struct Sweep {
+    parents: Vec<u32>,
+    runs: Vec<Run>,
+    /// Runs of the previous / current row: (c0, c1, label).
+    prev: Vec<(u32, u32, u32)>,
+    cur: Vec<(u32, u32, u32)>,
+}
+
+impl Sweep {
+    fn new() -> Self {
+        Self {
+            parents: Vec::new(),
+            runs: Vec::new(),
+            prev: Vec::new(),
+            cur: Vec::new(),
+        }
     }
 
-    RunRegions {
-        runs,
-        region_of_run,
-        n_regions,
+    /// Append the run `c0..=c1` of `row`. Rows must be pushed in order and
+    /// runs left to right within a row.
+    #[inline]
+    fn push_run(&mut self, row: usize, c0: usize, c1: usize) {
+        let label = self.runs.len() as u32;
+        self.parents.push(label);
+        self.runs.push(Run {
+            row: row as u32,
+            c0: c0 as u32,
+            c1: c1 as u32,
+        });
+        self.cur.push((c0 as u32, c1 as u32, label));
+    }
+
+    /// Merge the current row's runs with 8-connected runs of the previous
+    /// row, then make it the previous row.
+    fn end_row(&mut self) {
+        merge_rows(&mut self.parents, &self.cur, &self.prev);
+        std::mem::swap(&mut self.prev, &mut self.cur);
+        self.cur.clear();
+    }
+
+    /// Resolve roots and compact them to dense region ids in
+    /// first-appearance (row-major) order.
+    fn finish(self) -> RunRegions {
+        let Self {
+            mut parents, runs, ..
+        } = self;
+        let mut region_of_run = vec![0u32; runs.len()];
+        let mut id_of_root = vec![u32::MAX; parents.len()];
+        let mut n_regions = 0usize;
+        for (i, reg) in region_of_run.iter_mut().enumerate() {
+            let root = find(&mut parents, i as u32) as usize;
+            if id_of_root[root] == u32::MAX {
+                id_of_root[root] = n_regions as u32;
+                n_regions += 1;
+            }
+            *reg = id_of_root[root];
+        }
+        RunRegions {
+            runs,
+            region_of_run,
+            n_regions,
+        }
+    }
+}
+
+/// Union every current-row run with each 8-connected previous-row run. Both
+/// lists are column-sorted, so a two-pointer sweep finds all overlaps.
+fn merge_rows(parents: &mut [u32], cur: &[(u32, u32, u32)], prev: &[(u32, u32, u32)]) {
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < cur.len() && j < prev.len() {
+        let (cs, ce, cl) = cur[i];
+        let (ps, pe, pl) = prev[j];
+        if ce + 1 < ps {
+            i += 1; // current run ends left of (and not adjacent to) prev
+        } else if pe + 1 < cs {
+            j += 1; // prev run ends left of current
+        } else {
+            union(parents, cl, pl);
+            if ce < pe {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
     }
 }
 
@@ -225,14 +333,40 @@ mod tests {
         sweep_runs(w, h, |r, c| mask[r][c] != 0)
     }
 
-    #[test]
-    fn test_sweep_runs_basic() {
-        let rr = regions_of(&[
-            &[1, 1, 0, 0, 1],
-            &[0, 1, 0, 1, 0], // diagonal touch joins col-4/row-0 with col-3/row-1
-            &[0, 0, 0, 0, 0],
-            &[1, 0, 0, 0, 1],
-        ]);
+    /// Pack a byte mask into `words_per_row` words per row. Padding bits
+    /// (at or beyond `w`) and padding words are filled with garbage to
+    /// prove the sweep ignores them.
+    fn pack(mask: &[&[u8]], words_per_row: usize) -> Vec<u64> {
+        let w = mask[0].len();
+        let mut out = vec![u64::MAX; words_per_row * mask.len()];
+        for (r, row) in mask.iter().enumerate() {
+            for wi in 0..words_per_row {
+                let mut word = 0u64;
+                for b in 0..64 {
+                    let c = wi * 64 + b;
+                    let lit = if c < w { row[c] != 0 } else { (c + r) % 3 == 0 };
+                    word |= (lit as u64) << b;
+                }
+                out[r * words_per_row + wi] = word;
+            }
+        }
+        out
+    }
+
+    fn regions_of_mask(mask: &[&[u8]]) -> RunRegions {
+        let h = mask.len();
+        let w = mask[0].len();
+        let wpr = w.div_ceil(64);
+        sweep_runs_mask(w, h, wpr, &pack(mask, wpr))
+    }
+
+    fn assert_same(a: &RunRegions, b: &RunRegions) {
+        assert_eq!(a.n_regions, b.n_regions);
+        assert_eq!(a.runs, b.runs);
+        assert_eq!(a.region_of_run, b.region_of_run);
+    }
+
+    fn check_basic(rr: RunRegions) {
         assert_eq!(rr.n_regions, 4);
         let (offsets, order) = rr.group_by_region();
         // Region of the first run (top-left pair) contains 2 runs.
@@ -241,6 +375,24 @@ mod tests {
         // Total pixels across all runs.
         let total: usize = order.iter().map(|&i| rr.runs[i as usize].len()).sum();
         assert_eq!(total, 7);
+    }
+
+    const BASIC: [&[u8]; 4] = [
+        &[1, 1, 0, 0, 1],
+        &[0, 1, 0, 1, 0], // diagonal touch joins col-4/row-0 with col-3/row-1
+        &[0, 0, 0, 0, 0],
+        &[1, 0, 0, 0, 1],
+    ];
+
+    #[test]
+    fn test_sweep_runs_basic() {
+        check_basic(regions_of(&BASIC));
+    }
+
+    #[test]
+    fn test_sweep_runs_mask_basic() {
+        check_basic(regions_of_mask(&BASIC));
+        assert_same(&regions_of(&BASIC), &regions_of_mask(&BASIC));
     }
 
     #[test]
@@ -252,5 +404,87 @@ mod tests {
         let rr = regions_of(&[&[0, 0], &[0, 0]]);
         assert_eq!(rr.n_regions, 0);
         assert!(rr.runs.is_empty());
+    }
+
+    #[test]
+    fn test_sweep_runs_mask_full_row_and_empty() {
+        let rr = regions_of_mask(&[&[1, 1, 1], &[1, 1, 1]]);
+        assert_eq!(rr.n_regions, 1);
+        assert_eq!(rr.runs.len(), 2);
+
+        let rr = regions_of_mask(&[&[0, 0], &[0, 0]]);
+        assert_eq!(rr.n_regions, 0);
+        assert!(rr.runs.is_empty());
+    }
+
+    #[test]
+    fn test_sweep_runs_mask_word_boundaries() {
+        // Runs ending exactly at, starting exactly at, and spanning word
+        // boundaries; a fully lit word inside a run; runs touching the right
+        // image edge both with 64 | w and with w % 64 != 0.
+        for w in [64usize, 65, 127, 128, 129, 200] {
+            let row: Vec<u8> = (0..w)
+                .map(|c| {
+                    (c == 0
+                        || (60..=63).contains(&c)
+                        || ((64..=70).contains(&c) && w > 66)
+                        || (120..w).contains(&c)
+                        || ((30..=191).contains(&c) && w == 200)) as u8
+                })
+                .collect();
+            let blank = vec![0u8; w];
+            let mask: [&[u8]; 3] = [&row, &blank, &row];
+            assert_same(&regions_of(&mask), &regions_of_mask(&mask));
+        }
+        // Every pixel lit: one run per row spanning several words.
+        let row = vec![1u8; 300];
+        let mask: [&[u8]; 2] = [&row, &row];
+        let rr = regions_of_mask(&mask);
+        assert_same(&regions_of(&mask), &rr);
+        assert_eq!(rr.n_regions, 1);
+        assert_eq!(
+            rr.runs[0],
+            Run {
+                row: 0,
+                c0: 0,
+                c1: 299
+            }
+        );
+    }
+
+    #[test]
+    fn test_sweep_runs_mask_matches_sweep_runs_random() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let sizes = [
+            (1usize, 1usize),
+            (7, 3),
+            (63, 5),
+            (64, 4),
+            (65, 6),
+            (130, 9),
+            (2136, 3),
+            (257, 40),
+        ];
+        for &(w, h) in &sizes {
+            for density in [1u64, 8, 32, 60] {
+                let rows: Vec<Vec<u8>> = (0..h)
+                    .map(|_| (0..w).map(|_| (next() % 64 < density) as u8).collect())
+                    .collect();
+                let mask: Vec<&[u8]> = rows.iter().map(|r| r.as_slice()).collect();
+                let a = regions_of(&mask);
+                let b = regions_of_mask(&mask);
+                assert_same(&a, &b);
+                // Padding words beyond `w.div_ceil(64)` are ignored too.
+                let wpr = w.div_ceil(64) + 2;
+                let c = sweep_runs_mask(w, h, wpr, &pack(&mask, wpr));
+                assert_same(&a, &c);
+            }
+        }
     }
 }

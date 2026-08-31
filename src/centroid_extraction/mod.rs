@@ -450,6 +450,53 @@ pub(super) struct BackgroundGrid {
     ny: usize,
     block: usize,
     stride: usize,
+    /// Row-independent half of the interpolation for every image column.
+    cols: ColPlan,
+}
+
+/// Per-column interpolation parameters of a [`BackgroundGrid`] for a `w`-wide
+/// image — the row-independent half of the bilinear blend, computed once with
+/// the same [`col_params`] arithmetic the per-pixel accessors use and grouped
+/// into segments of constant `(bx0, bx1)`, so blending a whole row is a
+/// straight multiply-add loop with no per-pixel divide / floor / clamp.
+/// See [`BackgroundGrid::blend_columns`].
+struct ColPlan {
+    /// Column blend weight `fx` and its complement `1 - fx`.
+    fx: Vec<f32>,
+    omfx: Vec<f32>,
+    /// `(c_start, c_end_exclusive, bx0, bx1)` — maximal column ranges that
+    /// share the same pair of grid columns.
+    segs: Vec<(usize, usize, usize, usize)>,
+}
+
+impl ColPlan {
+    fn new(nx: usize, block: usize, w: usize) -> Self {
+        let mut fx = Vec::with_capacity(w);
+        let mut omfx = Vec::with_capacity(w);
+        let mut segs: Vec<(usize, usize, usize, usize)> = Vec::new();
+        for c in 0..w {
+            let (bx0, bx1, f) = col_params(nx, block, c);
+            fx.push(f);
+            omfx.push(1.0 - f);
+            match segs.last_mut() {
+                Some(seg) if seg.2 == bx0 && seg.3 == bx1 => seg.1 = c + 1,
+                _ => segs.push((c, c + 1, bx0, bx1)),
+            }
+        }
+        Self { fx, omfx, segs }
+    }
+}
+
+/// Column-constant part of the interpolation for image column `x`: the two
+/// grid columns to blend and the (unclamped — extrapolating) blend weight.
+#[inline]
+fn col_params(nx: usize, block: usize, x: usize) -> (usize, usize, f32) {
+    if nx == 1 {
+        return (0, 0, 0.0);
+    }
+    let bf = (x as f32 - block as f32 / 2.0) / block as f32;
+    let bx0 = (bf.floor() as isize).clamp(0, nx as isize - 2) as usize;
+    (bx0, bx0 + 1, bf - bx0 as f32)
 }
 
 impl BackgroundGrid {
@@ -525,6 +572,7 @@ impl BackgroundGrid {
                 ny,
                 block,
                 stride,
+                cols: ColPlan::new(nx, block, w),
             },
             sigma,
         )
@@ -577,14 +625,50 @@ impl BackgroundGrid {
         row_blend[bx0] * (1.0 - fx) + row_blend[bx1] * fx
     }
 
+    /// Column half of the interpolation for a whole row: with `row_blend`
+    /// from [`Self::blend_row`], for every image column `c`
+    ///
+    /// ```text
+    /// out[c] = map(row_blend[bx0] * (1 - fx) + row_blend[bx1] * fx)
+    /// ```
+    ///
+    /// with `(bx0, bx1, fx) = col_params(c)` — the same expression and
+    /// operation order as [`Self::value_at`] (which is exactly `blend_row`
+    /// followed by this column blend), so `map = |v| v` reproduces
+    /// `value_at(c, rp)` bit for bit, but the per-column divide / floor /
+    /// clamp is hoisted into the column plan built once by [`Self::build`].
+    /// `out.len()` must equal the image width given to `build`. `map` is
+    /// applied to each blended value (`|v| v + k·σ` for a detection
+    /// threshold, see [`Self::threshold_row`]).
+    #[inline]
+    pub(super) fn blend_columns(
+        &self,
+        row_blend: &[f32],
+        out: &mut [f32],
+        map: impl Fn(f32) -> f32,
+    ) {
+        debug_assert_eq!(out.len(), self.cols.fx.len());
+        for &(c0, c1, bx0, bx1) in &self.cols.segs {
+            let (g0, g1) = (row_blend[bx0], row_blend[bx1]);
+            let fx = &self.cols.fx[c0..c1];
+            let omfx = &self.cols.omfx[c0..c1];
+            for ((o, &f), &omf) in out[c0..c1].iter_mut().zip(fx).zip(omfx) {
+                *o = map(g0 * omf + g1 * f);
+            }
+        }
+    }
+
+    /// Detection threshold of every column of the row blended into
+    /// `row_blend`: `out[c] = value_at(c, rp) + k_sigma`, bit for bit (see
+    /// [`Self::blend_columns`]).
+    #[inline]
+    pub(super) fn threshold_row(&self, row_blend: &[f32], k_sigma: f32, out: &mut [f32]) {
+        self.blend_columns(row_blend, out, |v| v + k_sigma);
+    }
+
     #[inline]
     fn col_params(&self, x: usize) -> (usize, usize, f32) {
-        if self.nx == 1 {
-            return (0, 0, 0.0);
-        }
-        let bf = (x as f32 - self.block as f32 / 2.0) / self.block as f32;
-        let bx0 = (bf.floor() as isize).clamp(0, self.nx as isize - 2) as usize;
-        (bx0, bx0 + 1, bf - bx0 as f32)
+        col_params(self.nx, self.block, x)
     }
 }
 
