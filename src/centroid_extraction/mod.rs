@@ -874,6 +874,11 @@ fn peak_sharpness(
 fn to_grayscale_f32(img: &image::DynamicImage) -> Vec<f32> {
     use image::DynamicImage;
     match img {
+        // 8-bit grayscale: read the buffer directly (the `to_luma8()`
+        // fallback below would clone it first). Alpha is dropped, exactly
+        // as the Luma8 conversion does.
+        DynamicImage::ImageLuma8(g) => g.as_raw().iter().map(|&v| v as f32).collect(),
+        DynamicImage::ImageLumaA8(g) => g.pixels().map(|p| p.0[0] as f32).collect(),
         // 16-bit images: cast to f32 (values keep their native [0, 65535] range)
         DynamicImage::ImageLuma16(g) => g.as_raw().iter().map(|&v| v as f32).collect(),
         DynamicImage::ImageLumaA16(g) => g.pixels().map(|p| p.0[0] as f32).collect(),
@@ -948,6 +953,32 @@ fn quadratic_peak_offset(v: impl Fn(isize, isize) -> f64) -> Option<(f64, f64)> 
 mod tests {
     use super::ccl::estimate_background;
     use super::*;
+
+    #[test]
+    fn test_to_grayscale_f32_luma8_direct_arms_match_to_luma8() {
+        let (w, h) = (37u32, 11u32);
+        let raw: Vec<u8> = (0..w * h).map(|i| (i * 7919 % 256) as u8).collect();
+        let luma =
+            image::DynamicImage::ImageLuma8(image::GrayImage::from_raw(w, h, raw.clone()).unwrap());
+        let expect: Vec<f32> = luma.to_luma8().as_raw().iter().map(|&v| v as f32).collect();
+        assert_eq!(to_grayscale_f32(&luma), expect);
+        // LumaA8: alpha is dropped, exactly as `to_luma8()` does.
+        let raw_a: Vec<u8> = raw
+            .iter()
+            .enumerate()
+            .flat_map(|(i, &v)| [v, (i % 251) as u8])
+            .collect();
+        let luma_a =
+            image::DynamicImage::ImageLumaA8(image::GrayAlphaImage::from_raw(w, h, raw_a).unwrap());
+        let expect_a: Vec<f32> = luma_a
+            .to_luma8()
+            .as_raw()
+            .iter()
+            .map(|&v| v as f32)
+            .collect();
+        assert_eq!(to_grayscale_f32(&luma_a), expect_a);
+        assert_eq!(expect, expect_a);
+    }
 
     #[test]
     fn test_ccl_rejects_degenerate_geometry() {
