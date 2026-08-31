@@ -4,6 +4,11 @@ Only recent releases are listed. Older entries are in this file's git history (`
 
 ## Unreleased
 
+### Changed
+
+- `extract_centroids_fast` thresholds each row into a packed bit mask (per-column background plan precomputed once, `p > thr[c]` vectorized) and reads runs off the bits with `trailing_zeros`/`trailing_ones` instead of calling a per-pixel closure: ~6× faster on tracker-like frames (2048²: 7.3 → 1.2 ms), ~2.6× on dense survey frames; with `parallel` the mask is built row-parallel (2048²: 0.53 ms, ~13×). Output is bit-identical. ([#53](https://github.com/ssmichael1/tetra3rs/pull/53))
+- `BackgroundGrid::build` streams each block row across its blocks (one task per block row under `parallel`) instead of a strided gather per block, and the brightness sort orders `(mass, index)` keys with an unstable sort; both bit-identical. ([#53](https://github.com/ssmichael1/tetra3rs/pull/53))
+
 ## 0.11.0 - 2026-08-30
 
 ### Added
