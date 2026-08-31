@@ -4,6 +4,10 @@ Only recent releases are listed. Older entries are in this file's git history (`
 
 ## Unreleased
 
+### Changed
+
+- Python: `extract_centroids` / `extract_centroids_fast` convert C-contiguous numpy images straight from the flat slice (memcpy for f32), saving ~2.4 ms per 2048² frame; non-contiguous views keep the strided path, output unchanged ([#52](https://github.com/ssmichael1/tetra3rs/pull/52))
+
 ## 0.11.0 - 2026-08-30
 
 ### Added
