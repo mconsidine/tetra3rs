@@ -368,12 +368,12 @@ fn check_pixel_len(len: usize, width: u32, height: u32) -> Result<()> {
 /// fixed output slot, so results are independent of thread count and the
 /// non-`parallel` build is bit-identical to the original sequential code.
 ///
-/// Scope is deliberately narrow. Profiling (`smrecording.fits`, 2.1 Mpix) shows
-/// `estimate_local_background` is ~60% of extraction wall-clock; the per-blob
-/// centroid loop is ~2% and connected-component labeling lives in numeris and
-/// is sequential there, so neither is parallelized here. The fast path
-/// parallelizes its background grid (one task per block row) and its
-/// detection bit mask (16-row chunks); its run sweep stays sequential.
+/// Both paths parallelize their background grid (one task per block row)
+/// and their detection bit mask (16-row chunks). The CCL path additionally
+/// runs its residual pass by rows, its run sweep in 64-row bands, and its
+/// per-region annulus / moment / deblend stage as one task per region
+/// (`map_indices_init`, order preserved by index); the fast path's run
+/// sweep stays sequential.
 pub(super) mod par {
     #[cfg(feature = "parallel")]
     use rayon::prelude::*;
@@ -393,6 +393,30 @@ pub(super) mod par {
         F: Fn(usize) -> T,
     {
         (0..n).map(f).collect()
+    }
+
+    /// Map `f(&mut state, i)` over `0..n` into a `Vec`, preserving index
+    /// order. `state` is created by `init` once per worker (once in total
+    /// without the feature) and reused across the indices that worker
+    /// handles — scratch buffers for a per-item body. `f` must not let its
+    /// result depend on what `state` held from earlier indices.
+    #[cfg(feature = "parallel")]
+    pub fn map_indices_init<S, T, I, F>(n: usize, init: I, f: F) -> Vec<T>
+    where
+        T: Send,
+        I: Fn() -> S + Sync + Send,
+        F: Fn(&mut S, usize) -> T + Sync + Send,
+    {
+        (0..n).into_par_iter().map_init(init, f).collect()
+    }
+    #[cfg(not(feature = "parallel"))]
+    pub fn map_indices_init<S, T, I, F>(n: usize, init: I, mut f: F) -> Vec<T>
+    where
+        I: FnOnce() -> S,
+        F: FnMut(&mut S, usize) -> T,
+    {
+        let mut state = init();
+        (0..n).map(|i| f(&mut state, i)).collect()
     }
 
     /// Apply `f(i, chunk)` to each disjoint `chunk_len`-sized chunk of `buf`
@@ -603,6 +627,11 @@ impl BackgroundGrid {
 
     pub(super) fn stride(&self) -> usize {
         self.stride
+    }
+
+    /// Number of grid columns — the length [`Self::blend_row`] expects.
+    pub(super) fn grid_width(&self) -> usize {
+        self.nx
     }
 
     /// Representative background level: the midpoint of the block medians.
@@ -845,6 +874,11 @@ fn peak_sharpness(
 fn to_grayscale_f32(img: &image::DynamicImage) -> Vec<f32> {
     use image::DynamicImage;
     match img {
+        // 8-bit grayscale: read the buffer directly (the `to_luma8()`
+        // fallback below would clone it first). Alpha is dropped, exactly
+        // as the Luma8 conversion does.
+        DynamicImage::ImageLuma8(g) => g.as_raw().iter().map(|&v| v as f32).collect(),
+        DynamicImage::ImageLumaA8(g) => g.pixels().map(|p| p.0[0] as f32).collect(),
         // 16-bit images: cast to f32 (values keep their native [0, 65535] range)
         DynamicImage::ImageLuma16(g) => g.as_raw().iter().map(|&v| v as f32).collect(),
         DynamicImage::ImageLumaA16(g) => g.pixels().map(|p| p.0[0] as f32).collect(),
@@ -919,6 +953,32 @@ fn quadratic_peak_offset(v: impl Fn(isize, isize) -> f64) -> Option<(f64, f64)> 
 mod tests {
     use super::ccl::estimate_background;
     use super::*;
+
+    #[test]
+    fn test_to_grayscale_f32_luma8_direct_arms_match_to_luma8() {
+        let (w, h) = (37u32, 11u32);
+        let raw: Vec<u8> = (0..w * h).map(|i| (i * 7919 % 256) as u8).collect();
+        let luma =
+            image::DynamicImage::ImageLuma8(image::GrayImage::from_raw(w, h, raw.clone()).unwrap());
+        let expect: Vec<f32> = luma.to_luma8().as_raw().iter().map(|&v| v as f32).collect();
+        assert_eq!(to_grayscale_f32(&luma), expect);
+        // LumaA8: alpha is dropped, exactly as `to_luma8()` does.
+        let raw_a: Vec<u8> = raw
+            .iter()
+            .enumerate()
+            .flat_map(|(i, &v)| [v, (i % 251) as u8])
+            .collect();
+        let luma_a =
+            image::DynamicImage::ImageLumaA8(image::GrayAlphaImage::from_raw(w, h, raw_a).unwrap());
+        let expect_a: Vec<f32> = luma_a
+            .to_luma8()
+            .as_raw()
+            .iter()
+            .map(|&v| v as f32)
+            .collect();
+        assert_eq!(to_grayscale_f32(&luma_a), expect_a);
+        assert_eq!(expect, expect_a);
+    }
 
     #[test]
     fn test_ccl_rejects_degenerate_geometry() {

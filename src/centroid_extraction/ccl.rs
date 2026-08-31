@@ -6,7 +6,7 @@
 
 use std::borrow::Cow;
 
-use numeris::imageproc::{gaussian_blur, BorderMode};
+use numeris::imageproc::{gaussian_blur_into, BorderMode};
 use numeris::DynMatrix;
 
 use super::{
@@ -96,35 +96,40 @@ pub(super) fn extract_from_gray(
 
         // Fused residual pass (rows in parallel under the `parallel` feature;
         // each row writes disjoint output, results independent of threads).
+        // The bilinear surface is evaluated per row as `blend_row` +
+        // `blend_columns` — the same expression and operation order as
+        // `value_at`, with the per-pixel divide / floor / clamp hoisted into
+        // the grid's column plan — so the residuals are bit-identical to the
+        // per-pixel form.
+        let nx = bg.grid_width();
         let mut clamped = vec![0.0_f32; w * h];
         if filter_sigma.is_some() {
             let mut unclamped = vec![0.0_f32; w * h];
             par::for_each_chunk_pair_mut(&mut clamped, &mut unclamped, w, |y, cr, ur| {
-                let rp = bg.row_params(y);
-                let row = y * w;
-                for x in 0..w {
+                let mut row_blend = vec![0.0_f32; nx];
+                bg.blend_row(bg.row_params(y), &mut row_blend);
+                // Surface into `ur`, then residuals in place.
+                bg.blend_columns(&row_blend, ur, |v| v);
+                let src = &gray_input[y * w..(y + 1) * w];
+                for ((c, u), &p) in cr.iter_mut().zip(ur.iter_mut()).zip(src) {
                     // Non-finite pixels (dead/hot columns, NaN padding) are
                     // treated as background: `inf.max(0.0)` is `inf`, and one
                     // such pixel otherwise becomes a NaN centroid ranked first.
-                    let p = gray_input[row + x];
-                    let r = if p.is_finite() {
-                        p - bg.value_at(x, rp)
-                    } else {
-                        0.0
-                    };
-                    cr[x] = r.max(0.0);
-                    ur[x] = r;
+                    let r = if p.is_finite() { p - *u } else { 0.0 };
+                    *c = r.max(0.0);
+                    *u = r;
                 }
             });
             filter_input = Some(DynMatrix::from_vec(w, h, unclamped));
         } else {
             par::for_each_chunk_mut(&mut clamped, w, |y, cr| {
-                let rp = bg.row_params(y);
-                let row = y * w;
-                for (x, out) in cr.iter_mut().enumerate() {
-                    let p = gray_input[row + x];
-                    *out = if p.is_finite() {
-                        (p - bg.value_at(x, rp)).max(0.0)
+                let mut row_blend = vec![0.0_f32; nx];
+                bg.blend_row(bg.row_params(y), &mut row_blend);
+                bg.blend_columns(&row_blend, cr, |v| v);
+                let src = &gray_input[y * w..(y + 1) * w];
+                for (c, &p) in cr.iter_mut().zip(src) {
+                    *c = if p.is_finite() {
+                        (p - *c).max(0.0)
                     } else {
                         0.0
                     };
@@ -159,11 +164,17 @@ pub(super) fn extract_from_gray(
     // The detection threshold is scaled by the kernel's white-noise
     // suppression factor so `sigma_threshold` keeps meaning "sigmas of the
     // noise actually present in the thresholded image", filter on or off.
-    // Under the `parallel` feature numeris's gaussian_blur runs
+    // `gaussian_blur_into` (numeris ≥ 0.5.19) runs the separable passes in
+    // column bands with a per-band halo scratch instead of materializing a
+    // full-image intermediate — bit-identical to `gaussian_blur`, one 16 MB
+    // buffer less at 2048². Under the `parallel` feature the bands run
     // multi-threaded.
     let (thresh_src, mask_threshold): (Cow<[f32]>, f32) = match (filter_sigma, filter_input) {
         (Some(sigma), Some(mat)) => {
-            let filtered = gaussian_blur(&mat, sigma, BorderMode::Replicate).into_vec();
+            let mut filtered = DynMatrix::<f32>::zeros(0, 0);
+            gaussian_blur_into(&mat, sigma, BorderMode::Replicate, &mut filtered);
+            drop(mat);
+            let filtered = filtered.into_vec();
             let suppression = gaussian_noise_suppression(sigma);
             (
                 Cow::Owned(filtered),
@@ -175,16 +186,24 @@ pub(super) fn extract_from_gray(
             bg_mean + config.sigma_threshold * bg_sigma,
         ),
     };
-    let thresh_src: &[f32] = &thresh_src;
 
-    // ── Step 4: threshold into runs and group into regions ──
-    // The run-length union-find core replaces the u8 mask + u32 labels
-    // buffers of the old generic connected-component labeling; downstream
-    // stages iterate each region's run list instead of testing labels, and
-    // the annulus's "not in any blob" test becomes
-    // `thresh_src[i] <= mask_threshold` (equivalent: every lit pixel was in
-    // some region). 8-connectivity is inherent to the run merging.
-    let regions = runs::sweep_runs(w, h, |r, c| thresh_src[r * w + c] > mask_threshold);
+    // ── Step 4: threshold into a bit mask, sweep into runs and regions ──
+    // The thresholded image is packed one row at a time into a 1-bit-per-
+    // pixel mask (`thresh_src[i] > mask_threshold`), and the run-length
+    // union-find core reads runs straight off the words, so the sweep costs
+    // runs rather than pixels. Downstream stages iterate each region's run
+    // list; the annulus's "not in any blob" test is a bit test on the same
+    // mask (equivalent: every lit pixel was in some region). 8-connectivity
+    // is inherent to the run merging. The filtered image is released here —
+    // nothing downstream reads it.
+    let (mask, words_per_row) = threshold_to_mask(&thresh_src, w, h, mask_threshold);
+    drop(thresh_src);
+    // Under `parallel` the rows are labeled in 64-row bands (one task each)
+    // and stitched — the same `RunRegions` as the sequential sweep.
+    #[cfg(feature = "parallel")]
+    let regions = runs::sweep_runs_mask_banded(w, h, words_per_row, &mask, 64);
+    #[cfg(not(feature = "parallel"))]
+    let regions = runs::sweep_runs_mask(w, h, words_per_row, &mask);
 
     // ── Step 5: compute centroids ──
     // Origin at the geometric image center, (W-1)/2 and (H-1)/2 (pixel centers
@@ -196,8 +215,7 @@ pub(super) fn extract_from_gray(
     let mut centroids = compute_blob_centroids(
         gray,
         gray_input,
-        thresh_src,
-        mask_threshold,
+        (&mask, words_per_row),
         &regions,
         (w, h),
         (cx, cy),
@@ -219,6 +237,24 @@ pub(super) fn extract_from_gray(
         threshold: mask_threshold,
         num_blobs_raw,
     })
+}
+
+/// Pack `src > thr` into a 1-bit-per-pixel mask, `words_per_row =
+/// ⌈w/64⌉` `u64`s per image row (returned with the mask; padding bits are
+/// zero). Rows are packed in independent 16-row chunks — multi-threaded
+/// under the `parallel` feature — with [`runs::pack_above_row`], so the mask
+/// is identical either way.
+fn threshold_to_mask(src: &[f32], w: usize, h: usize, thr: f32) -> (Vec<u64>, usize) {
+    const ROWS_PER_CHUNK: usize = 16;
+    let words_per_row = w.div_ceil(64);
+    let mut mask = vec![0u64; words_per_row * h];
+    par::for_each_chunk_mut(&mut mask, words_per_row * ROWS_PER_CHUNK, |ci, chunk| {
+        for (i, words) in chunk.chunks_exact_mut(words_per_row).enumerate() {
+            let r = ci * ROWS_PER_CHUNK + i;
+            runs::pack_above_row(&src[r * w..(r + 1) * w], thr, words);
+        }
+    });
+    (mask, words_per_row)
 }
 
 /// Background-subtracted residuals at the block subsample lattice (the same
@@ -330,7 +366,7 @@ pub(super) fn estimate_background(
 
 /// Compute intensity-weighted centroids for each connected region.
 ///
-/// Consumes the run-length regions from [`runs::sweep_runs`]; each stage
+/// Consumes the run-length regions from [`runs::sweep_runs_mask`]; each stage
 /// iterates the region's run list (row-major, so accumulation order matches
 /// the historical bbox-scan order exactly). For each blob that passes size
 /// and elongation filters:
@@ -356,38 +392,95 @@ pub(super) fn estimate_background(
 /// halos, etc. — which destabilizes downstream calibration on dense fields
 /// like TESS).
 ///
-/// This loop is ~2% of extraction wall-clock, so it is left sequential even
-/// under the `parallel` feature — the threading overhead would not pay off and
-/// keeps the two builds bit-identical here.
-#[allow(clippy::too_many_arguments)]
+/// On dense fields (thousands of blobs) this stage is a third or more of
+/// extraction wall-clock, so under the `parallel` feature regions are
+/// processed as independent tasks: every region reads only shared inputs
+/// and writes its own `Option<Centroid>` slot, and the results are collected
+/// in region order, so the output is identical to the sequential loop.
 fn compute_blob_centroids(
     gray: &[f32],
     raw: &[f32],
-    thresh_src: &[f32],
-    mask_threshold: f32,
+    (mask, words_per_row): (&[u64], usize),
     regions: &runs::RunRegions,
     (w, h): (usize, usize),
     (cx, cy): (f32, f32),
     config: &CentroidExtractionConfig,
 ) -> Vec<Centroid> {
     let (offsets, order) = regions.group_by_region();
+    let ctx = BlobContext {
+        gray,
+        raw,
+        mask,
+        words_per_row,
+        regions,
+        offsets: &offsets,
+        order: &order,
+        w,
+        h,
+        cx,
+        cy,
+        config,
+    };
+    let per_region = par::map_indices_init(regions.n_regions, BlobScratch::default, |s, k| {
+        ctx.region_centroid(k, s)
+    });
+    per_region.into_iter().flatten().collect()
+}
 
-    // Reused across blobs to avoid a fresh allocation per region (dense
-    // fields can have thousands).
-    let mut annulus_vals: Vec<f32> = Vec::new();
-    let mut maxima: Vec<(f32, usize, usize)> = Vec::new();
-    let mut kept: Vec<(usize, usize)> = Vec::new();
-    let mut out: Vec<Centroid> = Vec::new();
+/// Read-only inputs shared by every region of one extraction.
+struct BlobContext<'a> {
+    /// Measurement image (clamped residuals, or the raw image without local
+    /// background).
+    gray: &'a [f32],
+    /// Raw sensor image (saturation is judged on it).
+    raw: &'a [f32],
+    /// Detection bit mask and its words per row (see `threshold_to_mask`).
+    mask: &'a [u64],
+    words_per_row: usize,
+    regions: &'a runs::RunRegions,
+    /// `group_by_region` output: region `k`'s runs are
+    /// `order[offsets[k]..offsets[k + 1]]`.
+    offsets: &'a [u32],
+    order: &'a [u32],
+    w: usize,
+    h: usize,
+    /// Pixel coordinates of the output origin.
+    cx: f32,
+    cy: f32,
+    config: &'a CentroidExtractionConfig,
+}
 
-    'region: for k in 0..regions.n_regions {
-        let region_runs = &order[offsets[k] as usize..offsets[k + 1] as usize];
+/// Buffers reused across the regions one worker handles (dense fields have
+/// thousands; a fresh allocation per region would dominate).
+#[derive(Default)]
+struct BlobScratch {
+    annulus_vals: Vec<f32>,
+    maxima: Vec<(f32, usize, usize)>,
+    kept: Vec<(usize, usize)>,
+}
+
+impl BlobContext<'_> {
+    /// The centroid of region `k`, or `None` when a filter rejects it.
+    fn region_centroid(&self, k: usize, scratch: &mut BlobScratch) -> Option<Centroid> {
+        let Self {
+            gray,
+            raw,
+            mask,
+            words_per_row,
+            regions,
+            w,
+            h,
+            config,
+            ..
+        } = *self;
+        let region_runs = &self.order[self.offsets[k] as usize..self.offsets[k + 1] as usize];
         let extent = regions.extent(region_runs);
         let pixel_count = extent.npix;
         if pixel_count < config.min_pixels || pixel_count > config.max_pixels {
-            continue;
+            return None;
         }
         if !extent.clear_of_border(config.border_margin as usize, w, h) {
-            continue;
+            return None;
         }
         let (min_row, max_row, min_col, max_col) = (
             extent.min_row,
@@ -402,27 +495,25 @@ fn compute_blob_centroids(
 
         // --- Per-blob local background from annulus ---
         // Expand bounding box by margin, collect pixels that are not part of
-        // *any* region (below the detection threshold — every lit pixel was
+        // *any* region (not lit in the detection mask — every lit pixel was
         // grouped into some region).
         const ANNULUS_MARGIN: usize = 5;
         let r0 = min_row.saturating_sub(ANNULUS_MARGIN);
         let r1 = (max_row + ANNULUS_MARGIN + 1).min(h);
         let c0 = min_col.saturating_sub(ANNULUS_MARGIN);
         let c1 = (max_col + ANNULUS_MARGIN + 1).min(w);
-
-        annulus_vals.clear();
-        for r in r0..r1 {
-            let row_off = r * w;
-            for c in c0..c1 {
-                let i = row_off + c;
-                if thresh_src[i] <= mask_threshold {
-                    annulus_vals.push(gray[i]);
-                }
-            }
-        }
+        let annulus_vals = &mut scratch.annulus_vals;
+        gather_unlit(
+            gray,
+            (mask, words_per_row),
+            w,
+            (r0, r1),
+            (c0, c1),
+            annulus_vals,
+        );
 
         // Median of annulus (residual local background in bg-subtracted image).
-        let local_bg = median_f32(&mut annulus_vals) as f64;
+        let local_bg = median_f32(annulus_vals) as f64;
 
         // --- Single moment pass: intensity-weighted moments with the
         // annulus-local background, tracking the peak in the same sweep ---
@@ -460,7 +551,7 @@ fn compute_blob_centroids(
         }
 
         if sum_i <= 0.0 {
-            continue;
+            return None;
         }
 
         let dx_bar = sum_x / sum_i;
@@ -475,7 +566,7 @@ fn compute_blob_centroids(
         // reported as `cov`.
         if let Some(max_elong) = config.max_elongation {
             if elongation_from_cov(cxx, cyy, cxy) > max_elong {
-                continue;
+                return None;
             }
         }
 
@@ -499,6 +590,7 @@ fn compute_blob_centroids(
         // genuinely single star).
         if config.deblend == DeblendMode::Reject && !saturated {
             let thresh = local_bg + 0.3 * (peak_val as f64 - local_bg);
+            let maxima = &mut scratch.maxima;
             maxima.clear();
             for &i in region_runs {
                 let run = regions.runs[i as usize];
@@ -532,8 +624,9 @@ fn compute_blob_centroids(
                 }
             }
             maxima.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            let kept = &mut scratch.kept;
             kept.clear();
-            for &(_, c, r) in &maxima {
+            for &(_, c, r) in maxima.iter() {
                 let distinct = kept.iter().all(|&(kc, kr)| {
                     let dx = c as f64 - kc as f64;
                     let dy = r as f64 - kr as f64;
@@ -542,7 +635,7 @@ fn compute_blob_centroids(
                 if distinct {
                     kept.push((c, r));
                     if kept.len() > 1 {
-                        continue 'region;
+                        return None;
                     }
                 }
             }
@@ -558,7 +651,7 @@ fn compute_blob_centroids(
 
         // Sharpness gate, peak refinement, and assembly are shared with the
         // fast path (see `finish_region`).
-        if let Some(c) = finish_region(
+        finish_region(
             pixel_count,
             (pc, pr),
             (w, h),
@@ -567,12 +660,102 @@ fn compute_blob_centroids(
             sum_i,
             saturated,
             config.max_sharpness,
-            (cx, cy),
+            (self.cx, self.cy),
             v,
-        ) {
-            out.push(c);
+        )
+    }
+}
+
+/// Gather into `out` (cleared first), in raster order, the `gray` values of
+/// the window rows `r0..r1` × columns `c0..c1` whose detection-mask bit is
+/// clear. Branch-free: every window value is written to the next slot and
+/// the slot index advances only for unlit pixels (`out` is sized to the
+/// window, then truncated) — a mostly-unlit annulus makes the branchy
+/// `if !lit { push }` form mispredict on every star pixel.
+fn gather_unlit(
+    gray: &[f32],
+    (mask, words_per_row): (&[u64], usize),
+    w: usize,
+    (r0, r1): (usize, usize),
+    (c0, c1): (usize, usize),
+    out: &mut Vec<f32>,
+) {
+    out.clear();
+    out.resize((r1 - r0) * (c1 - c0), 0.0);
+    let mut n = 0usize;
+    for r in r0..r1 {
+        let row = &gray[r * w + c0..r * w + c1];
+        let bits = &mask[r * words_per_row..(r + 1) * words_per_row];
+        for (i, &v) in row.iter().enumerate() {
+            let c = c0 + i;
+            let lit = (bits[c / 64] >> (c % 64)) & 1;
+            out[n] = v;
+            n += (lit == 0) as usize;
         }
     }
+    out.truncate(n);
+}
 
-    out
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gather_unlit_matches_branchy_gather() {
+        let (w, h) = (150usize, 40usize);
+        let words_per_row = w.div_ceil(64);
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let gray: Vec<f32> = (0..w * h).map(|_| (next() % 1000) as f32 * 0.25).collect();
+        for density in [0u64, 4, 32, 60, 64] {
+            let mut mask = vec![0u64; words_per_row * h];
+            for r in 0..h {
+                for c in 0..w {
+                    if next() % 64 < density {
+                        mask[r * words_per_row + c / 64] |= 1 << (c % 64);
+                    }
+                }
+                // Garbage padding bits must not matter (never indexed).
+                mask[r * words_per_row + words_per_row - 1] |= u64::MAX << (w % 64);
+            }
+            let windows = [
+                (0usize, h, 0usize, w),
+                (0, 1, 0, 1),
+                (3, 17, 60, 70),
+                (10, 11, 0, 150),
+                (5, 30, 63, 65),
+                (20, 40, 127, 150),
+            ];
+            for &(r0, r1, c0, c1) in &windows {
+                let mut expect = Vec::new();
+                for r in r0..r1 {
+                    for c in c0..c1 {
+                        if (mask[r * words_per_row + c / 64] >> (c % 64)) & 1 == 0 {
+                            expect.push(gray[r * w + c]);
+                        }
+                    }
+                }
+                let mut got = vec![1.0; 7]; // stale contents are discarded
+                gather_unlit(
+                    &gray,
+                    (&mask, words_per_row),
+                    w,
+                    (r0, r1),
+                    (c0, c1),
+                    &mut got,
+                );
+                assert_eq!(
+                    got,
+                    expect,
+                    "density {density} window {:?}",
+                    (r0, r1, c0, c1)
+                );
+            }
+        }
+    }
 }

@@ -177,7 +177,7 @@ pub fn extract_centroids_fast(
             let r = ci * ROWS_PER_CHUNK + i;
             bg.blend_row(bg.row_params(r), &mut grid_row);
             bg.threshold_row(&grid_row, k_sigma, &mut thr);
-            pack_lit_row(&pixels[r * w..(r + 1) * w], &thr, words);
+            runs::pack_lit_row(&pixels[r * w..(r + 1) * w], &thr, words);
         }
     });
 
@@ -293,67 +293,4 @@ pub fn extract_centroids_fast(
         threshold: bg_mean + k * sigma,
         num_blobs_raw,
     })
-}
-
-/// Pack one image row's detection mask: bit `c % 64` of `words[c / 64]` is
-/// set when `row[c]` is finite and exceeds `thr[c]`. `(p > t) & (p < +∞)` is
-/// exactly `p.is_finite() && p > t` (NaN fails both compares, −∞ fails the
-/// first, +∞ the second) but branch-free: the compares fill a 64-byte
-/// scratch (a vectorizable loop), then each 8 bytes fold to 8 bits with the
-/// multiply-shift trick. Padding bits at or beyond `row.len()` are zero.
-#[inline]
-fn pack_lit_row(row: &[f32], thr: &[f32], words: &mut [u64]) {
-    debug_assert_eq!(row.len(), thr.len());
-    debug_assert_eq!(words.len(), row.len().div_ceil(64));
-    for (wi, word) in words.iter_mut().enumerate() {
-        let c0 = wi * 64;
-        let c1 = (c0 + 64).min(row.len());
-        let mut bytes = [0u8; 64];
-        for ((m, &p), &t) in bytes.iter_mut().zip(&row[c0..c1]).zip(&thr[c0..c1]) {
-            *m = ((p > t) & (p < f32::INFINITY)) as u8;
-        }
-        let mut acc = 0u64;
-        for (k, chunk) in bytes.as_chunks::<8>().0.iter().enumerate() {
-            let x = u64::from_le_bytes(*chunk);
-            // Each byte is 0 or 1; the multiply gathers the low bit of each
-            // byte into the top byte, lowest byte → lowest bit.
-            acc |= (x.wrapping_mul(0x0102_0408_1020_4080) >> 56) << (8 * k);
-        }
-        *word = acc;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_pack_lit_row_matches_predicate() {
-        let w = 2136usize; // not a multiple of 64
-        let mut state = 0x2545_f491_4f6c_dd1du64;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        let thr: Vec<f32> = (0..w).map(|c| c as f32 * 0.5).collect();
-        let mut row: Vec<f32> = (0..w)
-            .map(|c| c as f32 * 0.5 + (next() % 5) as f32 - 2.0)
-            .collect();
-        // Non-finite values must never be lit, whatever the threshold.
-        row[3] = f32::NAN;
-        row[64] = f32::INFINITY;
-        row[65] = f32::NEG_INFINITY;
-        row[w - 1] = f32::INFINITY;
-        let mut words = vec![u64::MAX; w.div_ceil(64)];
-        pack_lit_row(&row, &thr, &mut words);
-        for c in 0..w {
-            let expect = row[c].is_finite() && row[c] > thr[c];
-            let got = words[c / 64] >> (c % 64) & 1 == 1;
-            assert_eq!(got, expect, "column {c}");
-        }
-        // Padding bits are zero.
-        assert_eq!(words[w / 64] >> (w % 64), 0);
-    }
 }
