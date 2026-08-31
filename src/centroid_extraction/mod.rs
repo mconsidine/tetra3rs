@@ -24,9 +24,11 @@
 //!   functions above stay the default and the right choice for calibration.
 //!
 //! With the `parallel` feature, the dominant local-background stage and the
-//! full-image element-wise maps of the connected-component path run
-//! multi-threaded via rayon; results are bit-identical to the sequential
-//! build. (The fast single-pass path is sequential.)
+//! full-image element-wise maps of the connected-component path, and the
+//! background grid + detection bit mask of the fast path, run multi-threaded
+//! via rayon; results are bit-identical to the sequential build. (The fast
+//! path's run sweep over the mask is sequential — it is proportional to the
+//! number of runs, not pixels.)
 //!
 //! # Example
 //!
@@ -313,15 +315,27 @@ fn median_f32(values: &mut [f32]) -> f32 {
 /// and truncate to the configured maximum. Shared tail of both extraction
 /// paths.
 fn sort_and_truncate_by_mass(centroids: &mut Vec<Centroid>, max_centroids: Option<usize>) {
-    centroids.sort_by(|a, b| {
-        b.mass
-            .unwrap_or(0.0)
-            .partial_cmp(&a.mass.unwrap_or(0.0))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // Sort (mass, original index) keys rather than the centroids themselves:
+    // the key `(mass desc, index asc)` is a strict total order, so an
+    // unstable sort of 8-byte keys reproduces exactly the order a stable
+    // descending-mass sort would give — at roughly half the cost on dense
+    // frames with tens of thousands of detections. Both extraction paths
+    // emit `mass` as `Some(m as f32)` with `m > 0.0` in f64 (or `None`,
+    // ranked as 0.0): never NaN and never -0.0, so `total_cmp` agrees with
+    // `partial_cmp` on every key present.
+    let mut keys: Vec<(f32, u32)> = centroids
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.mass.unwrap_or(0.0), i as u32))
+        .collect();
+    keys.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     if let Some(max) = max_centroids {
-        centroids.truncate(max);
+        keys.truncate(max);
     }
+    *centroids = keys
+        .iter()
+        .map(|&(_, i)| centroids[i as usize].clone())
+        .collect();
 }
 
 /// Validate that a raw pixel buffer matches the claimed dimensions.
@@ -357,7 +371,9 @@ fn check_pixel_len(len: usize, width: u32, height: u32) -> Result<()> {
 /// Scope is deliberately narrow. Profiling (`smrecording.fits`, 2.1 Mpix) shows
 /// `estimate_local_background` is ~60% of extraction wall-clock; the per-blob
 /// centroid loop is ~2% and connected-component labeling lives in numeris and
-/// is sequential there, so neither is parallelized here.
+/// is sequential there, so neither is parallelized here. The fast path
+/// parallelizes its background grid (one task per block row) and its
+/// detection bit mask (16-row chunks); its run sweep stays sequential.
 pub(super) mod par {
     #[cfg(feature = "parallel")]
     use rayon::prelude::*;
@@ -379,8 +395,8 @@ pub(super) mod par {
         (0..n).map(f).collect()
     }
 
-    /// Apply `f(i, chunk)` to each disjoint `chunk_len`-sized chunk of `buf`.
-    /// `buf.len()` must be a multiple of `chunk_len` (one chunk per image row).
+    /// Apply `f(i, chunk)` to each disjoint `chunk_len`-sized chunk of `buf`
+    /// (one or more image rows per chunk; the last chunk may be shorter).
     #[cfg(feature = "parallel")]
     pub fn for_each_chunk_mut<T, F>(buf: &mut [T], chunk_len: usize, f: F)
     where
@@ -450,6 +466,53 @@ pub(super) struct BackgroundGrid {
     ny: usize,
     block: usize,
     stride: usize,
+    /// Row-independent half of the interpolation for every image column.
+    cols: ColPlan,
+}
+
+/// Per-column interpolation parameters of a [`BackgroundGrid`] for a `w`-wide
+/// image — the row-independent half of the bilinear blend, computed once with
+/// the same [`col_params`] arithmetic the per-pixel accessors use and grouped
+/// into segments of constant `(bx0, bx1)`, so blending a whole row is a
+/// straight multiply-add loop with no per-pixel divide / floor / clamp.
+/// See [`BackgroundGrid::blend_columns`].
+struct ColPlan {
+    /// Column blend weight `fx` and its complement `1 - fx`.
+    fx: Vec<f32>,
+    omfx: Vec<f32>,
+    /// `(c_start, c_end_exclusive, bx0, bx1)` — maximal column ranges that
+    /// share the same pair of grid columns.
+    segs: Vec<(usize, usize, usize, usize)>,
+}
+
+impl ColPlan {
+    fn new(nx: usize, block: usize, w: usize) -> Self {
+        let mut fx = Vec::with_capacity(w);
+        let mut omfx = Vec::with_capacity(w);
+        let mut segs: Vec<(usize, usize, usize, usize)> = Vec::new();
+        for c in 0..w {
+            let (bx0, bx1, f) = col_params(nx, block, c);
+            fx.push(f);
+            omfx.push(1.0 - f);
+            match segs.last_mut() {
+                Some(seg) if seg.2 == bx0 && seg.3 == bx1 => seg.1 = c + 1,
+                _ => segs.push((c, c + 1, bx0, bx1)),
+            }
+        }
+        Self { fx, omfx, segs }
+    }
+}
+
+/// Column-constant part of the interpolation for image column `x`: the two
+/// grid columns to blend and the (unclamped — extrapolating) blend weight.
+#[inline]
+fn col_params(nx: usize, block: usize, x: usize) -> (usize, usize, f32) {
+    if nx == 1 {
+        return (0, 0, 0.0);
+    }
+    let bf = (x as f32 - block as f32 / 2.0) / block as f32;
+    let bx0 = (bf.floor() as isize).clamp(0, nx as isize - 2) as usize;
+    (bx0, bx0 + 1, bf - bx0 as f32)
 }
 
 impl BackgroundGrid {
@@ -469,49 +532,56 @@ impl BackgroundGrid {
         let nx = w.div_ceil(block);
         let ny = h.div_ceil(block);
 
-        // (median, Σresidual², n_below) per block; blocks are independent and
-        // each writes its own slot, so this maps in parallel.
-        let per_block: Vec<(f32, f64, usize)> = par::map_indices(nx * ny, |bi| {
-            let bx = bi % nx;
-            let by = bi / nx;
-            let x0 = bx * block;
+        // (median, Σresidual², n_below) per block, one task per block row.
+        // Each block row walks its sampled image rows once, left to right
+        // across all its blocks (forward streaming rather than a strided
+        // gather per block); each block still receives its samples in the
+        // same y-then-x order, so medians and residual sums are unchanged.
+        let per_block_row: Vec<Vec<(f32, f64, usize)>> = par::map_indices(ny, |by| {
             let y0 = by * block;
-            let x1 = (x0 + block).min(w);
             let y1 = (y0 + block).min(h);
-
-            let mut vals: Vec<f32> = Vec::with_capacity((block / stride + 1).pow(2));
+            let cap = (block / stride + 1).pow(2);
+            let mut vals: Vec<Vec<f32>> = (0..nx).map(|_| Vec::with_capacity(cap)).collect();
             let mut y = y0;
             let mut phase = 0usize;
             while y < y1 {
-                let row = y * w;
-                let mut x = x0 + phase;
-                while x < x1 {
-                    let v = pixels[row + x];
-                    if v.is_finite() {
-                        vals.push(v);
+                let row = &pixels[y * w..(y + 1) * w];
+                for (bx, block_vals) in vals.iter_mut().enumerate() {
+                    let x0 = bx * block;
+                    let x1 = (x0 + block).min(w);
+                    let mut x = x0 + phase;
+                    while x < x1 {
+                        let v = row[x];
+                        if v.is_finite() {
+                            block_vals.push(v);
+                        }
+                        x += stride;
                     }
-                    x += stride;
                 }
                 phase = (phase + 1) % stride;
                 y += stride;
             }
-            let median = midpoint_f32(&mut vals);
-            let mut sq = 0.0_f64;
-            let mut n = 0usize;
-            for &v in &vals {
-                if v <= median {
-                    let d = (v - median) as f64;
-                    sq += d * d;
-                    n += 1;
-                }
-            }
-            (median, sq, n)
+            vals.iter_mut()
+                .map(|block_vals| {
+                    let median = midpoint_f32(block_vals);
+                    let mut sq = 0.0_f64;
+                    let mut n = 0usize;
+                    for &v in block_vals.iter() {
+                        if v <= median {
+                            let d = (v - median) as f64;
+                            sq += d * d;
+                            n += 1;
+                        }
+                    }
+                    (median, sq, n)
+                })
+                .collect()
         });
 
-        let grid: Vec<f32> = per_block.iter().map(|&(m, _, _)| m).collect();
-        let (sq_sum, n_sum) = per_block
-            .iter()
-            .fold((0.0_f64, 0usize), |(s, n), &(_, sq, k)| (s + sq, n + k));
+        let per_block = per_block_row.iter().flatten();
+        let grid: Vec<f32> = per_block.clone().map(|&(m, _, _)| m).collect();
+        let (sq_sum, n_sum) =
+            per_block.fold((0.0_f64, 0usize), |(s, n), &(_, sq, k)| (s + sq, n + k));
         let sigma = if n_sum > 0 {
             (sq_sum / n_sum as f64).sqrt() as f32
         } else {
@@ -525,6 +595,7 @@ impl BackgroundGrid {
                 ny,
                 block,
                 stride,
+                cols: ColPlan::new(nx, block, w),
             },
             sigma,
         )
@@ -561,8 +632,8 @@ impl BackgroundGrid {
     }
 
     /// Blend one grid row for `row_params(row)` into `out` (length `nx`) —
-    /// hoists the row-constant half of the interpolation out of per-pixel
-    /// sweeps; combine with [`Self::lerp_in_row`].
+    /// hoists the row-constant half of the interpolation out of per-row
+    /// passes; combine with [`Self::blend_columns`].
     #[inline]
     pub(super) fn blend_row(&self, (by0, by1, fy): (usize, usize, f32), out: &mut [f32]) {
         for (bx, g) in out.iter_mut().enumerate() {
@@ -570,21 +641,50 @@ impl BackgroundGrid {
         }
     }
 
-    /// Background value at column `x` from a [`Self::blend_row`] result.
+    /// Column half of the interpolation for a whole row: with `row_blend`
+    /// from [`Self::blend_row`], for every image column `c`
+    ///
+    /// ```text
+    /// out[c] = map(row_blend[bx0] * (1 - fx) + row_blend[bx1] * fx)
+    /// ```
+    ///
+    /// with `(bx0, bx1, fx) = col_params(c)` — the same expression and
+    /// operation order as [`Self::value_at`] (which is exactly `blend_row`
+    /// followed by this column blend), so `map = |v| v` reproduces
+    /// `value_at(c, rp)` bit for bit, but the per-column divide / floor /
+    /// clamp is hoisted into the column plan built once by [`Self::build`].
+    /// `out.len()` must equal the image width given to `build`. `map` is
+    /// applied to each blended value (`|v| v + k·σ` for a detection
+    /// threshold, see [`Self::threshold_row`]).
     #[inline]
-    pub(super) fn lerp_in_row(&self, row_blend: &[f32], x: usize) -> f32 {
-        let (bx0, bx1, fx) = self.col_params(x);
-        row_blend[bx0] * (1.0 - fx) + row_blend[bx1] * fx
+    pub(super) fn blend_columns(
+        &self,
+        row_blend: &[f32],
+        out: &mut [f32],
+        map: impl Fn(f32) -> f32,
+    ) {
+        debug_assert_eq!(out.len(), self.cols.fx.len());
+        for &(c0, c1, bx0, bx1) in &self.cols.segs {
+            let (g0, g1) = (row_blend[bx0], row_blend[bx1]);
+            let fx = &self.cols.fx[c0..c1];
+            let omfx = &self.cols.omfx[c0..c1];
+            for ((o, &f), &omf) in out[c0..c1].iter_mut().zip(fx).zip(omfx) {
+                *o = map(g0 * omf + g1 * f);
+            }
+        }
+    }
+
+    /// Detection threshold of every column of the row blended into
+    /// `row_blend`: `out[c] = value_at(c, rp) + k_sigma`, bit for bit (see
+    /// [`Self::blend_columns`]).
+    #[inline]
+    pub(super) fn threshold_row(&self, row_blend: &[f32], k_sigma: f32, out: &mut [f32]) {
+        self.blend_columns(row_blend, out, |v| v + k_sigma);
     }
 
     #[inline]
     fn col_params(&self, x: usize) -> (usize, usize, f32) {
-        if self.nx == 1 {
-            return (0, 0, 0.0);
-        }
-        let bf = (x as f32 - self.block as f32 / 2.0) / self.block as f32;
-        let bx0 = (bf.floor() as isize).clamp(0, self.nx as isize - 2) as usize;
-        (bx0, bx0 + 1, bf - bx0 as f32)
+        col_params(self.nx, self.block, x)
     }
 }
 
