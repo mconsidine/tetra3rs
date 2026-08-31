@@ -315,15 +315,27 @@ fn median_f32(values: &mut [f32]) -> f32 {
 /// and truncate to the configured maximum. Shared tail of both extraction
 /// paths.
 fn sort_and_truncate_by_mass(centroids: &mut Vec<Centroid>, max_centroids: Option<usize>) {
-    centroids.sort_by(|a, b| {
-        b.mass
-            .unwrap_or(0.0)
-            .partial_cmp(&a.mass.unwrap_or(0.0))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // Sort (mass, original index) keys rather than the centroids themselves:
+    // the key `(mass desc, index asc)` is a strict total order, so an
+    // unstable sort of 8-byte keys reproduces exactly the order a stable
+    // descending-mass sort would give — at roughly half the cost on dense
+    // frames with tens of thousands of detections. Both extraction paths
+    // emit `mass` as `Some(m as f32)` with `m > 0.0` in f64 (or `None`,
+    // ranked as 0.0): never NaN and never -0.0, so `total_cmp` agrees with
+    // `partial_cmp` on every key present.
+    let mut keys: Vec<(f32, u32)> = centroids
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.mass.unwrap_or(0.0), i as u32))
+        .collect();
+    keys.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     if let Some(max) = max_centroids {
-        centroids.truncate(max);
+        keys.truncate(max);
     }
+    *centroids = keys
+        .iter()
+        .map(|&(_, i)| centroids[i as usize].clone())
+        .collect();
 }
 
 /// Validate that a raw pixel buffer matches the claimed dimensions.
@@ -520,49 +532,56 @@ impl BackgroundGrid {
         let nx = w.div_ceil(block);
         let ny = h.div_ceil(block);
 
-        // (median, Σresidual², n_below) per block; blocks are independent and
-        // each writes its own slot, so this maps in parallel.
-        let per_block: Vec<(f32, f64, usize)> = par::map_indices(nx * ny, |bi| {
-            let bx = bi % nx;
-            let by = bi / nx;
-            let x0 = bx * block;
+        // (median, Σresidual², n_below) per block, one task per block row.
+        // Each block row walks its sampled image rows once, left to right
+        // across all its blocks (forward streaming rather than a strided
+        // gather per block); each block still receives its samples in the
+        // same y-then-x order, so medians and residual sums are unchanged.
+        let per_block_row: Vec<Vec<(f32, f64, usize)>> = par::map_indices(ny, |by| {
             let y0 = by * block;
-            let x1 = (x0 + block).min(w);
             let y1 = (y0 + block).min(h);
-
-            let mut vals: Vec<f32> = Vec::with_capacity((block / stride + 1).pow(2));
+            let cap = (block / stride + 1).pow(2);
+            let mut vals: Vec<Vec<f32>> = (0..nx).map(|_| Vec::with_capacity(cap)).collect();
             let mut y = y0;
             let mut phase = 0usize;
             while y < y1 {
-                let row = y * w;
-                let mut x = x0 + phase;
-                while x < x1 {
-                    let v = pixels[row + x];
-                    if v.is_finite() {
-                        vals.push(v);
+                let row = &pixels[y * w..(y + 1) * w];
+                for (bx, block_vals) in vals.iter_mut().enumerate() {
+                    let x0 = bx * block;
+                    let x1 = (x0 + block).min(w);
+                    let mut x = x0 + phase;
+                    while x < x1 {
+                        let v = row[x];
+                        if v.is_finite() {
+                            block_vals.push(v);
+                        }
+                        x += stride;
                     }
-                    x += stride;
                 }
                 phase = (phase + 1) % stride;
                 y += stride;
             }
-            let median = midpoint_f32(&mut vals);
-            let mut sq = 0.0_f64;
-            let mut n = 0usize;
-            for &v in &vals {
-                if v <= median {
-                    let d = (v - median) as f64;
-                    sq += d * d;
-                    n += 1;
-                }
-            }
-            (median, sq, n)
+            vals.iter_mut()
+                .map(|block_vals| {
+                    let median = midpoint_f32(block_vals);
+                    let mut sq = 0.0_f64;
+                    let mut n = 0usize;
+                    for &v in block_vals.iter() {
+                        if v <= median {
+                            let d = (v - median) as f64;
+                            sq += d * d;
+                            n += 1;
+                        }
+                    }
+                    (median, sq, n)
+                })
+                .collect()
         });
 
-        let grid: Vec<f32> = per_block.iter().map(|&(m, _, _)| m).collect();
-        let (sq_sum, n_sum) = per_block
-            .iter()
-            .fold((0.0_f64, 0usize), |(s, n), &(_, sq, k)| (s + sq, n + k));
+        let per_block = per_block_row.iter().flatten();
+        let grid: Vec<f32> = per_block.clone().map(|&(m, _, _)| m).collect();
+        let (sq_sum, n_sum) =
+            per_block.fold((0.0_f64, 0usize), |(s, n), &(_, sq, k)| (s + sq, n + k));
         let sigma = if n_sum > 0 {
             (sq_sum / n_sum as f64).sqrt() as f32
         } else {
