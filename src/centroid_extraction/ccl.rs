@@ -6,7 +6,7 @@
 
 use std::borrow::Cow;
 
-use numeris::imageproc::{gaussian_blur, BorderMode};
+use numeris::imageproc::{gaussian_blur_into, BorderMode};
 use numeris::DynMatrix;
 
 use super::{
@@ -164,11 +164,17 @@ pub(super) fn extract_from_gray(
     // The detection threshold is scaled by the kernel's white-noise
     // suppression factor so `sigma_threshold` keeps meaning "sigmas of the
     // noise actually present in the thresholded image", filter on or off.
-    // Under the `parallel` feature numeris's gaussian_blur runs
+    // `gaussian_blur_into` (numeris ≥ 0.5.19) runs the separable passes in
+    // column bands with a per-band halo scratch instead of materializing a
+    // full-image intermediate — bit-identical to `gaussian_blur`, one 16 MB
+    // buffer less at 2048². Under the `parallel` feature the bands run
     // multi-threaded.
     let (thresh_src, mask_threshold): (Cow<[f32]>, f32) = match (filter_sigma, filter_input) {
         (Some(sigma), Some(mat)) => {
-            let filtered = gaussian_blur(&mat, sigma, BorderMode::Replicate).into_vec();
+            let mut filtered = DynMatrix::<f32>::zeros(0, 0);
+            gaussian_blur_into(&mat, sigma, BorderMode::Replicate, &mut filtered);
+            drop(mat);
+            let filtered = filtered.into_vec();
             let suppression = gaussian_noise_suppression(sigma);
             (
                 Cow::Owned(filtered),
