@@ -24,9 +24,11 @@
 //!   functions above stay the default and the right choice for calibration.
 //!
 //! With the `parallel` feature, the dominant local-background stage and the
-//! full-image element-wise maps of the connected-component path run
-//! multi-threaded via rayon; results are bit-identical to the sequential
-//! build. (The fast single-pass path is sequential.)
+//! full-image element-wise maps of the connected-component path, and the
+//! background grid + detection bit mask of the fast path, run multi-threaded
+//! via rayon; results are bit-identical to the sequential build. (The fast
+//! path's run sweep over the mask is sequential — it is proportional to the
+//! number of runs, not pixels.)
 //!
 //! # Example
 //!
@@ -357,7 +359,9 @@ fn check_pixel_len(len: usize, width: u32, height: u32) -> Result<()> {
 /// Scope is deliberately narrow. Profiling (`smrecording.fits`, 2.1 Mpix) shows
 /// `estimate_local_background` is ~60% of extraction wall-clock; the per-blob
 /// centroid loop is ~2% and connected-component labeling lives in numeris and
-/// is sequential there, so neither is parallelized here.
+/// is sequential there, so neither is parallelized here. The fast path
+/// parallelizes its background grid (one task per block row) and its
+/// detection bit mask (16-row chunks); its run sweep stays sequential.
 pub(super) mod par {
     #[cfg(feature = "parallel")]
     use rayon::prelude::*;
@@ -379,8 +383,8 @@ pub(super) mod par {
         (0..n).map(f).collect()
     }
 
-    /// Apply `f(i, chunk)` to each disjoint `chunk_len`-sized chunk of `buf`.
-    /// `buf.len()` must be a multiple of `chunk_len` (one chunk per image row).
+    /// Apply `f(i, chunk)` to each disjoint `chunk_len`-sized chunk of `buf`
+    /// (one or more image rows per chunk; the last chunk may be shorter).
     #[cfg(feature = "parallel")]
     pub fn for_each_chunk_mut<T, F>(buf: &mut [T], chunk_len: usize, f: F)
     where
@@ -609,20 +613,13 @@ impl BackgroundGrid {
     }
 
     /// Blend one grid row for `row_params(row)` into `out` (length `nx`) —
-    /// hoists the row-constant half of the interpolation out of per-pixel
-    /// sweeps; combine with [`Self::lerp_in_row`].
+    /// hoists the row-constant half of the interpolation out of per-row
+    /// passes; combine with [`Self::blend_columns`].
     #[inline]
     pub(super) fn blend_row(&self, (by0, by1, fy): (usize, usize, f32), out: &mut [f32]) {
         for (bx, g) in out.iter_mut().enumerate() {
             *g = self.grid[by0 * self.nx + bx] * (1.0 - fy) + self.grid[by1 * self.nx + bx] * fy;
         }
-    }
-
-    /// Background value at column `x` from a [`Self::blend_row`] result.
-    #[inline]
-    pub(super) fn lerp_in_row(&self, row_blend: &[f32], x: usize) -> f32 {
-        let (bx0, bx1, fx) = self.col_params(x);
-        row_blend[bx0] * (1.0 - fx) + row_blend[bx1] * fx
     }
 
     /// Column half of the interpolation for a whole row: with `row_blend`

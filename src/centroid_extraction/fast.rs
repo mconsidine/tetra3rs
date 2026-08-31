@@ -1,10 +1,10 @@
 //! Fast single-pass star-tracker extraction path: coarse subsampled
-//! background grid + one raster sweep with run-length connected regions and
-//! inline moment accumulation. Split out of the crate-facing module; entry via
-//! [`extract_centroids_fast`].
+//! background grid + one thresholding pass into a packed bit mask + a
+//! run-length sweep over the mask, with moments computed from the run lists.
+//! Split out of the crate-facing module; entry via [`extract_centroids_fast`].
 
 use super::{
-    check_pixel_len, elongation_from_cov, finish_region, runs, sort_and_truncate_by_mass,
+    check_pixel_len, elongation_from_cov, finish_region, par, runs, sort_and_truncate_by_mass,
     BackgroundGrid, CentroidExtractionResult,
 };
 use crate::centroid::Centroid;
@@ -100,13 +100,16 @@ impl Default for FastCentroidConfig {
 ///
 /// An alternative to [`extract_centroids_from_raw`](super::extract_centroids_from_raw) that reads each pixel
 /// **once**: a cheap subsampled pre-pass builds a coarse background grid, then
-/// a single raster sweep thresholds against the bilinearly-interpolated
-/// background, groups lit pixels into connected regions via run-length +
-/// union-find (accumulating intensity-weighted moments inline), and emits a
-/// center-of-mass per region. No convolution, no full-image background buffer,
-/// no second pass — so it is memory-bandwidth-bound rather than compute-bound,
-/// and markedly faster than the connected-component path (which stays the
-/// default and the right choice for calibration / faint-star work).
+/// a single pass thresholds every row against the bilinearly-interpolated
+/// background into a packed bit mask (1 bit per pixel), a run-length +
+/// union-find sweep over the mask groups lit pixels into connected regions
+/// (work proportional to runs, not pixels), and intensity-weighted moments
+/// over the run lists give a center-of-mass per region. No convolution, no
+/// full-image background buffer, no second pass over the image — so it runs
+/// close to memory bandwidth and markedly faster than the connected-component
+/// path (which stays the default and the right choice for calibration /
+/// faint-star work). With the `parallel` feature the background grid and the
+/// bit mask are built multi-threaded; results are bit-identical either way.
 ///
 /// # Trade-offs
 ///
@@ -152,23 +155,34 @@ pub fn extract_centroids_fast(
     let (bg, sigma) = BackgroundGrid::build(pixels, w, h, block, (block / 8).max(1));
     let nx = w.div_ceil(block);
     let k = config.sigma_threshold;
+    let k_sigma = k * sigma;
 
-    // ── Single raster sweep via the shared run-length core ──
-    // The `lit` closure hoists the row-constant half of the background
-    // interpolation itself (rebuilt when the row changes); moments are
-    // computed afterwards from the run lists — lit pixels are ≪1% of the
-    // image, so the second touch of them is nearly free and keeps the sweep
-    // core shared with the quality path.
-    let mut grid_row = vec![0.0_f32; nx];
-    let mut grid_row_y = usize::MAX;
-    let regions = runs::sweep_runs(w, h, |r, c| {
-        if r != grid_row_y {
+    // ── Threshold pass: packed detection bit mask ──
+    // Per row: blend the two bracketing grid rows (row-constant half of the
+    // interpolation), expand to a per-column threshold through the grid's
+    // precomputed column plan, and compare the pixels into one bit each.
+    // The whole-image mask (h × ⌈w/64⌉ words; 512 KB at 2048²) is filled in
+    // independent 16-row chunks — multi-threaded under `parallel` — and
+    // then consumed by one sequential run sweep, so region ids are
+    // identical to a pixel-by-pixel raster sweep. Moments are computed
+    // afterwards from the run lists: lit pixels are ≪1% of the image, so
+    // the second touch of them is nearly free.
+    const ROWS_PER_CHUNK: usize = 16;
+    let words_per_row = w.div_ceil(64);
+    let mut mask = vec![0u64; words_per_row * h];
+    par::for_each_chunk_mut(&mut mask, words_per_row * ROWS_PER_CHUNK, |ci, chunk| {
+        let mut grid_row = vec![0.0_f32; nx];
+        let mut thr = vec![0.0_f32; w];
+        for (i, words) in chunk.chunks_exact_mut(words_per_row).enumerate() {
+            let r = ci * ROWS_PER_CHUNK + i;
             bg.blend_row(bg.row_params(r), &mut grid_row);
-            grid_row_y = r;
+            bg.threshold_row(&grid_row, k_sigma, &mut thr);
+            pack_lit_row(&pixels[r * w..(r + 1) * w], &thr, words);
         }
-        let p = pixels[r * w + c];
-        p.is_finite() && p > bg.lerp_in_row(&grid_row, c) + k * sigma
     });
+
+    // ── Run-length sweep over the mask via the shared core ──
+    let regions = runs::sweep_runs_mask(w, h, words_per_row, &mask);
     let (offsets, order) = regions.group_by_region();
 
     // ── Emit one centroid per region ──
@@ -279,4 +293,67 @@ pub fn extract_centroids_fast(
         threshold: bg_mean + k * sigma,
         num_blobs_raw,
     })
+}
+
+/// Pack one image row's detection mask: bit `c % 64` of `words[c / 64]` is
+/// set when `row[c]` is finite and exceeds `thr[c]`. `(p > t) & (p < +∞)` is
+/// exactly `p.is_finite() && p > t` (NaN fails both compares, −∞ fails the
+/// first, +∞ the second) but branch-free: the compares fill a 64-byte
+/// scratch (a vectorizable loop), then each 8 bytes fold to 8 bits with the
+/// multiply-shift trick. Padding bits at or beyond `row.len()` are zero.
+#[inline]
+fn pack_lit_row(row: &[f32], thr: &[f32], words: &mut [u64]) {
+    debug_assert_eq!(row.len(), thr.len());
+    debug_assert_eq!(words.len(), row.len().div_ceil(64));
+    for (wi, word) in words.iter_mut().enumerate() {
+        let c0 = wi * 64;
+        let c1 = (c0 + 64).min(row.len());
+        let mut bytes = [0u8; 64];
+        for ((m, &p), &t) in bytes.iter_mut().zip(&row[c0..c1]).zip(&thr[c0..c1]) {
+            *m = ((p > t) & (p < f32::INFINITY)) as u8;
+        }
+        let mut acc = 0u64;
+        for (k, chunk) in bytes.as_chunks::<8>().0.iter().enumerate() {
+            let x = u64::from_le_bytes(*chunk);
+            // Each byte is 0 or 1; the multiply gathers the low bit of each
+            // byte into the top byte, lowest byte → lowest bit.
+            acc |= (x.wrapping_mul(0x0102_0408_1020_4080) >> 56) << (8 * k);
+        }
+        *word = acc;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pack_lit_row_matches_predicate() {
+        let w = 2136usize; // not a multiple of 64
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let thr: Vec<f32> = (0..w).map(|c| c as f32 * 0.5).collect();
+        let mut row: Vec<f32> = (0..w)
+            .map(|c| c as f32 * 0.5 + (next() % 5) as f32 - 2.0)
+            .collect();
+        // Non-finite values must never be lit, whatever the threshold.
+        row[3] = f32::NAN;
+        row[64] = f32::INFINITY;
+        row[65] = f32::NEG_INFINITY;
+        row[w - 1] = f32::INFINITY;
+        let mut words = vec![u64::MAX; w.div_ceil(64)];
+        pack_lit_row(&row, &thr, &mut words);
+        for c in 0..w {
+            let expect = row[c].is_finite() && row[c] > thr[c];
+            let got = words[c / 64] >> (c % 64) & 1 == 1;
+            assert_eq!(got, expect, "column {c}");
+        }
+        // Padding bits are zero.
+        assert_eq!(words[w / 64] >> (w % 64), 0);
+    }
 }
